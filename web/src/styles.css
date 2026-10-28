@@ -1,0 +1,6 @@
+:host { display: block; min-height: 100vh; background: #101820; color: #eef3f6; font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 52rem; margin: 0 auto; padding: 4rem 1.5rem; }
+.eyebrow { color: #80c7b4; font-size: .75rem; font-weight: 700; letter-spacing: .14em; }
+h1 { margin: .3rem 0; font-size: clamp(2.5rem, 8vw, 4rem); }
+section { margin-top: 3rem; padding: 1.5rem; border: 1px solid #40515e; border-radius: .8rem; background: #192630; }
+h2 { margin-top: 0; color: #f4c674; }
