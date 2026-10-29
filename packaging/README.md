@@ -1,6 +1,6 @@
 # Client distribution plan
 
-Status: planning only. Source-installer code exists at `../install.sh`, but an end-to-end release installation is unverified; no distribution channel is claimed as supported. No package artifact, service unit, Windows setup executable or macOS DMG has been built or tested.
+Status: package channels remain planning only. The source installer was exercised in an isolated prefix using built release outputs, including update and uninstall; its `--build-only` Rust stage passes but the fresh npm install is blocked by unavailable offline dependencies in this environment. Cache v2 records source and artifact digests plus build-host glibc; it does not execute cached binaries during install. No native package artifact, service unit, Windows setup executable or macOS DMG has been built or tested, and no distribution channel is claimed as supported.
 
 ## Shared build and ownership model
 

@@ -1,6 +1,7 @@
-//! Agent boundaries; execution, checks, policy and transport arrive in later milestones.
+//! Standalone read-only audit; service, policy and transport remain future boundaries.
 
 pub mod audit;
+pub mod observation;
 pub mod checks;
 pub mod communication;
 pub mod platform;

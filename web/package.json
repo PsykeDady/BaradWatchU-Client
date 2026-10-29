@@ -4,8 +4,12 @@
   "private": true,
   "scripts": {
     "sync-version": "node sync-version.mjs",
-    "prebuild": "node sync-version.mjs",
-    "build": "ng build"
+    "prebuild": "node check-node.mjs && node sync-version.mjs",
+    "build": "ng build",
+    "prestart": "node check-node.mjs && node sync-version.mjs",
+    "start": "ng serve",
+    "pretest": "node check-node.mjs",
+    "test": "node --test sync-version.test.mjs"
   },
   "dependencies": {
     "@angular/common": "^18.2.0",
@@ -21,5 +25,9 @@
     "@angular/cli": "^18.2.0",
     "@angular/compiler-cli": "^18.2.0",
     "typescript": "~5.5.4"
+  },
+  "engines": {
+    "node": "^20.11.1",
+    "npm": ">=8"
   }
 }

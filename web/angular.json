@@ -15,17 +15,53 @@
             "outputPath": "dist/client-status",
             "index": "src/index.html",
             "browser": "src/main.ts",
-            "polyfills": ["zone.js"],
+            "polyfills": [
+              "zone.js"
+            ],
             "tsConfig": "tsconfig.app.json",
-            "styles": ["src/styles.css"]
+            "styles": [
+              "src/styles.css"
+            ]
           },
           "configurations": {
-            "production": { "budgets": [{ "type": "initial", "maximumWarning": "1mb", "maximumError": "2mb" }], "outputHashing": "all" },
-            "development": { "optimization": false, "extractLicenses": false, "sourceMap": true }
+            "production": {
+              "budgets": [
+                {
+                  "type": "initial",
+                  "maximumWarning": "1mb",
+                  "maximumError": "2mb"
+                }
+              ],
+              "outputHashing": "all"
+            },
+            "development": {
+              "optimization": false,
+              "extractLicenses": false,
+              "sourceMap": true
+            }
           },
           "defaultConfiguration": "production"
+        },
+        "serve": {
+          "builder": "@angular-devkit/build-angular:dev-server",
+          "options": {
+            "host": "127.0.0.1",
+            "port": 4201
+          },
+          "configurations": {
+            "development": {
+              "buildTarget": "client-status:build:development"
+            },
+            "production": {
+              "buildTarget": "client-status:build:production"
+            }
+          },
+          "defaultConfiguration": "development"
         }
       }
     }
+  },
+  "cli": {
+    "analytics": "67f89927-0878-4054-b19d-8c990de2070a"
   }
 }
