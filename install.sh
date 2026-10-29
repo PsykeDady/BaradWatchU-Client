@@ -70,7 +70,9 @@ deps() {
 
 canonical() { realpath -m -- "$1"; }
 prefix_writable() { local p="$PREFIX"; (( EUID == 0 )) && return 0; while [[ ! -e "$p" ]]; do p=$(dirname -- "$p"); done; [[ -d "$p" && -w "$p" && -x "$p" ]]; }
-fingerprint() { (cd "$ROOT"; find Cargo.toml crates web -type d \( -name .git -o -name target -o -name node_modules -o -name dist -o -name .angular \) -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'); }
+fingerprint() {
+    (cd "$ROOT"; local paths=(Cargo.toml crates web); [[ ! -f Cargo.lock ]] || paths+=(Cargo.lock); [[ ! -d .cargo ]] || paths+=(.cargo); find "${paths[@]}" -type d \( -name .git -o -name target -o -name node_modules -o -name dist -o -name .angular \) -prune -o \( -type f -o -type l \) -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+}
 web_ok() {
     local pv av
     pv=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([0-9.]*\)".*/\1/p' "$ROOT/web/package.json"|head -1)
@@ -136,6 +138,14 @@ uninstall() {
     manifest_parent=$(canonical "$(dirname -- "$manifest")"); [[ "$manifest_parent" == "$PREFIX"/* ]] || fail 'manifest path escapes prefix'
     o=$(owner "$manifest"); [[ -z "$o" ]] || fail "package manager owns source manifest ($o)"
     load_manifest
+    # Preflight every owned path before removing any of them, so a modified
+    # later entry cannot cause a partially completed uninstall.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue; IFS=$'\t' read -r k h p <<< "$line"; path="$PREFIX/$p"
+        parent=$(canonical "$(dirname -- "$path")"); [[ "$parent" == "$PREFIX"/* ]] || fail "manifest path escapes prefix: $path"
+        o=$(owner "$path"); [[ -z "$o" ]] || fail "package manager owns $path ($o)"
+        if [[ -e "$path" || -L "$path" ]]; then hash_ok "$path" "$h" || fail "changed file preserved: $path"; fi
+    done < <(tail -n +5 "$manifest")
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue; IFS=$'\t' read -r k h p <<< "$line"; path="$PREFIX/$p"
         parent=$(canonical "$(dirname -- "$path")"); [[ "$parent" == "$PREFIX"/* ]] || fail "manifest path escapes prefix: $path"
