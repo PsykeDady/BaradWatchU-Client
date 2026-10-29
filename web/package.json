@@ -1,8 +1,12 @@
 {
   "name": "baradwatchu-client-status",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
-  "scripts": { "build": "ng build" },
+  "scripts": {
+    "sync-version": "node sync-version.mjs",
+    "prebuild": "node sync-version.mjs",
+    "build": "ng build"
+  },
   "dependencies": {
     "@angular/common": "^18.2.0",
     "@angular/compiler": "^18.2.0",

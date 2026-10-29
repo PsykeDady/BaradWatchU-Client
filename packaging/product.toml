@@ -1,0 +1,42 @@
+# Packaging inputs/ownership plan. Cargo.toml remains the only product version source.
+[product]
+name = "BaradWatchU Client"
+binary = "baradwatchu-agent"
+version_source = "../Cargo.toml#[workspace.package].version"
+formats = ["linux-source", "arch-pacman", "debian-deb", "fedora-rpm", "windows-setup-exe", "macos-dmg"]
+
+[linux]
+binary_package_path = "/usr/bin/baradwatchu-agent"
+binary_source_prefix_path = "/usr/local/bin/baradwatchu-agent"
+web_assets_path = "/usr/share/baradwatchu-client/web"
+config_path = "/etc/baradwatchu/client"
+data_path = "/var/lib/baradwatchu/client"
+custom_checks_path = "/var/lib/baradwatchu/client/custom-checks"
+service_unit = "baradwatchu-agent.service"
+service_status = "deferred"
+package_artifact_status = "planned-not-built-or-tested"
+
+[desktop]
+viewer_is_independent = true
+viewer_launcher_status = "deferred"
+
+[windows]
+artifact = "setup.exe"
+service = "Windows Service"
+administrator_authorization = true
+authenticode_signing_required = true
+status = "plan-only"
+
+[macos]
+artifact = "dmg"
+service = "launchd LaunchDaemon"
+administrator_authorization = true
+developer_id_signing_and_notarization_required = true
+status = "plan-only"
+
+[source_installer]
+script = "../install.sh"
+manifest = "share/baradwatchu-source/baradwatchu-agent.manifest"
+manifest_hashes_payload = true
+preserve_config_identity_audit_and_custom_checks = true
+user_local_is_development_only = true
