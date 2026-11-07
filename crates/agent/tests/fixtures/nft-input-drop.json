@@ -1,0 +1,1 @@
+{"nftables":[{"metainfo":{"json_schema_version":1}},{"table":{"family":"inet","name":"fixture"}},{"chain":{"family":"inet","table":"fixture","name":"input","type":"filter","hook":"input","policy":"drop"}}]}

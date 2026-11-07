@@ -4,144 +4,79 @@
 
 [Read in English](README.md)
 
-BaradWatchU è una piattaforma di audit della conformità di sicurezza degli endpoint. Questo repository contiene l'agente Rust indipendente e il visualizzatore locale di stato Angular. L'agente esegue offline una prima parte dell'audit autonomo Fedora e in futuro comunicherà le evidenze al repository server separato.
+BaradWatchU Client controlla la postazione su cui viene eseguito. Audit, impostazioni e storico restano locali; il Server non è necessario. Il target di sviluppo attuale è Arch Linux; il catalogo dei requisiti non supporta ancora altri sistemi operativi.
 
-## Stato
+## Requisiti ed esiti
 
-**Implementato in L0.1:** eseguibile Rust di bootstrap che stampa la piattaforma rilevata in compilazione e termina; confini adapter per Linux, Windows e macOS; scaffold del visualizzatore locale Angular che segnala che non sono collegati servizi o dati di audit.
+Il catalogo incluso è [catalog/requirements.json](catalog/requirements.json). Contiene nove requisiti leggibili, ognuno con ID, nome, descrizione funzionale, stato di abilitazione locale, priorità predefinita e percorso del tool specifico per sistema operativo. I tool Arch sono in `tools/linux/`. Le priorità sono `HIGHEST`, `HIGH`, `MEDIUM`, `LOW` e `OPTIONAL`; non modificano l'esito del controllo.
 
-**Validato in L0.1.1:** versione `0.0.1`, CLI Rust, build debug/release e build Angular production. Sono presenti test di regressione per avvio e metadati versione. L’installer è stato verificato con cache e prefissi isolati per installazione/aggiornamento/disinstallazione; la build completa arriva alla fase Rust ma l’installazione npm in una cache nuova è bloccata nell’ambiente offline. Servizi di sistema e package nativi restano pianificati.
+Ogni tool viene avviato direttamente, senza shell implicita, con durata e output limitati. Restituisce un oggetto JSON con ID del requisito, stato, riepilogo breve e dettagli facoltativi. Gli stati sono `PASS`, `FAIL`, `WARN`, `ERROR`, `DISABLED` e `NOT_APPLICABLE`. Evidenze mancanti o ambigue restano `WARN`; errori di avvio o di protocollo diventano `ERROR`. I tool non elevano i privilegi e non modificano la configurazione di sistema.
 
-**Implementato in L1.1 / Checkpoint 1:** audit Rust autonomo, cinque stati di risultato, report JSON versionato e leggibile, identità OS, aggiornamenti Fedora DNF5 in cache e ispezione della cifratura a blocchi del filesystem root. Non richiede processi Server o Angular.
+`REQ-001` verifica gli aggiornamenti dei pacchetti usando `/usr/bin/checkupdates --nocolor` fornito da `pacman-contrib`. `checkupdates` usa un database temporaneo e può contattare i mirror Arch: il controllo non è offline. Se `checkupdates` manca, i mirror non rispondono o l'esito non è determinabile, viene restituito `WARN`. Gli aggiornamenti trovati producono `FAIL`; nessun aggiornamento produce `PASS`. Il controllo non determina la presenza di vulnerabilità. Vedi il [manuale Arch di checkupdates](https://man.archlinux.org/man/extra/pacman-contrib/checkupdates.8.en).
 
-**Smoke L0.1.1 confermati dall’operatore:** `/health` Server HTTP 200 con JSON atteso; entrambi i dev server Angular funzionanti; Ctrl+C del launcher arresta i servizi. Build installer con cache nuova, pacchetti nativi, audit dipendenze su tutte le distribuzioni e audit vulnerabilità restano debito tecnico.
+Altri controlli restituiscono intenzionalmente `WARN` quando gli indicatori locali non dimostrano la proprietà di sicurezza. In particolare, la presenza di un servizio antivirus non dimostra la copertura delle scansioni; le impostazioni DNS non dimostrano il filtraggio; lo stato VPN non dimostra la raggiungibilità del tunnel; e i tool attuali per cifratura, password e avvio non dichiarano più di quanto consentano le evidenze disponibili. Valutare il riepilogo e i dettagli prima di considerare conforme un requisito.
 
-**Pianificato:** servizi persistenti, pianificazione, policy firmate, controlli custom autorizzati, controlli per altre piattaforme, storage, arruolamento, sincronizzazione autenticata e remediation. Non fanno parte di questo checkpoint.
+## CLI
 
-## Architettura
-
-- `crates/agent/src/main.rs`: parsing CLI, compatibilità bootstrap, rendering audit e codici di uscita.
-- `service.rs`: confine del ciclo di vita del servizio in background.
-- `audit.rs`: `Check`/`Clock` riutilizzabili, tipi report/risultato/evidenza, riepilogo deterministico e rendering.
-- `checks/builtin.rs`: tre identificatori stabili e applicabilità; `checks/custom.rs` resta differito.
-- `policy.rs`, `communication.rs`: confini di policy e trasporto server; non esistono elaborazione policy o comportamento di rete.
-- `platform/mod.rs`: `AuditPlatform` iniettabile; `linux.rs`: parser os-release sicuro; `fedora/`: sonde aggiornamenti/cifratura; `command.rs`: subprocessi limitati; `read_only.rs`: vincolo Linux sul filesystem del solo processo figlio. Gli adapter Windows/macOS restano confini.
-- `web`: visualizzatore locale di stato Angular, indipendente dall'agente in background. Non è implementato IPC locale.
-
-## Versione e CLI
-
-Server e Client hanno cicli di release indipendenti. La versione prodotto autorevole del Client è `[workspace.package].version` nel `Cargo.toml` radice di questo repository; i package Rust la ereditano. La versione Angular nel `package.json` e quella visualizzata sono generate/sincronizzate da questa fonte con `node web/sync-version.mjs` (eseguito anche automaticamente da `npm run build`). Per cambiare versione, aggiornare quella workspace secondo SemVer e lanciare la sincronizzazione. La versione prodotto è distinta dallo schema report Client `baradwatchu.audit-report.v1`; ingestion Server e protocolli condivisi della flotta restano da definire.
+Compilare con Rust e le dipendenze Angular installate, poi eseguire:
 
 ```sh
-cargo run -p baradwatchu-agent -- --version
-cargo run -p baradwatchu-agent -- --help
+cargo run -p baradwatchu-agent -- list
+cargo run -p baradwatchu-agent -- enable REQ-001
+cargo run -p baradwatchu-agent -- disable REQ-005
+cargo run -p baradwatchu-agent -- priority REQ-001 HIGH
+cargo run -p baradwatchu-agent -- configure REQ-006 '{"sensitivePaths":["/srv/archive"]}'
+cargo run -p baradwatchu-agent -- check REQ-001
+cargo run -p baradwatchu-agent -- check REQ-001 --log
 cargo run -p baradwatchu-agent -- audit
-cargo run -p baradwatchu-agent -- audit --format json
+cargo run -p baradwatchu-agent -- audit --json
+cargo run -p baradwatchu-agent -- audit --log
+cargo run -p baradwatchu-agent -- status
 ```
 
-L'eseguibile release supporta questi flag senza avviare un servizio. Il bootstrap corrente, se eseguito senza opzioni, stampa la piattaforma e termina.
+Usare `--json` esplicitamente per l’output destinato alle macchine e aggiungere `--log` a `audit` o `check ID` per salvare un log di testo `.log` in `~/.local/state/baradwatchu/audits/`. I log di testo sono disattivati per impostazione predefinita. I report JSON strutturati restano salvati per `status` e dashboard in `audits/reports/`: sono la cronologia dell’applicazione, non copie dei log. Il log richiesto mostra risultati, tool eseguiti e diagnostiche. L’installer suggerisce anche i pacchetti Arch per i comandi di audit opzionali mancanti. Disabilitare un requisito lo conserva insieme alle impostazioni. I parametri sono oggetti JSON passati tramite standard input; i tool che non li leggono li ignorano.
 
-## Audit autonomo (L1.1 / Checkpoint 1)
+I controlli Linux riportano separatamente le evidenze dei metodi: REQ-003 supporta UFW, firewalld e nftables operativi; REQ-004 restituisce PASS se dnsmasq è installato e attivo oppure, se dnsmasq è assente, sono presenti voci di blocco personalizzate in `/etc/hosts`; REQ-005 supporta Cato e WireGuard e restituisce PASS solo se almeno una VPN è connessa. Un dnsmasq installato ma inattivo produce FAIL; una VPN installata ma disconnessa produce WARN perché i servizi aziendali potrebbero non essere raggiungibili. Antivirus e controlli analoghi richiedono che i servizi pertinenti siano attivi: la sola installazione non basta. REQ-003 restituisce `PASS` solo quando l'operatività di un metodo è verificata. Se tutti i servizi firewall gestiti risultano esplicitamente inattivi/disabilitati, restituisce `FAIL` anche quando il ruleset kernel non è leggibile; l'incertezza resta nei dettagli diagnostici. Negli altri casi, regole nftables inaccessibili producono `WARN`, senza presumerne l'assenza o l'efficacia.
 
-Usare il binario compilato con `target/debug/baradwatchu-agent audit` oppure `target/release/baradwatchu-agent audit --format json`. Senza argomenti resta il bootstrap. L'audit non avvia servizi e non richiede root, Node, browser o Server.
+I precedenti comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta. I vecchi file d'implementazione restano temporaneamente per test e codice interno della migrazione, ma non sono esposti come comandi.
 
-Prerequisiti Fedora: installazione tradizionale RPM/DNF5 con `/usr/bin/dnf5` dotato di `--skip-file-locks`, `findmnt` e `lsblk` (util-linux), metadati di sistema leggibili e metadati dei repository già disponibili. DNF4 senza DNF5, installazioni ostree/Atomic/a immagine e altre distribuzioni non sono supportati. Un derivato con `ID_LIKE=fedora` non basta. Sono necessari `ID=fedora` effettivo e `VERSION_ID` numerico; ciò non certifica il supporto o la fine vita della release Fedora.
+## Dashboard e notifiche
 
-La sonda aggiornamenti richiede Linux **Landlock ABI 3+** abilitato e consentito. Il figlio vieta scrittura dei contenuti, creazione, rimozione, rinomina e troncamento dei file, e imposta `no_new_privs`; se il vincolo non è applicabile restituisce `ERROR/READ_ONLY_GUARD_UNAVAILABLE`, senza riprovare senza protezione. DNF5 usa soltanto la cache, disabilita plugin, output persistente dei log e creazione cache libsolv, e omette creazione/acquisizione del lock del repository di sistema; lo stato DNF esistente resta leggibile e il vincolo blocca le scritture. L’osservazione non è uno snapshot protetto dal lock delle transazioni ed è soggetta a modifiche concorrenti dei pacchetti; non invoca refresh o transazioni di pacchetti. L'auditor non popola né aggiorna metadati mancanti. Legge `/etc/os-release`, ripiegando su `/usr/lib/os-release` solo se assente; non valuta codice shell. Le sonde usano percorsi eseguibili fissi, ambiente minimo con locale C, stdin nullo, timeout 30 secondi e limite di 256 KiB per flusso di output. Il report esclude elenchi pacchetti grezzi, stderr, URL dei repository, seriali e UUID dei dischi.
-
-| Controllo | Interpretazione e politica degli esiti |
-|---|---|
-| `SYS-OS-001` — identità OS | `PASS`: distribuzione identificata, con versione se presente (le rolling possono ometterla). Un OS non supportato mantiene limiti di copertura espliciti; errori di lettura/parsing sono `ERROR`. Questa osservazione non certifica conformità di sicurezza. |
-| `SEC-001` — aggiornamenti pendenti | DNF5 `check-upgrade`: uscita 100 è `FAIL` (aggiornamenti in cache disponibili). Uscita 0 è `WARN/NO_CACHED_UPDATES`, perché freschezza/copertura non sono verificate. Cache mancante o nessun repository è `WARN`; DNF5 mancante, permessi, timeout, opzioni non valide e altri errori di esecuzione sono `ERROR`. Non esiste volutamente `PASS` finché freschezza/copertura non saranno attendibili. La futura policy trimestrale non viene valutata. |
-| `SEC-006` — cifratura a blocchi della root | `findmnt` identifica `/` tramite major:minor; `lsblk` segue **ogni percorso osservato dei dispositivi sottostanti**. `PASS` richiede percorsi semplici disco/partizione/LVM con mapping dm-crypt attivo direttamente su metadati LUKS in ogni percorso. Un percorso provato in chiaro è `FAIL`. Un volume LUKS estraneo non basta. Ascendenza mancante/incompleta/sconosciuta, metadati incoerenti, dm-crypt senza LUKS provato, Btrfs (compreso il comune default Fedora), RAID/multipath, loop, overlay o root di rete sono `WARN`; strumenti mancanti, permessi, errori dei comandi e output malformato sono `ERROR`. |
-
-L'ambito cifratura è **solo il filesystem root**, non tutti i dati di sistema/utente: `/home` separata, boot/EFI, swap, dischi esterni, cifratura hardware, robustezza delle chiavi e boot autenticato non sono certificati. Lo storage complesso richiede lavoro futuro e non viene presunto conforme. Le piattaforme non supportate producono controlli Fedora `NOT_APPLICABLE`, nessun comando di sonda e riepilogo `WARN`. Identità OS non rilevabile produce `ERROR`, non un salto riuscito.
-
-Codici di uscita: **0** tutti i controlli applicabili PASS (anche bootstrap/help/version); **1** almeno un ERROR di esecuzione; **2** CLI non valida; **3** FAIL senza ERROR; **4** WARN, piattaforma non supportata o copertura incompleta senza ERROR/FAIL. Precedenza ERROR > FAIL > WARN > PASS. I conteggi dei cinque stati restano separati e deterministici.
-
-Contratto JSON: `schemaVersion`, `agentVersion`, `startedAtUnixMs`, `completedAtUnixMs`, `operatingSystem`, `overall`, `summary`, `results`. Ogni risultato contiene metadati `check` (`id`, `name`, `description`, `version` dell'implementazione), `observedAtUnixMs`, `status`, `reasonCode`, `message`, `evidence` (`source`, `scope`, `values` strutturati). Timestamp interi in millisecondi Unix UTC; quelli dei risultati indicano l'inizio del controllo. Non vengono inventati identità dispositivo, policy applicata, firma o compatibilità Server. Gli audit completati emettono un report completo anche con esito non zero; errori fatali di clock/output possono impedire il report. Per gli audit completati, conservare il codice quando si salva JSON:
+`baradwatchu-agent dashboard` avvia la dashboard Angular su un indirizzo loopback con porta temporanea e prova ad aprirla con `xdg-open`. Non avvia un servizio dell'agente né espone un listener alla rete. La dashboard usa le stesse impostazioni locali, lo stesso runner di audit e lo storico dei report della CLI; l'audit funziona anche senza browser. Per lo sviluppo, compilare prima Angular e poi avviare il bridge Rust; Cargo copia il bundle locale accanto all'eseguibile:
 
 ```sh
-./target/release/baradwatchu-agent audit --format json > report.json
-result=$?
-printf 'Audit exit: %s\n' "$result"
+cd web
+npm ci
+npm run build
+cd ..
+cargo run -p baradwatchu-agent -- dashboard
 ```
 
-Validazione: 38 test Rust, formattazione, Clippy con warning vietati e build debug/release con lock superati su Arch. Entrambi i binari producono report leggibili/JSON validi per piattaforma non supportata (riepilogo WARN, uscita 4); il test Linux di divieto di scrittura è stato eseguito con successo. Fixture per parser/contratto/piattaforma e test dei subprocessi non richiedono configurazione Fedora né root. L'esecuzione effettiva Fedora DNF5/storage root resta uno smoke test dell'operatore; le fixture non sono evidenze di conformità dell'endpoint. Riferimenti tecnici: [cache/configurazione DNF5](https://dnf5.readthedocs.io/en/stable/dnf5.conf.5.html), [uscite check-upgrade](https://dnf5.readthedocs.io/en/stable/commands/check-upgrade.8.html), [Landlock](https://docs.kernel.org/userspace-api/landlock.html), [lsblk](https://man7.org/linux/man-pages/man8/lsblk.8.html).
+`baradwatchu-agent audit --notify` chiede a `notify-send` di mostrare un riepilogo al termine dell'audit, se il programma è installato e la sessione desktop accetta notifiche. Le notifiche sono facoltative e non servono per eseguire l'audit.
 
-## Prerequisiti
+## Compilazione e installazione su Arch Linux
 
-- Toolchain Rust stable con Cargo e rustfmt (base workspace: Rust 1.80+).
-- Node.js 20.11.1 o successivo nella serie 20 e npm 8+; `web/.nvmrc` seleziona Node 20. I comandi rifiutano versioni Node incompatibili con un messaggio esplicito.
-- Accesso di rete alla prima risoluzione delle dipendenze, salvo dipendenze già in cache.
-- GNU/Linux con glibc 2.17+ per compilare; la cache registra la glibc effettiva del sistema di build e richiede conservativamente una versione uguale o successiva.
-- Per la build sorgente completa: compilatori C/C++, make, Python 3 e tar (anche per eventuali dipendenze npm native).
+L'installer dei sorgenti mantiene il flusso di cache di build, staging, reinstallazione e disinstallazione tramite manifest. Avviarlo come utente normale; chiede `sudo` solo per copiare i file in un prefisso protetto:
 
-## Comandi
+```sh
+./install.sh --missing-deps
+./install.sh --build-only
+./install.sh
+```
 
-Dalla radice del repository:
+Servono Rust/Cargo, tool di compilazione C/C++, Python, tar, Node.js 20 (almeno 20.11.1) e npm. Se nvm è già installato, l'installer seleziona la versione indicata da `web/.nvmrc`; non scarica Node automaticamente. Installare `pacman-contrib` per eseguire `REQ-001`. `./install.sh --help` elenca le opzioni per build-only, cache, prefisso e disinstallazione. L'installer non crea un servizio di sistema né un pacchetto per il package manager.
+
+## Verifiche di sviluppo
 
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --locked
-cargo build --release --workspace --locked
-cargo run -p baradwatchu-agent
-cargo run -p baradwatchu-agent -- --version
-cargo run -p baradwatchu-agent -- --help
+cd web && npm test && npm run build
 ```
 
-Compilare separatamente il visualizzatore di stato:
+I comandi npm usano la versione Node selezionata da `web/.nvmrc`.
 
-```sh
-cd web
-npm ci
-npm start       # sviluppo locale
-npm test        # test degli strumenti di versione
-npm run build   # production
-```
+## Limiti attuali della migrazione
 
-Se si usa nvm, eseguire `nvm use` in `web/` prima dei comandi npm. L’interfaccia di sviluppo ascolta su `http://127.0.0.1:4201` e rimane indipendente dal processo Rust. `npm start` resta in primo piano; fermarlo con Ctrl-C prima di eseguire altri comandi nello stesso terminale.
-
-## Installazione Linux da sorgenti
-
-Rilevamento installer supportato: Arch Linux, Fedora, Debian e Ubuntu, anche tramite `ID_LIKE`. `--missing-deps` controlla solo le dipendenze, rileva i package Angular locali mancanti e mostra comandi package manager/progetto; non installa pacchetti di sistema. Strumenti richiesti per compilare: Rust/Cargo 1.80+, Node.js 20 >=20.11.1, npm 8+, C/C++, make, Python 3 e tar; glibc 2.17+ è il minimo controllato sul sistema di build. Una cache precompilata e validata non richiede Node/Angular, mentre la build sorgente eseguita dall'installer compila anche questi asset.
-
-```sh
-./install.sh --help
-./install.sh --missing-deps
-./install.sh --dry-run --prefix=/tmp/baradwatchu-preview
-./install.sh --local                         # copia di sviluppo limitata all'utente
-./install.sh --build-only --build-dir="$HOME/.cache/baradwatchu/baradwatchu-agent-0.0.1"
-sudo ./install.sh --no-build --build-dir="$HOME/.cache/baradwatchu/baradwatchu-agent-0.0.1" --prefix=/usr/local
-./install.sh --uninstall --prefix=/usr/local
-```
-
-`--no-build` richiede una cache completa prodotta dallo stesso albero sorgente, versione e piattaforma. Per un prefisso di sistema, compilare prima come utente non privilegiato e poi installare con `sudo` e `--no-build`; non compilare come root. `--local` installa in `~/.local` solo per sviluppo manuale: non fornisce servizio di sistema, controlli privilegiati o monitoraggio di conformità. L'installazione sorgente di sistema installa solo file, senza creare o riavviare servizi. La disinstallazione rimuove solo file invariati elencati nel manifest sorgente; rifiuta file gestiti da package manager o modificati e conserva configurazione, identità di arruolamento, audit e controlli custom. Gli aggiornamenti usano lo stesso manifest.
-
-`--build-only` usa Cargo `--locked` e una copia temporanea di Angular nella cache: `npm ci` non sostituisce `node_modules` del checkout. Dipendenze, log npm e header node-gyp rimangono nella cache. I sorgenti devono restare invariati durante la build. `-h` è alias di `--help`, `-U` di `--uninstall` e `--build-dir=DIR` seleziona la cache marcata. Codici di uscita: 0 successo, 1 errore di esecuzione/validazione, 2 opzioni non valide o in conflitto.
-
-L'installazione da sorgenti compila da questo checkout. Arch `pacman`, pacchetto `.deb` Debian/Ubuntu e `.rpm` Fedora sono pianificati in [`packaging/README.md`](packaging/README.md). Sono pianificati anche Windows `setup.exe` e macOS `.dmg`; nessuno di questi artefatti è stato compilato o testato. L'installer sorgente rifiuta conflitti di proprietà con package manager.
-
-I test audit Rust coprono serializzazione, riepilogo/codici, applicabilità, fixture ed errori dei subprocessi limitati, senza root o configurazione reale degli endpoint. `npm test` copre ancora 4 casi degli strumenti di versione; non è configurato un runner UI Angular. Gli smoke dell’operatore confermano i dev server Angular e l’arresto del launcher; questo checkpoint non modifica le UI. Il lock npm v1 resta debito tecnico, come la build installer completa con cache nuova e gli audit vulnerabilità. La cache v2 verifica hash/glibc; cache precedenti richiedono una nuova build e configurazione/dati installati sono conservati.
-
-## Principi di sicurezza
-
-L'agente è progettato per effettuare prima audit, operare con privilegi minimi, funzionare indipendentemente dall'interfaccia e classificare come sconosciuti i controlli non osservabili, senza considerarli superati. Le policy server devono autorizzare i controlli; gli artefatti custom richiedono approvazione locale e verifica d'identità. Non sono ammessi shell remota o interventi correttivi impliciti. Questo checkpoint applica sonde native in sola lettura e stati veritieri. Autorizzazione policy, controlli custom ed evidenze autenticate restano futuri; le osservazioni locali non sono una certificazione resistente a manomissioni.
-
-## Requisiti e roadmap
-
-I requisiti canonici e le fasi sono nel file locale `REQUIREMENTS.md` della cartella padre (§§ 2–14). È un documento locale di sviluppo, non una dipendenza né un file pubblico di questo repository.
-
-## Mappa del repository
-
-```text
-Cargo.toml                 Workspace Rust
-crates/agent/               Eseguibile/libreria audit autonomo e confini futuri
-crates/agent/tests/         Contratti, test comandi, fixture Fedora sintetiche
-web/                        Visualizzatore locale di stato Angular indipendente
-install.sh                  Installer Linux da sorgenti; servizio differito
-packaging/README.md         Piano pacchetti Linux/Windows/macOS
-packaging/product.toml      Metadati piano: percorsi e proprietà
-```
+Questo è il primo checkpoint d'implementazione del Client semplificato, non la migrazione conclusa. Il valutatore legacy delle policy, i collector nativi e il registro workstation sono ancora nel codice, ma i relativi vecchi comandi CLI sono stati rimossi. Alcuni dei nove tool Arch sono prudenti e restituiscono `WARN`; la verifica della cifratura dei percorsi e una più ampia validazione su host reale sono incomplete. Non sono presenti pianificazione/daemon, comunicazione con il Server, policy remote, download dinamico dei tool, implementazioni Windows/macOS o correzione automatica.

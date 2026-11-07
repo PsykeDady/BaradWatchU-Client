@@ -49,6 +49,11 @@ pub enum Reason {
     RootEncrypted,
     RootUnencrypted,
     EncryptionInconclusive,
+    UpdateScopeInconclusive,
+    SecurityStateObserved,
+    EvidenceInconclusive,
+    EvidenceUnavailable,
+    HeadlessSession,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -233,7 +238,11 @@ pub struct AuditReport {
 impl AuditReport {
     /// CLI codes: execution error 1, usage 2, noncompliance 3, incomplete 4.
     pub fn exit_code(&self) -> u8 {
-        match self.policy_evaluation.as_ref().map_or(self.overall, |evaluation| evaluation.overall) {
+        match self
+            .policy_evaluation
+            .as_ref()
+            .map_or(self.overall, |evaluation| evaluation.overall)
+        {
             Status::Pass => 0,
             Status::Error => 1,
             Status::Fail => 3,
@@ -283,14 +292,31 @@ impl AuditReport {
             self.overall, s.total, s.pass, s.fail, s.warn, s.error, s.not_applicable
         );
         if let Some(evaluation) = &self.policy_evaluation {
-            let _ = writeln!(text, "Policy {}: {} (mandatory checks determine compliance)", evaluation.policy.id, evaluation.overall);
+            let _ = writeln!(
+                text,
+                "Policy {}: {} (mandatory checks determine compliance)",
+                evaluation.policy.id, evaluation.overall
+            );
             for check in &evaluation.checks {
-                let _ = writeln!(text, "  {} {} [{}]: {} — {}", check.check_id,
-                    if check.mandatory { "mandatory" } else { "informational" },
+                let _ = writeln!(
+                    text,
+                    "  {} {} [{}]: {} — {}",
+                    check.check_id,
+                    if check.mandatory {
+                        "mandatory"
+                    } else {
+                        "informational"
+                    },
                     if check.enabled { "enabled" } else { "disabled" },
-                    check.status.map_or_else(|| "DISABLED".to_owned(), |status| status.to_string()), check.reasons.join(", "));
+                    check
+                        .status
+                        .map_or_else(|| "DISABLED".to_owned(), |status| status.to_string()),
+                    check.reasons.join(", ")
+                );
             }
-            if !evaluation.context_reasons.is_empty() { let _ = writeln!(text, "  Context: {}", evaluation.context_reasons.join(", ")); }
+            if !evaluation.context_reasons.is_empty() {
+                let _ = writeln!(text, "  Context: {}", evaluation.context_reasons.join(", "));
+            }
         }
         text
     }

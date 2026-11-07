@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.audit-policy.v3",
+  "id": "encryption-coverage-example",
+  "checks": {
+    "SEC-006": { "enabled": true, "mandatory": false, "requirement": "LUKS" },
+    "SEC-015": { "enabled": true, "mandatory": true, "required": true },
+    "SEC-016": {
+      "enabled": true,
+      "mandatory": true,
+      "targets": []
+    },
+    "SEC-017": { "enabled": true, "mandatory": true, "required": true }
+  }
+}

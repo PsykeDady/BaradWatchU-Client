@@ -1,18 +1,14 @@
 use std::process::Command;
 
 #[test]
-fn bootstrap_exits_cleanly_without_service_or_ui() {
+fn no_arguments_prints_local_cli_usage_without_service_or_ui() {
     let output = Command::new(env!("CARGO_BIN_EXE_baradwatchu-agent"))
         .output()
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(concat!(
-        "BaradWatchU Client ",
-        env!("CARGO_PKG_VERSION"),
-        " bootstrap"
-    )));
-    assert!(stdout.contains(std::env::consts::OS));
+    assert!(stdout.starts_with(concat!("BaradWatchU Client ", env!("CARGO_PKG_VERSION"))));
+    assert!(stdout.contains("baradwatchu-agent audit [--json]"));
     assert!(output.stderr.is_empty());
 }
 

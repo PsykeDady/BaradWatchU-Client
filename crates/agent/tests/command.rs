@@ -93,6 +93,44 @@ fn environment_is_minimal_and_locale_is_deterministic() {
 }
 
 #[test]
+fn only_explicit_kconfig_environment_is_added_to_clean_environment() {
+    let mut spec = CommandSpec::new("/usr/bin/env", &[]);
+    for (key, value) in [
+        ("HOME", "/home/fixture with spaces"),
+        ("XDG_CONFIG_HOME", "/home/fixture with spaces/.config"),
+        ("XDG_CONFIG_DIRS", "/etc/xdg"),
+    ] {
+        spec.config_environment.insert(key.into(), value.into());
+    }
+    let output = SystemRunner.run(&spec).unwrap();
+    assert!(output
+        .stdout
+        .lines()
+        .any(|l| l == "HOME=/home/fixture with spaces"));
+    assert!(output.stdout.lines().any(|l| l == "LC_ALL=C"));
+    assert!(!output.stdout.contains("DBUS_SESSION_BUS_ADDRESS="));
+    assert!(!output.stdout.contains("LD_PRELOAD="));
+}
+
+#[test]
+fn inherited_bus_loader_path_and_proxy_overrides_are_rejected_before_spawn() {
+    for key in [
+        "DBUS_SESSION_BUS_ADDRESS",
+        "LD_PRELOAD",
+        "PATH",
+        "HTTPS_PROXY",
+        "QT_PLUGIN_PATH",
+    ] {
+        let mut spec = CommandSpec::new("/baradwatchu-nonexistent-fixture-tool", &[]);
+        spec.config_environment.insert(key.into(), "unsafe".into());
+        assert_eq!(
+            SystemRunner.run(&spec).unwrap_err().reason,
+            Reason::InvalidOutput
+        );
+    }
+}
+
+#[test]
 fn missing_read_only_tool_is_not_misreported_as_guard_failure() {
     let mut spec = CommandSpec::new("/baradwatchu-nonexistent-fixture-tool", &[]);
     spec.read_only_filesystem = true;
@@ -148,4 +186,50 @@ fn landlock_prevents_probe_writes_or_fails_before_execution() {
     // Parent remains unrestricted; cleanup is limited to this fixture directory.
     std::fs::remove_file(original).unwrap();
     std::fs::remove_dir(directory).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn null_device_exception_preserves_file_write_denial() {
+    let directory =
+        std::env::temp_dir().join(format!("baradwatchu-null-guard-{}", std::process::id()));
+    std::fs::create_dir(&directory).unwrap();
+    let original = directory.join("original");
+    std::fs::write(&original, "unchanged").unwrap();
+    let mut spec = CommandSpec::new(
+        "/bin/sh",
+        &["-c", "exec 3<>/dev/null || exit 10; printf safe >&3; if printf changed > \"$1\" 2>/dev/null; then exit 11; fi; if rm -f \"$1\" 2>/dev/null; then exit 12; fi; if mkdir \"$2\" 2>/dev/null; then exit 13; fi; if (exec 4<>/dev/zero) 2>/dev/null; then exit 14; fi", "fixture"],
+    );
+    spec.args.push(original.to_string_lossy().into_owned());
+    spec.args
+        .push(directory.join("new").to_string_lossy().into_owned());
+    spec.read_only_filesystem = true;
+    let denied = SystemRunner.run(&spec);
+    spec.allow_null_device = true;
+    let allowed = SystemRunner.run(&spec);
+    match (denied, allowed) {
+        (Ok(denied), Ok(allowed)) => {
+            assert_ne!(denied.code, Some(0));
+            assert_eq!(allowed.code, Some(0));
+        }
+        (Err(a), Err(b)) => {
+            assert_eq!(a.reason, Reason::ReadOnlyGuardUnavailable);
+            assert_eq!(b.reason, Reason::ReadOnlyGuardUnavailable);
+        }
+        other => panic!("inconsistent guard outcomes: {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), "unchanged");
+    assert!(!directory.join("new").exists());
+    std::fs::remove_file(original).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn null_device_exception_requires_guard() {
+    let mut spec = CommandSpec::new("/usr/bin/env", &[]);
+    spec.allow_null_device = true;
+    assert_eq!(
+        SystemRunner.run(&spec).unwrap_err().reason,
+        Reason::InvalidOutput
+    );
 }

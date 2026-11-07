@@ -1,6 +1,7 @@
 //! Bounded subprocess collection. Fixed native probes supply commands; never a shell.
 use crate::audit::Reason;
 use std::{
+    collections::BTreeMap,
     io::{self, Read},
     path::PathBuf,
     process::{Command, Stdio},
@@ -46,6 +47,10 @@ pub struct CommandSpec {
     pub output_limit: usize,
     /// Mandatory for tools that could write logs/cache during nominally read-only queries.
     pub read_only_filesystem: bool,
+    /// Optional exact /dev/null write access; all filesystem mutations remain denied.
+    pub allow_null_device: bool,
+    /// Only the selected current user's KConfig search paths; no inherited bus/proxy/loader variables.
+    pub config_environment: BTreeMap<String, String>,
 }
 impl CommandSpec {
     pub fn new(program: &str, args: &[&str]) -> Self {
@@ -55,6 +60,8 @@ impl CommandSpec {
             timeout: Duration::from_secs(30),
             output_limit: 256 * 1024,
             read_only_filesystem: false,
+            allow_null_device: false,
+            config_environment: BTreeMap::new(),
         }
     }
 }
@@ -112,9 +119,25 @@ fn stop(child: &mut std::process::Child) {
 
 impl CommandRunner for SystemRunner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, ProbeError> {
+        if spec.allow_null_device && !spec.read_only_filesystem {
+            return Err(ProbeError::new(
+                Reason::InvalidOutput,
+                "Null-device exception requires the read-only guard",
+            ));
+        }
         if spec.read_only_filesystem {
             // Report missing tooling even on a host where Landlock is unavailable.
             std::fs::metadata(&spec.program).map_err(ProbeError::io)?;
+        }
+        if spec
+            .config_environment
+            .keys()
+            .any(|key| !matches!(key.as_str(), "HOME" | "XDG_CONFIG_HOME" | "XDG_CONFIG_DIRS"))
+        {
+            return Err(ProbeError::new(
+                Reason::InvalidOutput,
+                "Unapproved inspection environment key",
+            ));
         }
         let mut command = Command::new(&spec.program);
         command
@@ -130,6 +153,7 @@ impl CommandRunner for SystemRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        command.envs(&spec.config_environment);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -159,8 +183,9 @@ impl CommandRunner for SystemRunner {
                 use std::os::unix::process::CommandExt;
                 // SAFETY: the hook only invokes async-signal-safe syscalls and creates
                 // errors from a constant errno; it performs no allocation or locking.
+                let allow_null = spec.allow_null_device;
                 unsafe {
-                    command.pre_exec(super::read_only::restrict);
+                    command.pre_exec(move || super::read_only::restrict(allow_null));
                 }
             }
             #[cfg(not(target_os = "linux"))]

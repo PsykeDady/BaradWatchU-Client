@@ -1,0 +1,14 @@
+{
+  "schema_version": "baradwatchu.requirements.v1",
+  "requirements": [
+    {"id":"REQ-001","name":"Aggiornamenti software","description":"Verifica se sono disponibili aggiornamenti per i pacchetti installati.","enabled":true,"priority":"HIGH","tools":{"linux":"share/baradwatchu-client/tools/linux/updates/check.sh"}},
+    {"id":"REQ-002","name":"Protezione antivirus","description":"Verifica che la protezione prevista sia disponibile e operativa.","enabled":true,"priority":"HIGHEST","tools":{"linux":"share/baradwatchu-client/tools/linux/antivirus/check.sh"}},
+    {"id":"REQ-003","name":"Protezione firewall","description":"Verifica che almeno uno tra UFW, firewalld e nftables fornisca evidenze di filtraggio operativo.","enabled":true,"priority":"HIGH","tools":{"linux":"share/baradwatchu-client/tools/linux/firewall/check.sh"}},
+    {"id":"REQ-004","name":"Filtro DNS","description":"Verifica che dnsmasq sia attivo oppure, se non è installato, che /etc/hosts contenga voci di blocco.","enabled":true,"priority":"HIGHEST","tools":{"linux":"share/baradwatchu-client/tools/linux/dns-filter/check.sh"}},
+    {"id":"REQ-005","name":"VPN aziendale","description":"Verifica lo stato di connessione dei client VPN Cato e WireGuard supportati.","enabled":true,"priority":"LOW","tools":{"linux":"share/baradwatchu-client/tools/linux/vpn/check.sh"}},
+    {"id":"REQ-006","name":"Cifratura dei dati","description":"Rileva i metodi di cifratura supportati: LUKS e eCryptfs.","enabled":true,"priority":"HIGHEST","tools":{"linux":"share/baradwatchu-client/tools/linux/encryption/check.sh"}},
+    {"id":"REQ-007","name":"Blocco schermo","description":"Verifica il blocco automatico della sessione.","enabled":true,"priority":"LOW","tools":{"linux":"share/baradwatchu-client/tools/linux/screen-lock/check.sh"}},
+    {"id":"REQ-008","name":"Sicurezza delle password","description":"Verifica scadenza, lunghezza e varietà minima richieste per le password degli account locali.","enabled":true,"priority":"HIGHEST","parameters":{"maxPasswordAgeDays":60,"minimumLength":14,"minimumClasses":4},"tools":{"linux":"share/baradwatchu-client/tools/linux/password-security/check.sh"}},
+    {"id":"REQ-009","name":"Sicurezza di avvio","description":"Verifica le protezioni della piattaforma che contribuiscono all’avvio sicuro.","enabled":true,"priority":"OPTIONAL","tools":{"linux":"share/baradwatchu-client/tools/linux/boot-security/check.sh"}}
+  ]
+}

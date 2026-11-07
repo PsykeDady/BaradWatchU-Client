@@ -1,4 +1,10 @@
-//! os-release is parsed as data, never sourced/evaluated as shell code.
+//! Shared Linux identity, environment and storage; package managers remain distro-specific.
+// os-release is parsed as data, never sourced/evaluated as shell code.
+pub mod baseline;
+pub mod coverage;
+pub mod environment;
+pub mod storage;
+pub mod topology;
 use super::command::ProbeError;
 use crate::audit::{OperatingSystem, Reason};
 use std::{
@@ -165,12 +171,57 @@ pub fn parse_os_release(
             "coreos" | "silverblue" | "kinoite" | "sericea" | "onyx" | "iot" | "bootc"
         ) || v.contains("atomic")
     });
-    let supported = id == "fedora" && !atomic && !image_variant;
+    let supported = matches!(id.as_str(), "fedora" | "arch") && !atomic && !image_variant;
+    let support_reason = if supported && id == "arch" {
+        "Native Arch Linux; offline pacman metadata, shared root-encryption inspection"
+    } else if supported {
+        "Fedora RPM/DNF5 baseline; root-filesystem encryption scope only"
+    } else {
+        "Unsupported platform: only native Arch Linux and Fedora RPM/DNF5; derivatives and image/ostree systems are excluded"
+    };
     Ok(OperatingSystem {
-        family: "linux".to_owned(), architecture: std::env::consts::ARCH.to_owned(),
-        distribution_id: Some(id), name: fields.remove("PRETTY_NAME").or_else(|| fields.remove("NAME")),
-        version_id: version, variant_id: variant, identity_source: Some(source.to_owned()), supported,
-        support_reason: if supported { "Fedora RPM/DNF5 baseline; root-filesystem encryption scope only" }
-            else { "Unsupported platform: only Fedora RPM/DNF5; derivatives and image/ostree systems are excluded" }.to_owned(),
+        family: "linux".to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        distribution_id: Some(id),
+        name: fields
+            .remove("PRETTY_NAME")
+            .or_else(|| fields.remove("NAME")),
+        version_id: version,
+        variant_id: variant,
+        identity_source: Some(source.to_owned()),
+        supported,
+        support_reason: support_reason.to_owned(),
     })
+}
+
+/// Dispatch remains outside the audit domain and policy engine. Recheck identity rather
+/// than invoking a package manager if the OS becomes unsupported between probes.
+pub fn pending_updates(runner: &dyn super::command::CommandRunner) -> crate::audit::Outcome {
+    match detect() {
+        Ok(os) => pending_updates_for(&os, runner, &super::arch::SystemMetadata),
+        Err(error) => super::probe::failure(error, "OS identity", "update applicability"),
+    }
+}
+pub fn pending_updates_for(
+    os: &OperatingSystem,
+    runner: &dyn super::command::CommandRunner,
+    metadata: &dyn super::arch::Metadata,
+) -> crate::audit::Outcome {
+    use crate::audit::{Outcome, Status};
+    if os.supported {
+        match os.distribution_id.as_deref() {
+            Some("arch") => return super::arch::updates(runner, metadata),
+            Some("fedora") => return super::fedora::updates(runner),
+            _ => {}
+        }
+    }
+    Outcome::new(
+        Status::NotApplicable,
+        Reason::UnsupportedPlatform,
+        "Package inspection requires native Arch Linux or Fedora RPM/DNF5",
+    )
+}
+pub fn root_encryption(runner: &dyn super::command::CommandRunner) -> crate::audit::Outcome {
+    let environment = environment::detect(runner, &environment::SystemSignals);
+    storage::encryption_in_environment(runner, &topology::SysfsTopology, &environment)
 }

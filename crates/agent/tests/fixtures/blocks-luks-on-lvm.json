@@ -1,0 +1,1 @@
+{"blockdevices":[{"maj:min":"8:0","type":"disk","fstype":null,"children":[{"maj:min":"8:2","type":"part","fstype":"LVM2_member","children":[{"maj:min":"253:1","type":"lvm","fstype":"crypto_LUKS","children":[{"maj:min":"253:0","type":"crypt","fstype":"ext4"}]}]}]}]}

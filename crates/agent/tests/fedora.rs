@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+mod common;
 use baradwatchu_agent::{
     audit::{Clock, OperatingSystem, Outcome, Reason, Status},
     checks::builtin,
@@ -27,6 +28,16 @@ impl Runner {
 impl CommandRunner for Runner {
     fn run(&self, spec: &CommandSpec) -> Result<CommandOutput, ProbeError> {
         self.commands.borrow_mut().push(spec.clone());
+        // Supply deterministic auxiliary CP2 metadata for CP1 availability fixtures.
+        if spec.args.iter().any(|arg| arg == "repo") {
+            return output(0, include_str!("fixtures/dnf-repos.json"), "");
+        }
+        if spec.args.iter().any(|arg| arg == "repoquery") {
+            return output(0, include_str!("fixtures/dnf-candidates.txt"), "");
+        }
+        if spec.args.iter().any(|arg| arg == "advisory") {
+            return output(0, "[]", "");
+        }
         self.outputs
             .borrow_mut()
             .pop_front()
@@ -47,7 +58,7 @@ fn os_identity_uses_id_not_id_like_and_handles_quotes() {
     assert!(os.supported);
     assert_eq!(os.version_id.as_deref(), Some("43"));
     assert_eq!(os.variant_id.as_deref(), Some("workstation"));
-    for id in ["arch", "ubuntu", "debian", "rhel", "derivative"] {
+    for id in ["manjaro", "ubuntu", "debian", "rhel", "derivative"] {
         let text = format!("ID={id}\nNAME='Fixture Linux'\nID_LIKE=\"fedora rhel\"\n");
         let os = linux::parse_os_release(&text, "fixture", false).unwrap();
         assert!(!os.supported);
@@ -109,7 +120,7 @@ fn os_release_fallback_and_precedence() {
             .unwrap()
             .supported
     );
-    std::fs::write(&primary, "ID=arch\nNAME=Arch").unwrap();
+    std::fs::write(&primary, "ID=manjaro\nNAME=Manjaro").unwrap();
     assert!(
         !linux::read_identity(&primary, &fallback, false)
             .unwrap()
@@ -221,10 +232,10 @@ fn dnf_permission_execution_and_timeout_are_errors() {
 }
 
 fn encryption(root: &str, blocks: &str) -> Outcome {
-    fedora::encryption(&Runner::new(vec![
-        output(0, root, ""),
-        output(0, blocks, ""),
-    ]))
+    fedora::encryption_with_topology(
+        &Runner::new(vec![output(0, root, ""), output(0, blocks, "")]),
+        &common::Kernel::fixture(blocks),
+    )
 }
 #[test]
 fn encrypted_root_and_lvm_on_luks_pass() {
@@ -249,14 +260,7 @@ fn unrelated_luks_never_proves_root_encryption() {
 }
 #[test]
 fn every_root_backing_path_must_be_encrypted() {
-    let mut blocks: serde_json::Value = serde_json::from_str(ENCRYPTED).unwrap();
-    let plain: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/blocks-plain-unrelated-luks.json")).unwrap();
-    blocks["blockdevices"]
-        .as_array_mut()
-        .unwrap()
-        .push(plain["blockdevices"][0].clone());
-    let result = encryption(ROOT, &blocks.to_string());
+    let result = encryption(ROOT, include_str!("fixtures/blocks-lvm-mixed.json"));
     assert_eq!(result.status, Status::Fail);
     assert_eq!(result.evidence[0].values["rootBackingPaths"], 2);
 }
@@ -327,7 +331,7 @@ impl AuditPlatform for FixtureFedora {
         fedora::updates(&self.0)
     }
     fn root_encryption(&self) -> Outcome {
-        fedora::encryption(&self.0)
+        fedora::encryption_with_topology(&self.0, &common::Kernel::fixture(ENCRYPTED))
     }
 }
 #[test]
