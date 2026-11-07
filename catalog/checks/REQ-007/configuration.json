@@ -7,8 +7,11 @@
   "enabled": true,
   "toolPath": "./check.sh",
   "arguments": [],
-  "expectedSha256": "071a3dc2d3848902378c97b428a891e4d8bea1b6b9254b7fce31d5ab83da1cd4",
+  "expectedSha256": "b12f04056f6bc90bc8f1646406ec99e36ecc0d297711853e6f7969ee4b4c997d",
   "version": 1,
-  "parameters": {},
+  "parameters": {
+    "maxTimeoutMinutes": 5,
+    "maxLockGraceSeconds": 0
+  },
   "overrideBuiltinId": null
 }

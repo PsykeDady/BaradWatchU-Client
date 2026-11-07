@@ -3,6 +3,10 @@ use std::ffi::OsString;
 
 #[test]
 fn legacy_commands_and_options_are_rejected() {
+    // Isolate XDG paths: the CLI may scan configuration before rejecting an option.
+    let root = std::env::temp_dir().join(format!("bwu-policy-cli-{}", std::process::id()));
+    std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
+    std::env::set_var("XDG_STATE_HOME", root.join("state"));
     for command in [
         vec!["workstation", "list"],
         vec!["workstation", "audit"],

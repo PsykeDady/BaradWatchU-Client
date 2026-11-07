@@ -27,13 +27,11 @@ fn copy_tree(source: &Path, destination: &Path) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../scripts/adapters/SEC-011.sh");
     println!("cargo:rerun-if-changed=../../catalog");
     println!("cargo:rerun-if-changed=../../catalog/checks");
     println!("cargo:rerun-if-changed=../../web/src");
     println!("cargo:rerun-if-changed=../../web/dist/client-status/browser");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let source = manifest.join("../../scripts/adapters/SEC-011.sh");
     let catalog = manifest.join("../../catalog");
     let web = manifest.join("../../web/dist/client-status/browser");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
@@ -67,8 +65,13 @@ fn main() {
         if web.is_dir() {
             copy_tree(&web, &target.join("web"));
         }
-        let adapter = target.join("checks/SEC-011.sh");
-        fs::create_dir_all(adapter.parent().unwrap()).expect("Create adapter artifact directory");
-        fs::copy(&source, &adapter).expect("Stage approved adapter artifact");
+        // The legacy SEC-011 adapter is no longer shipped; drop stale staged copies.
+        let obsolete_adapters = target.join("checks");
+        if fs::symlink_metadata(&obsolete_adapters)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            fs::remove_dir_all(&obsolete_adapters)
+                .expect("Remove obsolete legacy adapter directory");
+        }
     }
 }

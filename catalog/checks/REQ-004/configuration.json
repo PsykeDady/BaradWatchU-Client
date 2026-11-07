@@ -7,8 +7,11 @@
   "enabled": true,
   "toolPath": "./check.sh",
   "arguments": [],
-  "expectedSha256": "0d0481cca82bf85f04ff9598ad6c9f8f43ebb33937fb989279c651be5db1ba86",
+  "expectedSha256": "1037388c9a37041357ed36dd118b12491062a30c6cbdbd94b87c5be06ee72162",
   "version": 1,
-  "parameters": {},
+  "parameters": {
+    "minimumHostsEntries": 10000,
+    "minimumDnsmasqRules": 1000
+  },
   "overrideBuiltinId": null
 }

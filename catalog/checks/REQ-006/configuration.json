@@ -7,7 +7,7 @@
   "enabled": true,
   "toolPath": "./check.sh",
   "arguments": [],
-  "expectedSha256": "a078114a730fb6ba6edcd2edf1a43c3b0b242c6491da23fbdab3618d1b9f09fa",
+  "expectedSha256": "4b0b20970976b83a63902b692a3c3cd29a9bbe357871fd03a3779d5f08d0c2cc",
   "version": 1,
   "parameters": {},
   "overrideBuiltinId": null

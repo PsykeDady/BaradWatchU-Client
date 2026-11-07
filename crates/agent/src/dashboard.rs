@@ -204,6 +204,10 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
             let id = &path["/api/custom-checks/restore/".len()..];
             api(requirements::dashboard_restore_builtin(id))
         }
+        ("POST", path) if path.starts_with("/api/custom-checks/accept/") => {
+            let id = &path["/api/custom-checks/accept/".len()..];
+            api(requirements::dashboard_accept_custom(id))
+        }
         ("DELETE", path) if path.starts_with("/api/custom-checks/") => {
             let id = &path["/api/custom-checks/".len()..];
             api(requirements::dashboard_remove_custom(id))
@@ -307,6 +311,7 @@ mod tests {
 
     #[test]
     fn routes_only_supported_methods_and_known_endpoints() {
+        let _env = requirements::TestEnv::new("dashboard-routes");
         let path = PathBuf::from("/does/not/exist");
         assert_eq!(route("GET", "/api/nope", &[], &path).status, 404);
         assert_eq!(route("DELETE", "/api/audit", &[], &path).status, 405);
@@ -326,6 +331,17 @@ mod tests {
             route("DELETE", "/api/custom-checks/CUSTOM-UNKNOWN", b"{}", &path).status,
             400
         );
+        assert_eq!(
+            route(
+                "POST",
+                "/api/custom-checks/accept/CUSTOM-UNKNOWN",
+                b"{}",
+                &path
+            )
+            .status,
+            400
+        );
+        assert_eq!(route("GET", "/api/requirements", &[], &path).status, 200);
         assert_eq!(
             route("GET", "/api/history/not-a-timestamp", &[], &path).status,
             400

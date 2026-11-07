@@ -14,7 +14,18 @@ use std::{
 };
 
 const MAX_TOOL_OUTPUT: usize = 64 * 1024;
-const TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_TOOL_STDERR: usize = 4 * 1024;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
+const MAX_TIMEOUT_SECONDS: u64 = 300;
+/// Folder (under `$XDG_CONFIG_HOME/baradwatchu/`) holding one sub-folder per custom check.
+const CUSTOM_DIR: &str = "custom-checks";
+/// Pre-release name of [`CUSTOM_DIR`]; migrated once by renaming it.
+const LEGACY_CUSTOM_DIR: &str = "custom-tools";
+const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
+
+fn default_timeout_seconds() -> u64 {
+    DEFAULT_TIMEOUT_SECONDS
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -62,8 +73,9 @@ impl std::fmt::Display for Priority {
     }
 }
 
+/// In-memory control; serialized in camelCase for `list --json` and the dashboard API.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Requirement {
     pub id: String,
     pub name: String,
@@ -74,7 +86,12 @@ pub struct Requirement {
     pub parameters: serde_json::Value,
     #[serde(default)]
     pub arguments: Vec<String>,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
     pub tools: BTreeMap<String, String>,
+    /// Set when a custom check folder exists but cannot be used; the check reports ERROR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_error: Option<String>,
     #[serde(default)]
     pub origin: ControlOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -134,11 +151,21 @@ struct Catalog {
     requirements: Vec<Requirement>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Default)]
 struct CustomRegistry {
-    schema_version: String,
     checks: Vec<CustomEntry>,
+    /// Custom folders whose configuration cannot be used: (folder ID, name, reason).
+    broken: Vec<BrokenCustom>,
+    /// Folders with a configuration.json but a name that is not a valid custom ID.
+    ignored: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct BrokenCustom {
+    id: String,
+    name: Option<String>,
+    priority: Option<Priority>,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -158,6 +185,8 @@ struct CustomEntry {
     parameters: serde_json::Value,
     #[serde(default)]
     override_builtin_id: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +206,8 @@ struct ImportRequest {
     file_base64: String,
     #[serde(default)]
     arguments: Vec<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -311,9 +342,37 @@ impl Drop for TemporaryTool {
     }
 }
 
+fn broken_requirement(broken: BrokenCustom) -> Requirement {
+    Requirement {
+        id: broken.id.clone(),
+        name: broken.name.unwrap_or_else(|| broken.id.clone()),
+        description: "Configurazione del controllo personalizzato non utilizzabile.".into(),
+        enabled: true,
+        priority: broken.priority.unwrap_or(Priority::Optional),
+        parameters: empty_parameters(),
+        arguments: vec![],
+        timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+        tools: BTreeMap::new(),
+        configuration_error: Some(broken.reason),
+        origin: ControlOrigin::Custom,
+        expected_sha256: None,
+        replaces_builtin: None,
+        custom_tool_id: Some(broken.id),
+        custom_tool_version: None,
+        builtin_tool_path: None,
+        actual_sha256: None,
+        integrity_status: IntegrityStatus::Unknown,
+    }
+}
+
 fn catalog() -> Result<Catalog, CliError> {
-    // Discover controls from their folders on every call. `refresh` deliberately calls
-    // this same scanner; there is no persisted/in-memory registry to go stale.
+    catalog_with_registry().map(|(catalog, _)| catalog)
+}
+
+/// Discover controls from their folders on every call. `refresh` deliberately calls this
+/// same scanner; there is no persisted/in-memory registry to go stale. A broken custom
+/// folder becomes an ERROR control of its own and never hides the other controls.
+fn catalog_with_registry() -> Result<(Catalog, CustomRegistry), CliError> {
     let install = install_root()?;
     let requirements = discover_builtin_checks(&install)?;
     if requirements.is_empty() {
@@ -329,46 +388,46 @@ fn catalog() -> Result<Catalog, CliError> {
         .iter()
         .map(|r| r.id.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let mut seen_custom = std::collections::BTreeSet::new();
     let mut seen_overrides = std::collections::BTreeSet::new();
-    for entry in registry.checks {
-        if !valid_custom_id(&entry.id)
-            || !seen_custom.insert(entry.id.clone())
-            || entry.name.trim().is_empty()
-            || entry.name.len() > 160
-            || entry.description.len() > 2048
-            || !entry.parameters.is_object()
-            || entry.expected_sha256.len() != 64
-            || !entry.expected_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-            || !safe_relative_path(&entry.tool_path)
-        {
-            return Err(CliError(
-                "Custom-check registry contains an invalid entry".into(),
-            ));
-        }
-        if let Some(target) = entry.override_builtin_id.as_deref() {
-            if !builtin_ids.contains(target) || !seen_overrides.insert(target.to_owned()) {
-                return Err(CliError(
-                    "Custom-check override target is invalid or duplicated".into(),
-                ));
+    let mut broken = registry.broken.clone();
+    for entry in registry.checks.iter().cloned() {
+        if let Some(target) = entry.override_builtin_id.clone() {
+            let problem = if !builtin_ids.contains(&target) {
+                Some(format!(
+                    "overrideBuiltinId \"{target}\" non corrisponde a un controllo integrato"
+                ))
+            } else if !seen_overrides.insert(target.clone()) {
+                Some(format!(
+                    "il controllo integrato {target} è già sostituito da un altro controllo personalizzato"
+                ))
+            } else {
+                None
+            };
+            if let Some(reason) = problem {
+                broken.push(BrokenCustom {
+                    id: entry.id,
+                    name: Some(entry.name),
+                    priority: Some(entry.priority),
+                    reason,
+                });
+                continue;
             }
             let builtin = value
                 .requirements
                 .iter_mut()
                 .find(|r| r.id == target)
-                .unwrap();
+                .expect("override target was checked against builtin IDs");
             builtin.builtin_tool_path = builtin.tools.get(platform_key()).cloned();
             builtin.tools.insert(platform_key().into(), entry.tool_path);
             builtin.expected_sha256 = Some(entry.expected_sha256);
             builtin.arguments = entry.arguments;
+            builtin.timeout_seconds = entry.timeout_seconds.unwrap_or(builtin.timeout_seconds);
             builtin.origin = ControlOrigin::Custom;
-            builtin.replaces_builtin = Some(target.to_owned());
+            builtin.replaces_builtin = Some(target);
             builtin.custom_tool_id = Some(entry.id);
             builtin.custom_tool_version = Some(entry.version);
             builtin.enabled = entry.enabled;
         } else {
-            let mut tools = BTreeMap::new();
-            tools.insert(platform_key().into(), entry.tool_path);
             value.requirements.push(Requirement {
                 id: entry.id.clone(),
                 name: entry.name,
@@ -377,7 +436,9 @@ fn catalog() -> Result<Catalog, CliError> {
                 priority: entry.priority,
                 parameters: entry.parameters,
                 arguments: entry.arguments,
-                tools,
+                timeout_seconds: entry.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS),
+                tools: BTreeMap::from([(platform_key().into(), entry.tool_path)]),
+                configuration_error: None,
                 origin: ControlOrigin::Custom,
                 expected_sha256: Some(entry.expected_sha256),
                 replaces_builtin: None,
@@ -389,11 +450,18 @@ fn catalog() -> Result<Catalog, CliError> {
             });
         }
     }
+    value
+        .requirements
+        .extend(broken.into_iter().map(broken_requirement));
+    // Built-in IDs (including overridden ones) first, then custom controls by ID.
+    value.requirements.sort_by(|a, b| {
+        (!builtin_ids.contains(&a.id), &a.id).cmp(&(!builtin_ids.contains(&b.id), &b.id))
+    });
     let mut ids = std::collections::BTreeSet::new();
     for requirement in &value.requirements {
         if requirement.id.is_empty()
             || !ids.insert(requirement.id.as_str())
-            || requirement.tools.is_empty()
+            || (requirement.configuration_error.is_none() && requirement.tools.is_empty())
             || requirement
                 .tools
                 .values()
@@ -404,7 +472,7 @@ fn catalog() -> Result<Catalog, CliError> {
             ));
         }
     }
-    Ok(value)
+    Ok((value, registry))
 }
 
 #[derive(Deserialize)]
@@ -427,70 +495,118 @@ struct CheckConfiguration {
     version: Option<u64>,
     #[serde(default)]
     override_builtin_id: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
 }
 
-fn discover_check_folders(parent: &Path) -> Result<Vec<(PathBuf, CheckConfiguration)>, CliError> {
-    let metadata = match fs::symlink_metadata(parent) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Validate one parsed `configuration.json`; the message is shown to the user as-is.
+fn validate_configuration(folder: &str, config: &CheckConfiguration) -> Result<(), String> {
+    if config.schema_version != CHECK_SCHEMA {
+        return Err(format!("schemaVersion deve essere \"{CHECK_SCHEMA}\""));
+    }
+    if config.id != folder {
+        return Err(format!(
+            "id \"{}\" diverso dal nome della cartella \"{folder}\"",
+            config.id
+        ));
+    }
+    if config.name.trim().is_empty() || config.name.len() > 160 {
+        return Err("name è obbligatorio (massimo 160 caratteri)".into());
+    }
+    if config.description.len() > 2048 {
+        return Err("description supera 2048 caratteri".into());
+    }
+    if !config.parameters.is_object() {
+        return Err("parameters deve essere un oggetto JSON".into());
+    }
+    if config.arguments.len() > 64 || config.arguments.iter().any(|arg| arg.len() > 4096) {
+        return Err("arguments ammette al massimo 64 stringhe di 4096 caratteri".into());
+    }
+    if !safe_relative_path(&config.tool_path) {
+        return Err(
+            "toolPath deve essere un percorso relativo alla cartella del controllo (es. ./check.sh)"
+                .into(),
+        );
+    }
+    if config
+        .timeout_seconds
+        .is_some_and(|value| value == 0 || value > MAX_TIMEOUT_SECONDS)
+    {
+        return Err(format!(
+            "timeoutSeconds deve essere compreso tra 1 e {MAX_TIMEOUT_SECONDS}"
+        ));
+    }
+    if config
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|hash| !valid_sha256(hash))
+    {
+        return Err("expectedSha256 deve contenere 64 cifre esadecimali".into());
+    }
+    Ok(())
+}
+
+type DiscoveredFolder = (PathBuf, String, Result<CheckConfiguration, String>);
+
+/// Scan `parent` for `<ID>/configuration.json`. Root-level problems are errors; problems
+/// with one folder are reported per folder so callers can decide how strict to be.
+fn discover_check_folders(parent: &Path) -> Result<Vec<DiscoveredFolder>, CliError> {
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
         Ok(_) => return Err(CliError("Check folder root is unsafe".into())),
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(CliError("Cannot inspect check folders".into())),
-    };
-    let _ = metadata;
+    }
     let mut discovered = Vec::new();
     for entry in fs::read_dir(parent).map_err(|_| CliError("Cannot scan check folders".into()))? {
         let entry = entry.map_err(|_| CliError("Cannot read check folder".into()))?;
         let folder = entry.path();
-        let meta = fs::symlink_metadata(&folder)
-            .map_err(|_| CliError("Cannot inspect a check folder".into()))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Ok(meta) = fs::symlink_metadata(&folder) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.file_type().is_symlink() || name.starts_with('.') {
             continue;
         }
         let config = folder.join("configuration.json");
-        let meta = match fs::symlink_metadata(&config) {
-            Ok(meta)
-                if meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 64 * 1024 =>
-            {
-                meta
-            }
-            Ok(_) => continue,
+        let parsed = match fs::symlink_metadata(&config) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(CliError("Cannot inspect check configuration".into())),
+            Err(_) => Err("configuration.json non è ispezionabile".to_owned()),
+            Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                Err("configuration.json deve essere un file regolare, non un link".to_owned())
+            }
+            Ok(meta) if meta.len() > 64 * 1024 => {
+                Err("configuration.json supera 64 KiB".to_owned())
+            }
+            Ok(_) => fs::read(&config)
+                .map_err(|_| "configuration.json non è leggibile".to_owned())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<CheckConfiguration>(&bytes)
+                        .map_err(|error| format!("configuration.json non valido: {error}"))
+                })
+                .and_then(|parsed| validate_configuration(&name, &parsed).map(|_| parsed)),
         };
-        let _ = meta;
-        let bytes =
-            fs::read(&config).map_err(|_| CliError("Cannot read check configuration".into()))?;
-        let parsed: CheckConfiguration = serde_json::from_slice(&bytes).map_err(|_| {
-            CliError(format!(
-                "Invalid configuration.json in {}",
-                folder.display()
-            ))
-        })?;
-        if parsed.schema_version != "baradwatchu.custom-checks.v1"
-            || parsed.id != entry.file_name().to_string_lossy()
-            || parsed.name.trim().is_empty()
-            || parsed.name.len() > 160
-            || parsed.description.len() > 2048
-            || !parsed.parameters.is_object()
-            || parsed.arguments.len() > 64
-            || parsed.arguments.iter().any(|arg| arg.len() > 4096)
-            || !safe_relative_path(&parsed.tool_path)
-        {
-            return Err(CliError(format!(
-                "Invalid check configuration for {}",
-                parsed.id
-            )));
-        }
-        discovered.push((folder, parsed));
+        discovered.push((folder, name, parsed));
     }
-    discovered.sort_by(|a, b| a.1.id.cmp(&b.1.id));
+    discovered.sort_by(|a, b| a.1.cmp(&b.1));
     Ok(discovered)
 }
 
 fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError> {
     let parent = install.join("share/baradwatchu-client/catalog/checks");
+    let root = install
+        .canonicalize()
+        .map_err(|_| CliError("Cannot locate Client installation".into()))?;
     let mut requirements = Vec::new();
-    for (folder, config) in discover_check_folders(&parent)? {
+    for (folder, name, parsed) in discover_check_folders(&parent)? {
+        // Built-ins are package-owned: any defect is an installation error, not a skip.
+        let config = parsed.map_err(|reason| {
+            CliError(format!("Invalid check configuration for {name}: {reason}"))
+        })?;
         let trusted_hash = builtin_hash(&config.id, platform_key());
         if config.expected_sha256.as_deref() != trusted_hash.as_deref() {
             return Err(CliError(format!(
@@ -502,15 +618,12 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             .join(&config.tool_path)
             .canonicalize()
             .map_err(|_| CliError(format!("Tool missing for {}", config.id)))?;
-        let root = install
-            .canonicalize()
-            .map_err(|_| CliError("Cannot locate Client installation".into()))?;
         if !tool.starts_with(&root) || !tool.is_file() {
             return Err(CliError(format!("Unsafe tool path for {}", config.id)));
         }
         let relative = tool
             .strip_prefix(&root)
-            .unwrap()
+            .expect("tool is inside the installation root")
             .to_string_lossy()
             .replace('\\', "/");
         requirements.push(Requirement {
@@ -521,7 +634,9 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             priority: config.priority,
             parameters: config.parameters,
             arguments: config.arguments,
+            timeout_seconds: config.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS),
             tools: BTreeMap::from([(platform_key().into(), relative)]),
+            configuration_error: None,
             origin: ControlOrigin::Builtin,
             expected_sha256: trusted_hash,
             replaces_builtin: None,
@@ -537,49 +652,89 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
 
 fn valid_custom_id(id: &str) -> bool {
     id.starts_with("CUSTOM-")
+        && id.len() > 7
         && id.len() <= 64
         && id[7..]
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
-        && id.len() > 7
+}
+
+/// `$XDG_CONFIG_HOME/baradwatchu/custom-checks`, migrating the pre-release
+/// `custom-tools` folder in place (one rename, contents untouched) when needed.
+fn custom_root() -> Result<PathBuf, CliError> {
+    let base = state_dir()?;
+    let current = base.join(CUSTOM_DIR);
+    let legacy = base.join(LEGACY_CUSTOM_DIR);
+    if fs::symlink_metadata(&current).is_err() {
+        if let Ok(metadata) = fs::symlink_metadata(&legacy) {
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::rename(&legacy, &current).map_err(|_| {
+                    CliError(format!(
+                        "Cannot migrate {} to {}",
+                        legacy.display(),
+                        current.display()
+                    ))
+                })?;
+            }
+        }
+    }
+    Ok(current)
 }
 
 fn load_custom_registry() -> Result<CustomRegistry, CliError> {
-    let root = state_dir()?;
-    let mut checks = Vec::new();
-    for (folder, config) in discover_check_folders(&root.join("custom-tools"))? {
-        if !valid_custom_id(&config.id) {
-            return Err(CliError(format!("Invalid custom check ID: {}", config.id)));
+    let root = custom_root()?;
+    let mut registry = CustomRegistry::default();
+    for (_, name, parsed) in discover_check_folders(&root)? {
+        if !valid_custom_id(&name) {
+            registry.ignored.push(name);
+            continue;
         }
+        let config = match parsed {
+            Ok(config) => config,
+            Err(reason) => {
+                registry.broken.push(BrokenCustom {
+                    id: name,
+                    name: None,
+                    priority: None,
+                    reason,
+                });
+                continue;
+            }
+        };
+        let Some(expected_sha256) = config.expected_sha256.clone() else {
+            registry.broken.push(BrokenCustom {
+                reason: format!(
+                    "expectedSha256 mancante: fissa l'hash del tool con `baradwatchu-agent custom accept {name}` oppure dalla dashboard"
+                ),
+                id: name,
+                name: Some(config.name),
+                priority: Some(config.priority),
+            });
+            continue;
+        };
         let local_tool = config
             .tool_path
             .strip_prefix("./")
             .unwrap_or(&config.tool_path);
-        checks.push(CustomEntry {
-            id: config.id,
+        registry.checks.push(CustomEntry {
+            tool_path: format!("{CUSTOM_DIR}/{name}/{local_tool}"),
+            id: name,
             name: config.name,
             description: config.description,
             priority: config.priority,
             enabled: config.enabled,
-            tool_path: format!(
-                "custom-tools/{}/{}",
-                folder.file_name().unwrap().to_string_lossy(),
-                local_tool
-            ),
             arguments: config.arguments,
-            expected_sha256: config.expected_sha256.unwrap_or_default(),
+            expected_sha256,
             version: config.version.unwrap_or(1),
             parameters: config.parameters,
             override_builtin_id: config.override_builtin_id,
+            timeout_seconds: config.timeout_seconds,
         });
     }
-    if checks.len() > 256 {
+    if registry.checks.len() + registry.broken.len() > 256 {
         return Err(CliError("Too many custom check folders".into()));
     }
-    Ok(CustomRegistry {
-        schema_version: "baradwatchu.custom-checks.v1".into(),
-        checks,
-    })
+    Ok(registry)
 }
 
 fn decode_base64(value: &str) -> Result<Vec<u8>, CliError> {
@@ -634,38 +789,95 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, CliError> {
     Ok(output)
 }
 
-fn save_custom_entry(entry: &CustomEntry) -> Result<(), CliError> {
-    let folder = state_dir()?.join("custom-tools").join(&entry.id);
+/// On-disk `configuration.json`, serialized in the documented field order.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigurationFile<'a> {
+    schema_version: &'a str,
+    id: &'a str,
+    name: &'a str,
+    description: &'a str,
+    priority: Priority,
+    enabled: bool,
+    tool_path: &'a str,
+    arguments: &'a [String],
+    expected_sha256: Option<&'a str>,
+    version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    parameters: &'a serde_json::Value,
+    override_builtin_id: Option<&'a str>,
+}
+
+fn valid_tool_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with('.')
+        && name != "configuration.json"
+        && !name.contains(['/', '\\', '\0'])
+        && Path::new(name).file_name().and_then(|n| n.to_str()) == Some(name)
+}
+
+fn custom_folder(id: &str) -> Result<PathBuf, CliError> {
+    if !valid_custom_id(id) {
+        return Err(CliError("Invalid custom check ID".into()));
+    }
+    Ok(custom_root()?.join(id))
+}
+
+fn prepare_custom_folder(id: &str) -> Result<PathBuf, CliError> {
+    let folder = custom_folder(id)?;
     fs::create_dir_all(&folder)
         .map_err(|_| CliError("Cannot create custom check folder".into()))?;
-    secure_dir(folder.parent().unwrap())?;
+    secure_dir(&state_dir()?)?;
+    secure_dir(folder.parent().expect("custom folder has a parent"))?;
     secure_dir(&folder)?;
-    let prefix = format!("custom-tools/{}/", entry.id);
-    let local_tool = entry
+    Ok(folder)
+}
+
+fn local_tool_path(entry: &CustomEntry) -> Result<&str, CliError> {
+    let prefix = format!("{CUSTOM_DIR}/{}/", entry.id);
+    entry
         .tool_path
         .strip_prefix(&prefix)
-        .ok_or_else(|| CliError("Invalid custom tool path".into()))?;
-    let config = serde_json::json!({
-        "schemaVersion":"baradwatchu.custom-checks.v1", "id":entry.id, "name":entry.name,
-        "description":entry.description, "priority":entry.priority, "enabled":entry.enabled,
-        "toolPath":format!("./{local_tool}"), "arguments":entry.arguments,
-        "expectedSha256":entry.expected_sha256, "version":entry.version,
-        "parameters":entry.parameters, "overrideBuiltinId":entry.override_builtin_id
-    });
+        .filter(|local| safe_relative_path(local))
+        .ok_or_else(|| CliError("Invalid custom tool path".into()))
+}
+
+fn save_custom_entry(entry: &CustomEntry) -> Result<(), CliError> {
+    let folder = prepare_custom_folder(&entry.id)?;
+    let tool_path = format!("./{}", local_tool_path(entry)?);
+    let config = ConfigurationFile {
+        schema_version: CHECK_SCHEMA,
+        id: &entry.id,
+        name: &entry.name,
+        description: &entry.description,
+        priority: entry.priority,
+        enabled: entry.enabled,
+        tool_path: &tool_path,
+        arguments: &entry.arguments,
+        expected_sha256: Some(&entry.expected_sha256),
+        version: entry.version,
+        timeout_seconds: entry.timeout_seconds,
+        parameters: &entry.parameters,
+        override_builtin_id: entry.override_builtin_id.as_deref(),
+    };
     atomic_json(&folder.join("configuration.json"), &config)
 }
 
-fn store_custom_tool(id: &str, bytes: &[u8]) -> Result<(String, String), CliError> {
-    let directory = state_dir()?;
-    let tools = directory.join("custom-tools").join(id);
-    fs::create_dir_all(&tools)
-        .map_err(|_| CliError("Cannot create custom tool directory".into()))?;
-    secure_dir(&directory)?;
-    secure_dir(tools.parent().unwrap())?;
-    secure_dir(&tools)?;
-    let relative = format!("custom-tools/{id}/{id}.tool");
-    let path = directory.join(&relative);
-    let temp = tools.join(format!(".tmp-{}-{}", std::process::id(), now_ms()));
+/// Atomically write `bytes` as `<custom-checks>/<id>/<local>` (mode 0700) and return the
+/// state-relative path plus its SHA-256.
+fn store_custom_tool(id: &str, local: &str, bytes: &[u8]) -> Result<(String, String), CliError> {
+    if !safe_relative_path(local) || local.ends_with("configuration.json") {
+        return Err(CliError("Invalid custom tool file name".into()));
+    }
+    let folder = prepare_custom_folder(id)?;
+    let path = folder.join(local);
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| CliError("Custom tool directory is missing".into()))?;
+    let temp = parent.join(format!(".tmp-{}-{}", std::process::id(), now_ms()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -676,12 +888,17 @@ fn store_custom_tool(id: &str, bytes: &[u8]) -> Result<(String, String), CliErro
     let mut file = options
         .open(&temp)
         .map_err(|_| CliError("Cannot stage custom tool".into()))?;
-    file.write_all(bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|_| CliError("Cannot write custom tool".into()))?;
-    fs::rename(&temp, &path).map_err(|_| CliError("Cannot install custom tool".into()))?;
+    if file.write_all(bytes).and_then(|_| file.sync_all()).is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(CliError("Cannot write custom tool".into()));
+    }
+    fs::rename(&temp, &path).map_err(|_| {
+        let _ = fs::remove_file(&temp);
+        CliError("Cannot install custom tool".into())
+    })?;
+    let local = local.strip_prefix("./").unwrap_or(local);
     Ok((
-        relative,
+        format!("{CUSTOM_DIR}/{id}/{local}"),
         sha256_bytes(bytes).ok_or_else(|| CliError("Cannot calculate SHA-256".into()))?,
     ))
 }
@@ -692,39 +909,48 @@ pub(crate) fn dashboard_import_custom(text: &str) -> Result<String, CliError> {
     }
     let request: ImportRequest = serde_json::from_str(text)
         .map_err(|_| CliError("Custom-check import is invalid".into()))?;
-    if !valid_custom_id(&request.id)
-        || request.name.trim().is_empty()
-        || request.name.len() > 160
-        || request.description.len() > 2048
-        || request.file_name.is_empty()
-        || request.file_name.len() > 255
-        || request.arguments.len() > 64
-        || request.arguments.iter().any(|arg| arg.len() > 4096)
-        || Path::new(&request.file_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            != Some(request.file_name.as_str())
-    {
+    if !valid_custom_id(&request.id) {
         return Err(CliError(
-            "Custom-check ID, name or description is invalid".into(),
+            "L'ID deve iniziare con CUSTOM- seguito da lettere maiuscole, cifre o trattini".into(),
         ));
     }
+    if request.name.trim().is_empty()
+        || request.name.len() > 160
+        || request.description.len() > 2048
+    {
+        return Err(CliError(
+            "Nome obbligatorio (max 160 caratteri), descrizione max 2048 caratteri".into(),
+        ));
+    }
+    if !valid_tool_file_name(&request.file_name) {
+        return Err(CliError("Nome del file del tool non valido".into()));
+    }
+    if request.arguments.len() > 64 || request.arguments.iter().any(|arg| arg.len() > 4096) {
+        return Err(CliError(
+            "Troppi argomenti o argomenti troppo lunghi".into(),
+        ));
+    }
+    if request
+        .timeout_seconds
+        .is_some_and(|value| value == 0 || value > MAX_TIMEOUT_SECONDS)
+    {
+        return Err(CliError(format!(
+            "timeoutSeconds deve essere compreso tra 1 e {MAX_TIMEOUT_SECONDS}"
+        )));
+    }
     let bytes = decode_base64(&request.file_base64)?;
-    let catalog = catalog()?;
-    let mut registry = load_custom_registry()?;
-    if registry.checks.iter().any(|c| c.id == request.id) {
+    let (catalog, _) = catalog_with_registry()?;
+    if catalog.requirements.iter().any(|r| r.id == request.id)
+        || custom_folder(&request.id)?.exists()
+    {
         return Err(CliError("Custom-check ID already exists".into()));
     }
     if let Some(target) = request.override_builtin_id.as_deref() {
-        if !catalog
+        let overridable = catalog
             .requirements
             .iter()
-            .any(|r| r.id == target && r.origin == ControlOrigin::Builtin)
-            || registry
-                .checks
-                .iter()
-                .any(|c| c.override_builtin_id.as_deref() == Some(target))
-        {
+            .any(|r| r.id == target && r.origin == ControlOrigin::Builtin);
+        if !overridable {
             return Err(CliError(
                 "Override target is unknown or already overridden".into(),
             ));
@@ -735,8 +961,8 @@ pub(crate) fn dashboard_import_custom(text: &str) -> Result<String, CliError> {
             return Err(CliError("Clone source requirement is unknown".into()));
         }
     }
-    let (tool_path, expected_sha256) = store_custom_tool(&request.id, &bytes)?;
-    registry.checks.push(CustomEntry {
+    let (tool_path, expected_sha256) = store_custom_tool(&request.id, &request.file_name, &bytes)?;
+    let entry = CustomEntry {
         id: request.id,
         name: request.name,
         description: request.description,
@@ -748,20 +974,90 @@ pub(crate) fn dashboard_import_custom(text: &str) -> Result<String, CliError> {
         arguments: request.arguments,
         parameters: serde_json::json!({}),
         override_builtin_id: request.override_builtin_id,
-    });
-    save_custom_entry(registry.checks.last().unwrap())?;
+        timeout_seconds: request.timeout_seconds,
+    };
+    save_custom_entry(&entry)?;
     dashboard_data_json()
 }
 
+/// Delete a custom check folder. Works for broken folders too, so a bad configuration
+/// can always be cleaned up from the CLI or dashboard.
+fn remove_custom(id: &str) -> Result<(), CliError> {
+    let folder = custom_folder(id)?;
+    match fs::symlink_metadata(&folder) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(CliError("Custom check folder is unsafe".into())),
+        Err(_) => return Err(CliError("Custom check not found".into())),
+    }
+    fs::remove_dir_all(&folder)
+        .map_err(|_| CliError("Cannot remove custom check folder".into()))?;
+    remove_local_requirement_setting(id)
+}
+
 pub(crate) fn dashboard_remove_custom(id: &str) -> Result<String, CliError> {
-    let mut registry = load_custom_registry()?;
-    let Some(index) = registry.checks.iter().position(|c| c.id == id) else {
-        return Err(CliError("Custom check not found".into()));
+    remove_custom(id)?;
+    dashboard_data_json()
+}
+
+/// Pin the current bytes of a custom tool: write its SHA-256 as `expectedSha256` and
+/// bump `version` when the hash changes. This is the explicit "I trust this edit" step
+/// for checks written or edited by hand.
+fn accept_custom(id: &str) -> Result<(String, u64), CliError> {
+    let folder = custom_folder(id)?;
+    let config_path = folder.join("configuration.json");
+    let metadata = fs::symlink_metadata(&config_path)
+        .map_err(|_| CliError("Custom check not found".into()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
+        return Err(CliError("configuration.json is unsafe or too large".into()));
+    }
+    let bytes =
+        fs::read(&config_path).map_err(|_| CliError("Cannot read configuration.json".into()))?;
+    let config: CheckConfiguration = serde_json::from_slice(&bytes)
+        .map_err(|error| CliError(format!("configuration.json non valido: {error}")))?;
+    validate_configuration(id, &config).map_err(CliError)?;
+    let root = folder
+        .canonicalize()
+        .map_err(|_| CliError("Cannot locate custom check folder".into()))?;
+    let tool = folder.join(&config.tool_path);
+    let tool_metadata = fs::symlink_metadata(&tool)
+        .map_err(|_| CliError(format!("Tool {} non trovato", config.tool_path)))?;
+    if !tool_metadata.is_file()
+        || tool_metadata.file_type().is_symlink()
+        || tool_metadata.len() > 4 * 1024 * 1024
+        || !tool
+            .canonicalize()
+            .is_ok_and(|path| path.starts_with(&root))
+    {
+        return Err(CliError("Custom tool is unsafe or too large".into()));
+    }
+    let hash = sha256_bytes(&fs::read(&tool).map_err(|_| CliError("Cannot read tool".into()))?)
+        .ok_or_else(|| CliError("Cannot calculate SHA-256".into()))?;
+    let current = config.version.unwrap_or(1);
+    let version = match config.expected_sha256.as_deref() {
+        Some(previous) if !previous.eq_ignore_ascii_case(&hash) => current.saturating_add(1),
+        _ => current,
     };
-    registry.checks.remove(index);
-    let folder = state_dir()?.join("custom-tools").join(id);
-    fs::remove_dir_all(folder).map_err(|_| CliError("Cannot remove custom check folder".into()))?;
-    remove_local_requirement_setting(id)?;
+    let file = ConfigurationFile {
+        schema_version: CHECK_SCHEMA,
+        id: &config.id,
+        name: &config.name,
+        description: &config.description,
+        priority: config.priority,
+        enabled: config.enabled,
+        tool_path: &config.tool_path,
+        arguments: &config.arguments,
+        expected_sha256: Some(&hash),
+        version,
+        timeout_seconds: config.timeout_seconds,
+        parameters: &config.parameters,
+        override_builtin_id: config.override_builtin_id.as_deref(),
+    };
+    atomic_json(&config_path, &file)?;
+    Ok((hash, version))
+}
+
+pub(crate) fn dashboard_accept_custom(id: &str) -> Result<String, CliError> {
+    accept_custom(id)?;
     dashboard_data_json()
 }
 
@@ -796,10 +1092,14 @@ pub(crate) fn dashboard_update_custom(id: &str, text: &str) -> Result<String, Cl
         .iter_mut()
         .find(|c| c.id == id)
         .ok_or_else(|| CliError("Custom check not found".into()))?;
-    let (path, hash) = store_custom_tool(id, &bytes)?;
+    // Replace the configured entrypoint in place so hand-made folders keep their layout.
+    let local = local_tool_path(entry)?.to_owned();
+    let (path, hash) = store_custom_tool(id, &local, &bytes)?;
     entry.tool_path = path;
+    if !entry.expected_sha256.eq_ignore_ascii_case(&hash) {
+        entry.version = entry.version.saturating_add(1);
+    }
     entry.expected_sha256 = hash;
-    entry.version = entry.version.saturating_add(1);
     save_custom_entry(entry)?;
     dashboard_data_json()
 }
@@ -1102,6 +1402,15 @@ fn now_ms() -> u64 {
 }
 
 fn error_result(requirement: &Requirement, priority: Priority, summary: &str) -> ResultRecord {
+    error_with_details(requirement, priority, summary, vec![])
+}
+
+fn error_with_details(
+    requirement: &Requirement,
+    priority: Priority,
+    summary: &str,
+    details: Vec<String>,
+) -> ResultRecord {
     ResultRecord {
         id: requirement.id.clone(),
         name: requirement.name.clone(),
@@ -1109,7 +1418,7 @@ fn error_result(requirement: &Requirement, priority: Priority, summary: &str) ->
         status: ResultStatus::Error,
         compliance_status: None,
         summary: summary.into(),
-        details: vec![],
+        details,
         completed_at_unix_ms: now_ms(),
         provenance: None,
     }
@@ -1120,7 +1429,81 @@ fn execute(
     priority: Priority,
     parameters: &serde_json::Value,
 ) -> ResultRecord {
-    execute_with_timeout(requirement, priority, parameters, TOOL_TIMEOUT)
+    let seconds = requirement.timeout_seconds.clamp(1, MAX_TIMEOUT_SECONDS);
+    execute_with_timeout(
+        requirement,
+        priority,
+        parameters,
+        Duration::from_secs(seconds),
+    )
+}
+
+/// Read at most `limit + 1` bytes, then keep draining so the writer never blocks on a
+/// full pipe. Returns the kept bytes and whether the stream exceeded `limit`.
+fn bounded_reader<R: Read + Send + 'static>(
+    mut stream: R,
+    limit: usize,
+) -> thread::JoinHandle<io::Result<(Vec<u8>, bool)>> {
+    thread::spawn(move || {
+        let mut data = Vec::new();
+        (&mut stream)
+            .take((limit + 1) as u64)
+            .read_to_end(&mut data)?;
+        let oversized = data.len() > limit;
+        if oversized {
+            data.truncate(limit);
+            io::copy(&mut stream, &mut io::sink())?;
+        }
+        Ok((data, oversized))
+    })
+}
+
+/// SIGKILL the whole process group of a tool (the tool and any helper it spawned).
+#[cfg(unix)]
+fn kill_process_group(child: &std::process::Child) {
+    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+        if pgid > 1 {
+            // SAFETY: plain syscall; a negative PID addresses the group created for the tool.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &std::process::Child) {
+    let _ = child;
+}
+
+fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stderr);
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut excerpt: String = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if excerpt.chars().count() > 512 {
+        excerpt = excerpt.chars().take(512).collect::<String>() + "…";
+    }
+    Some(format!("stderr del tool: {excerpt}"))
+}
+
+fn integrity_hint(requirement: &Requirement) -> String {
+    match requirement.origin {
+        ControlOrigin::Custom => format!(
+            "Se la modifica è voluta, fissa il nuovo hash con `baradwatchu-agent custom accept {}` oppure con «Accetta versione attuale» nella dashboard",
+            requirement.custom_tool_id.as_deref().unwrap_or(&requirement.id)
+        ),
+        ControlOrigin::Builtin => {
+            "Il file installato è stato modificato: reinstalla BaradWatchU Client".into()
+        }
+    }
 }
 
 fn execute_with_timeout(
@@ -1129,6 +1512,17 @@ fn execute_with_timeout(
     parameters: &serde_json::Value,
     timeout: Duration,
 ) -> ResultRecord {
+    if let Some(reason) = &requirement.configuration_error {
+        return error_with_details(
+            requirement,
+            priority,
+            "Configurazione del controllo non valida: il tool non è stato eseguito",
+            vec![
+                reason.clone(),
+                "Correggi configuration.json nella cartella del controllo oppure eliminalo".into(),
+            ],
+        );
+    }
     let Some(relative) = requirement.tools.get(platform_key()) else {
         return ResultRecord {
             id: requirement.id.clone(),
@@ -1158,7 +1552,7 @@ fn execute_with_timeout(
         Err(_) => return error_result(requirement, priority, "Cannot locate Client installation"),
     };
     if requirement.origin != ControlOrigin::Builtin {
-        let managed_tools = root.join("custom-tools");
+        let managed_tools = root.join(CUSTOM_DIR);
         if fs::symlink_metadata(&managed_tools)
             .map(|m| !m.is_dir() || m.file_type().is_symlink())
             .unwrap_or(true)
@@ -1171,9 +1565,16 @@ fn execute_with_timeout(
         }
     }
     let tool_path = root.join(relative);
-    let original_metadata = match fs::symlink_metadata(&tool_path) {
+    let metadata = match fs::symlink_metadata(&tool_path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => metadata,
-        _ => return error_result(requirement, priority, "Required tool is missing or unsafe"),
+        _ => {
+            return error_with_details(
+                requirement,
+                priority,
+                "Required tool is missing or unsafe",
+                vec![format!("Tool atteso: {}", tool_path.display())],
+            )
+        }
     };
     let canonical_tool = match tool_path.canonicalize() {
         Ok(path) if path.starts_with(&root) => path,
@@ -1185,37 +1586,66 @@ fn execute_with_timeout(
             )
         }
     };
-    let metadata = original_metadata;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o111 == 0 {
-            return error_result(requirement, priority, "Required tool is not executable");
+            return error_with_details(
+                requirement,
+                priority,
+                "Required tool is not executable",
+                vec![format!(
+                    "Rendi eseguibile il file: chmod +x {}",
+                    canonical_tool.display()
+                )],
+            );
         }
     }
-    // Custom imports are single-file tools: execute a private snapshot of the exact bytes hashed.
-    // Builtins stay at their package-owned paths so their verified sibling helpers remain usable.
-    let (execution_path, execution_provenance, _snapshot) = if requirement.origin
-        == ControlOrigin::Custom
-    {
-        let bytes = match fs::read(&canonical_tool) {
-            Ok(bytes) if !bytes.is_empty() && bytes.len() <= 4 * 1024 * 1024 => bytes,
-            _ => return error_result(requirement, priority, "Custom tool is missing or too large"),
-        };
-        let actual = sha256_bytes(&bytes);
-        let mut provenance = control_provenance(requirement);
-        provenance.actual_sha256 = actual.clone();
-        provenance.integrity_status = match (&provenance.expected_sha256, &actual) {
-            (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => {
-                IntegrityStatus::Verified
-            }
-            (Some(_), Some(_)) => IntegrityStatus::Mismatch,
-            _ => IntegrityStatus::Unknown,
-        };
-        let Some(parent) = canonical_tool.parent() else {
-            return error_result(requirement, priority, "Invalid custom tool path");
-        };
-        let snapshot = parent.join(format!(".run-{}-{}", std::process::id(), now_ms()));
+    let Some(working_dir) = canonical_tool.parent().map(Path::to_path_buf) else {
+        return error_result(requirement, priority, "Invalid tool path");
+    };
+    // Integrity gate for every origin: hash the exact bytes and refuse to run on mismatch.
+    let bytes = match fs::read(&canonical_tool) {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 4 * 1024 * 1024 => bytes,
+        _ => {
+            return error_result(
+                requirement,
+                priority,
+                "Tool is unreadable, empty or too large",
+            )
+        }
+    };
+    let actual = sha256_bytes(&bytes);
+    let mut provenance = control_provenance(requirement);
+    provenance.actual_sha256 = actual.clone();
+    provenance.integrity_status = match (&provenance.expected_sha256, &actual) {
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => {
+            IntegrityStatus::Verified
+        }
+        (Some(_), Some(_)) => IntegrityStatus::Mismatch,
+        _ => IntegrityStatus::Unknown,
+    };
+    if provenance.integrity_status != IntegrityStatus::Verified {
+        let mut result = error_with_details(
+            requirement,
+            priority,
+            "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito",
+            vec![
+                format!(
+                    "SHA-256 atteso: {}",
+                    provenance.expected_sha256.as_deref().unwrap_or("non disponibile")
+                ),
+                format!("SHA-256 attuale: {}", actual.as_deref().unwrap_or("non disponibile")),
+                integrity_hint(requirement),
+            ],
+        );
+        result.provenance = Some(provenance);
+        return result;
+    }
+    // Custom tools run from a private snapshot of the exact bytes hashed (no swap between
+    // hash and exec). Built-ins stay at their package-owned path so sibling helpers work.
+    let (execution_path, _snapshot) = if requirement.origin == ControlOrigin::Custom {
+        let snapshot = working_dir.join(format!(".run-{}-{}", std::process::id(), now_ms()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1245,13 +1675,10 @@ fn execute_with_timeout(
                 "Cannot write custom tool execution snapshot",
             );
         }
-        (snapshot.clone(), provenance, Some(TemporaryTool(snapshot)))
+        drop(file);
+        (snapshot.clone(), Some(TemporaryTool(snapshot)))
     } else {
-        (
-            canonical_tool.clone(),
-            control_provenance(requirement),
-            None,
-        )
+        (canonical_tool.clone(), None)
     };
     let parameter_input =
         if parameters.is_null() || parameters.as_object().is_some_and(|map| map.is_empty()) {
@@ -1272,7 +1699,15 @@ fn execute_with_timeout(
             Some(encoded)
         };
     let mut command = Command::new(&execution_path);
-    command.args(&requirement.arguments);
+    command
+        .args(&requirement.arguments)
+        .current_dir(&working_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group: a timeout kills the tool and every helper it started.
+        command.process_group(0);
+    }
     let mut executable_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
     if requirement.origin == ControlOrigin::Custom {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1294,7 +1729,7 @@ fn execute_with_timeout(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .env_clear()
         .env("PATH", executable_path);
     for name in [
@@ -1322,69 +1757,105 @@ fn execute_with_timeout(
         Ok(child) => child,
         Err(_) => return error_result(requirement, priority, "Could not start requirement tool"),
     };
-    if let Some(input) = parameter_input {
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            return error_result(
-                requirement,
-                priority,
-                "Could not send requirement parameters",
-            );
-        };
-        if stdin.write_all(&input).is_err() {
-            let _ = child.kill();
-            return error_result(
-                requirement,
-                priority,
-                "Could not send requirement parameters",
-            );
-        }
-    }
-    let Some(stdout) = child.stdout.take() else {
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        kill_process_group(&child);
         let _ = child.kill();
+        let _ = child.wait();
         return error_result(
             requirement,
             priority,
             "Could not read requirement tool result",
         );
     };
-    let reader = thread::spawn(move || -> io::Result<Vec<u8>> {
-        let mut data = Vec::new();
-        stdout
-            .take((MAX_TOOL_OUTPUT + 1) as u64)
-            .read_to_end(&mut data)?;
-        Ok(data)
-    });
+    let stdout_reader = bounded_reader(stdout, MAX_TOOL_OUTPUT);
+    let stderr_reader = bounded_reader(stderr, MAX_TOOL_STDERR);
+    if let Some(input) = parameter_input {
+        // A tool may legitimately ignore stdin; a closed pipe is not an error by itself.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&input);
+        }
+    }
     let deadline = std::time::Instant::now() + timeout;
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if std::time::Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(20))
             }
-            _ => {
+            Ok(None) => {
+                timed_out = true;
+                kill_process_group(&child);
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            Err(_) => {
+                kill_process_group(&child);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
         }
     };
-    let output = match reader.join() {
-        Ok(Ok(output)) if output.len() <= MAX_TOOL_OUTPUT => output,
-        _ => {
+    // Helpers left in the background would hold the pipes open: end the whole group.
+    kill_process_group(&child);
+    let stderr_text = match stderr_reader.join() {
+        Ok(Ok((data, _))) => stderr_excerpt(&data),
+        _ => None,
+    };
+    let with_stderr = |mut details: Vec<String>| {
+        details.extend(stderr_text.clone());
+        details
+    };
+    let stdout_result = stdout_reader.join();
+    if timed_out {
+        return error_with_details(
+            requirement,
+            priority,
+            &format!(
+                "Il tool ha superato il timeout di {} s ed è stato terminato",
+                timeout.as_secs_f32()
+            ),
+            with_stderr(vec![format!("Tool: {}", canonical_tool.display())]),
+        );
+    }
+    let output = match stdout_result {
+        Ok(Ok((output, false))) => output,
+        Ok(Ok((_, true))) => {
+            return error_with_details(
+                requirement,
+                priority,
+                "Requirement tool output is too large",
+                with_stderr(vec![format!("Limite stdout: {MAX_TOOL_OUTPUT} byte")]),
+            )
+        }
+        _ => return error_result(requirement, priority, "Requirement tool output is invalid"),
+    };
+    match status {
+        Some(status) if status.success() => {}
+        Some(status) => {
+            let code = status.code().map_or_else(
+                || "terminato da un segnale".to_owned(),
+                |code| code.to_string(),
+            );
+            return error_with_details(
+                requirement,
+                priority,
+                &format!("Il tool è terminato con un errore (codice uscita {code})"),
+                with_stderr(vec![
+                    format!("Tool: {}", canonical_tool.display()),
+                    "Un controllo deve uscire con codice 0 e riportare l'esito nel JSON".into(),
+                ]),
+            );
+        }
+        None => {
             return error_result(
                 requirement,
                 priority,
-                "Requirement tool output is invalid or too large",
+                "Requirement tool could not be awaited",
             )
         }
-    };
-    if !status.is_some_and(|status| status.success()) {
-        return error_result(
-            requirement,
-            priority,
-            "Requirement tool failed or timed out",
-        );
     }
     let text = match std::str::from_utf8(&output) {
         Ok(text) => text,
@@ -1399,11 +1870,17 @@ fn execute_with_timeout(
     let (result_status, summary, mut details) = if requirement.origin == ControlOrigin::Custom {
         let result: CustomToolResult = match serde_json::from_str(text) {
             Ok(result) => result,
-            Err(_) => return error_result(
-                requirement,
-                priority,
-                "Custom tool returned invalid JSON or fields; expected status, summary and details",
-            ),
+            Err(error) => {
+                return error_with_details(
+                    requirement,
+                    priority,
+                    "Custom tool returned invalid JSON or fields; expected status, summary and details",
+                    with_stderr(vec![
+                        format!("Errore di parsing: {error}"),
+                        "Formato atteso: {\"status\":\"PASS|FAIL|WARNING|ERROR\",\"summary\":\"…\",\"details\":[\"…\"]}".into(),
+                    ]),
+                )
+            }
         };
         (
             ResultStatus::from(result.status),
@@ -1417,10 +1894,11 @@ fn execute_with_timeout(
         let result: ToolResult = match serde_json::from_str(text) {
             Ok(result) => result,
             Err(_) => {
-                return error_result(
+                return error_with_details(
                     requirement,
                     priority,
                     "Requirement tool returned invalid JSON",
+                    with_stderr(vec![]),
                 )
             }
         };
@@ -1451,7 +1929,7 @@ fn execute_with_timeout(
         summary,
         details,
         completed_at_unix_ms: now_ms(),
-        provenance: Some(execution_provenance),
+        provenance: Some(provenance),
     }
 }
 
@@ -1665,24 +2143,120 @@ fn parse_priority(value: &OsString) -> Option<Priority> {
     }
 }
 
+const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | custom accept ID | custom remove ID | dashboard | --version";
+
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
-    let catalog = catalog()?;
+    // Custom-check maintenance must work even when the catalog cannot be built.
+    match args {
+        [command, action, id] if command == "custom" && action == "remove" => {
+            let id = id.to_str().unwrap_or("");
+            remove_custom(id)?;
+            return Ok(CliOutput {
+                text: format!("Controllo personalizzato {id} eliminato.\n"),
+                code: 0,
+            });
+        }
+        [command, action, id] if command == "custom" && action == "accept" => {
+            let id = id.to_str().unwrap_or("");
+            let (hash, version) = accept_custom(id)?;
+            return Ok(CliOutput {
+                text: format!("{id}: SHA-256 atteso aggiornato a {hash} (versione {version}).\n"),
+                code: 0,
+            });
+        }
+        [command, ..] if command == "custom" => {
+            return Err(CliError(
+                "Usage: custom accept ID | custom remove ID".into(),
+            ));
+        }
+        _ => {}
+    }
+    // Reject unknown commands before touching configuration or state on disk.
+    const COMMANDS: [&str; 9] = [
+        "refresh",
+        "list",
+        "enable",
+        "disable",
+        "priority",
+        "configure",
+        "check",
+        "audit",
+        "status",
+    ];
+    if !args
+        .first()
+        .and_then(|command| command.to_str())
+        .is_some_and(|command| COMMANDS.contains(&command))
+    {
+        return Err(CliError(USAGE.into()));
+    }
+    match args {
+        [command, options @ ..] if command == "audit" => {
+            parse_audit_options(options)?;
+        }
+        [command, _] | [command, _, _] if command == "check" => {
+            if args.len() == 3 && args[2] != "--log" {
+                return Err(CliError("Usage: check ID [--log]".into()));
+            }
+        }
+        [command, ..] if command == "check" => {
+            return Err(CliError("Usage: check ID [--log]".into()))
+        }
+        _ => {}
+    }
+    let (catalog, registry) = catalog_with_registry()?;
     let mut settings = load_settings(&catalog)?;
     fn id_of(value: &OsString) -> &str {
         value.to_str().unwrap_or("")
     }
     match args {
         [command] if command == "refresh" => {
-            Ok(CliOutput { text: format!("Discovery aggiornata: {} controlli rilevati ({} integrati, {} personalizzati).\n", catalog.requirements.len(), catalog.requirements.iter().filter(|item| item.origin == ControlOrigin::Builtin).count(), catalog.requirements.iter().filter(|item| item.origin == ControlOrigin::Custom).count()), code: 0 })
+            let builtin = catalog
+                .requirements
+                .iter()
+                .filter(|item| {
+                    item.origin == ControlOrigin::Builtin || item.replaces_builtin.is_some()
+                })
+                .count();
+            let broken = catalog
+                .requirements
+                .iter()
+                .filter(|item| item.configuration_error.is_some())
+                .collect::<Vec<_>>();
+            let mut text = format!("Discovery aggiornata: {} controlli rilevati ({} integrati, {} personalizzati).\nCartella controlli personalizzati: {}\n", catalog.requirements.len(), builtin, catalog.requirements.len() - builtin, custom_root()?.display());
+            for item in broken {
+                text.push_str(&format!(
+                    "  [NON VALIDO] {}: {}\n",
+                    item.id,
+                    item.configuration_error.as_deref().unwrap_or("")
+                ));
+            }
+            for name in &registry.ignored {
+                text.push_str(&format!(
+                    "  [IGNORATA] cartella {name}: il nome deve essere un ID CUSTOM-…\n"
+                ));
+            }
+            Ok(CliOutput { text, code: 0 })
         }
         [command] if command == "list" => {
-            let list = catalog.requirements.iter().map(|r| {
-                let local = settings.requirements.get(&r.id);
-                let mut item = r.clone();
-                if let Some(local) = local { item.enabled = local.enabled; item.priority = local.priority; item.parameters = local.parameters.clone(); }
-                item
-            }).collect::<Vec<_>>();
+            let list = catalog
+                .requirements
+                .iter()
+                .map(|r| {
+                    let local = settings.requirements.get(&r.id);
+                    let mut item = r.clone();
+                    if let Some(local) = local {
+                        item.enabled = local.enabled;
+                        item.priority = local.priority;
+                        item.parameters = local.parameters.clone();
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
             let text = list.iter().map(|r| {
+                if let Some(reason) = &r.configuration_error {
+                    return format!("{}  NON VALIDO {} [CUSTOM]\n    Errore: {}\n", r.id, r.name, reason);
+                }
                 let evidence = control_provenance(r);
                 format!("{}  {:<8} {:<7} {} [{}{}]\n    Tool: {}\n    Integrity: {:?} expected={} actual={}\n",
                     r.id, if r.enabled { "enabled" } else { "disabled" }, r.priority, r.name,
@@ -1694,56 +2268,131 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             Ok(CliOutput { text, code: 0 })
         }
         [command, flag] if command == "list" && flag == "--json" => {
-            let mut list = catalog.requirements.iter().map(|r| { let mut item=r.clone(); if let Some(local)=settings.requirements.get(&r.id) {item.enabled=local.enabled;item.priority=local.priority;item.parameters=local.parameters.clone();} item }).collect::<Vec<_>>();
-            for item in &mut list { populate_current_integrity(item); }
-            Ok(CliOutput { text: output_json(&list)?, code: 0 })
+            let mut list = catalog
+                .requirements
+                .iter()
+                .map(|r| {
+                    let mut item = r.clone();
+                    if let Some(local) = settings.requirements.get(&r.id) {
+                        item.enabled = local.enabled;
+                        item.priority = local.priority;
+                        item.parameters = local.parameters.clone();
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
+            for item in &mut list {
+                populate_current_integrity(item);
+            }
+            Ok(CliOutput {
+                text: output_json(&list)?,
+                code: 0,
+            })
         }
         [command, id] if (command == "enable" || command == "disable") => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) { return Err(CliError(format!("Unknown requirement: {id}"))); }
-            let local = settings.requirements.entry(id.into()).or_insert(RequirementSettings { enabled: true, priority: Priority::High, parameters: serde_json::json!({}) });
+            if !catalog.requirements.iter().any(|r| r.id == id) {
+                return Err(CliError(format!("Unknown requirement: {id}")));
+            }
+            let local = settings
+                .requirements
+                .entry(id.into())
+                .or_insert(RequirementSettings {
+                    enabled: true,
+                    priority: Priority::High,
+                    parameters: serde_json::json!({}),
+                });
             local.enabled = command == "enable";
             let enabled = local.enabled;
             save_settings(&settings)?;
-            Ok(CliOutput { text: format!("{} {}\n", if enabled { "Enabled" } else { "Disabled" }, id), code: 0 })
+            Ok(CliOutput {
+                text: format!("{} {}\n", if enabled { "Enabled" } else { "Disabled" }, id),
+                code: 0,
+            })
         }
         [command, id, priority] if command == "priority" => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) { return Err(CliError(format!("Unknown requirement: {id}"))); }
-            let priority = parse_priority(priority).ok_or_else(|| CliError("Priority must be HIGHEST, HIGH, MEDIUM, LOW or OPTIONAL".into()))?;
-            let local = settings.requirements.entry(id.into()).or_insert(RequirementSettings { enabled: true, priority, parameters: serde_json::json!({}) });
+            if !catalog.requirements.iter().any(|r| r.id == id) {
+                return Err(CliError(format!("Unknown requirement: {id}")));
+            }
+            let priority = parse_priority(priority).ok_or_else(|| {
+                CliError("Priority must be HIGHEST, HIGH, MEDIUM, LOW or OPTIONAL".into())
+            })?;
+            let local = settings
+                .requirements
+                .entry(id.into())
+                .or_insert(RequirementSettings {
+                    enabled: true,
+                    priority,
+                    parameters: serde_json::json!({}),
+                });
             local.priority = priority;
             save_settings(&settings)?;
-            Ok(CliOutput { text: format!("Priority for {id}: {priority}\n"), code: 0 })
+            Ok(CliOutput {
+                text: format!("Priority for {id}: {priority}\n"),
+                code: 0,
+            })
         }
         [command, id, value] if command == "configure" => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) { return Err(CliError(format!("Unknown requirement: {id}"))); }
-            if value.to_string_lossy().len() > 16 * 1024 { return Err(CliError("Parameters JSON exceeds 16 KiB".into())); }
-            let raw = value.to_str().ok_or_else(|| CliError("Parameters must be UTF-8 JSON".into()))?;
-            let parameters: serde_json::Value = serde_json::from_str(raw).map_err(|_| CliError("Parameters must be a JSON object".into()))?;
-            if !parameters.is_object() { return Err(CliError("Parameters must be a JSON object".into())); }
-            let local = settings.requirements.entry(id.into()).or_insert(RequirementSettings { enabled: true, priority: Priority::High, parameters: serde_json::json!({}) });
+            if !catalog.requirements.iter().any(|r| r.id == id) {
+                return Err(CliError(format!("Unknown requirement: {id}")));
+            }
+            if value.to_string_lossy().len() > 16 * 1024 {
+                return Err(CliError("Parameters JSON exceeds 16 KiB".into()));
+            }
+            let raw = value
+                .to_str()
+                .ok_or_else(|| CliError("Parameters must be UTF-8 JSON".into()))?;
+            let parameters: serde_json::Value = serde_json::from_str(raw)
+                .map_err(|_| CliError("Parameters must be a JSON object".into()))?;
+            if !parameters.is_object() {
+                return Err(CliError("Parameters must be a JSON object".into()));
+            }
+            let local = settings
+                .requirements
+                .entry(id.into())
+                .or_insert(RequirementSettings {
+                    enabled: true,
+                    priority: Priority::High,
+                    parameters: serde_json::json!({}),
+                });
             local.parameters = parameters;
             save_settings(&settings)?;
-            Ok(CliOutput { text: format!("Parameters saved for {id}\n"), code: 0 })
+            Ok(CliOutput {
+                text: format!("Parameters saved for {id}\n"),
+                code: 0,
+            })
         }
         [command, id] if command == "check" => run_check(&catalog, &settings, id_of(id), false),
-        [command, id, flag] if command == "check" && flag == "--log" => run_check(&catalog, &settings, id_of(id), true),
+        [command, id, flag] if command == "check" && flag == "--log" => {
+            run_check(&catalog, &settings, id_of(id), true)
+        }
         [command, options @ ..] if command == "audit" => {
             let (json, notify, include_log) = parse_audit_options(options)?;
             run_audit(&catalog, &settings, json, notify, include_log)
         }
-        [command] if command == "status" => {
-            match load_last_audit()? {
-                Some(report) => { let mut text=report.results.iter().map(human_result).collect::<String>(); if let Some(path)=report.log_file { text.push_str(&format!("\nLog audit: {path}\n")); } Ok(CliOutput {text,code:0}) },
-                None => Ok(CliOutput {text:"No audit results saved yet. Run `baradwatchu-agent audit`.\n".into(),code:0}),
+        [command] if command == "status" => match load_last_audit()? {
+            Some(report) => {
+                let mut text = report.results.iter().map(human_result).collect::<String>();
+                if let Some(path) = report.log_file {
+                    text.push_str(&format!("\nLog audit: {path}\n"));
+                }
+                Ok(CliOutput { text, code: 0 })
             }
-        }
-        [command, flag] if command == "status" && flag == "--json" => {
-            Ok(CliOutput { text: match load_last_audit()? {Some(report)=>output_json(&report)?,None=>"null\n".into()}, code:0 })
-        }
-        _ => Err(CliError("Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | dashboard | --version".into())),
+            None => Ok(CliOutput {
+                text: "No audit results saved yet. Run `baradwatchu-agent audit`.\n".into(),
+                code: 0,
+            }),
+        },
+        [command, flag] if command == "status" && flag == "--json" => Ok(CliOutput {
+            text: match load_last_audit()? {
+                Some(report) => output_json(&report)?,
+                None => "null\n".into(),
+            },
+            code: 0,
+        }),
+        _ => Err(CliError(USAGE.into())),
     }
 }
 
@@ -1903,7 +2552,7 @@ fn run_audit(
 }
 
 pub(crate) fn dashboard_data_json() -> Result<String, CliError> {
-    let catalog = catalog()?;
+    let (catalog, registry) = catalog_with_registry()?;
     let settings = load_settings(&catalog)?;
     let requirements = catalog
         .requirements
@@ -1919,9 +2568,12 @@ pub(crate) fn dashboard_data_json() -> Result<String, CliError> {
             item
         })
         .collect::<Vec<_>>();
-    output_json(
-        &serde_json::json!({"schemaVersion":"baradwatchu.dashboard.v1","requirements":requirements}),
-    )
+    output_json(&serde_json::json!({
+        "schemaVersion":"baradwatchu.dashboard.v1",
+        "requirements":requirements,
+        "customChecksDir":custom_root()?.display().to_string(),
+        "ignoredFolders":registry.ignored,
+    }))
 }
 
 pub(crate) fn dashboard_refresh_json() -> Result<String, CliError> {
@@ -2091,7 +2743,66 @@ fn send_notification(report: &AuditReport) {
 }
 
 pub fn help() -> String {
-    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent dashboard\n  baradwatchu-agent --version\n\nUse --log to write a plain-text audit log; structured reports are kept locally. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user.\n", env!("CARGO_PKG_VERSION"))
+    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user.\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// Serialises tests that change process-wide environment variables and points every
+/// XDG location at a private temporary tree, so tests never touch the real user data.
+#[cfg(test)]
+pub(crate) struct TestEnv {
+    pub(crate) root: PathBuf,
+    saved: Vec<(&'static str, Option<OsString>)>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+impl TestEnv {
+    pub(crate) fn new(label: &str) -> Self {
+        let guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("bwu-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let mut env = Self {
+            root: root.clone(),
+            saved: vec![],
+            _guard: guard,
+        };
+        env.set("XDG_CONFIG_HOME", root.join("config"));
+        env.set("XDG_STATE_HOME", root.join("state"));
+        env
+    }
+
+    pub(crate) fn set(&mut self, key: &'static str, value: impl Into<OsString>) {
+        if !self.saved.iter().any(|(saved, _)| *saved == key) {
+            self.saved.push((key, std::env::var_os(key)));
+        }
+        std::env::set_var(key, value.into());
+    }
+
+    pub(crate) fn custom_dir(&self) -> PathBuf {
+        self.root.join("config/baradwatchu").join(CUSTOM_DIR)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 #[cfg(test)]
@@ -2122,6 +2833,56 @@ mod tests {
         out
     }
 
+    /// Create `<custom-checks>/<id>/` with an executable tool and a configuration whose
+    /// fields can be overridden; returns the folder.
+    fn write_custom_folder(
+        env: &TestEnv,
+        id: &str,
+        tool_name: &str,
+        tool: &[u8],
+        overrides: serde_json::Value,
+    ) -> PathBuf {
+        let folder = env.custom_dir().join(id);
+        fs::create_dir_all(&folder).unwrap();
+        let tool_path = folder.join(tool_name);
+        fs::write(&tool_path, tool).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tool_path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut config = serde_json::json!({
+            "schemaVersion": CHECK_SCHEMA, "id": id, "name": format!("Check {id}"),
+            "description": "test", "priority": "HIGH", "enabled": true,
+            "toolPath": format!("./{tool_name}"), "arguments": [],
+            "expectedSha256": sha256_bytes(tool).unwrap(), "version": 1,
+            "parameters": {}, "overrideBuiltinId": null
+        });
+        for (key, value) in overrides.as_object().unwrap() {
+            if value.is_null() && key == "expectedSha256" {
+                config.as_object_mut().unwrap().remove(key);
+            } else {
+                config[key] = value.clone();
+            }
+        }
+        fs::write(folder.join("configuration.json"), config.to_string()).unwrap();
+        folder
+    }
+
+    fn find(catalog: &Catalog, id: &str) -> Requirement {
+        catalog
+            .requirements
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap_or_else(|| panic!("{id} not in catalog"))
+            .clone()
+    }
+
+    fn pass_tool(summary: &str) -> Vec<u8> {
+        format!("#!/bin/sh\nprintf '%s' '{{\"status\":\"PASS\",\"summary\":\"{summary}\",\"details\":[]}}'\n")
+            .into_bytes()
+    }
+
     #[test]
     fn custom_import_rejects_malformed_base64_padding() {
         for value in ["=AAA", "AA=A", "AA==AAAA", "AB==", "AAB="] {
@@ -2148,64 +2909,403 @@ mod tests {
             r#"{"id":"CUSTOM-001","status":"PASS","summary":"ok","details":[]}"#
         )
         .is_err());
+        // WARN is the report status; tools must write WARNING.
+        assert!(
+            serde_json::from_str::<CustomToolResult>(r#"{"status":"WARN","summary":"ok"}"#)
+                .is_err()
+        );
         let fail: CustomToolStatus = serde_json::from_str("\"FAIL\"").unwrap();
         assert_eq!(ResultStatus::from(fail), ResultStatus::Fail);
     }
 
+    /// The operator's own model check (copied verbatim from
+    /// ~/.config/baradwatchu/custom-tools/CUSTOM-001) must be accepted as designed.
     #[test]
-    fn folder_discovery_reads_configuration_and_direct_arguments() {
-        let root =
-            std::env::temp_dir().join(format!("bwu-discovery-{}-{}", std::process::id(), now_ms()));
-        let check = root.join("CUSTOM-ARG");
-        fs::create_dir_all(&check).unwrap();
-        fs::write(check.join("configuration.json"), serde_json::json!({
-            "schemaVersion":"baradwatchu.custom-checks.v1", "id":"CUSTOM-ARG",
-            "name":"Argument check", "description":"test", "priority":"HIGH",
-            "enabled":true, "toolPath":"./check.sh", "arguments":["one value", "two"],
-            "expectedSha256":"0".repeat(64), "version":1, "parameters":{}, "overrideBuiltinId":null
-        }).to_string()).unwrap();
-        let found = discover_check_folders(&root).unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].1.arguments, vec!["one value", "two"]);
-        assert_eq!(found[0].1.tool_path, "./check.sh");
-        fs::remove_dir_all(root).unwrap();
+    fn operator_model_custom_001_runs_as_designed() {
+        const SCRIPT: &[u8] = b"#!/bin/bash\n\nexists=$(ricordatichedevicambiare -V >/dev/null 2>/dev/null; echo $?);\nif ((exists==0)); then \n\tdetails=\"version: $(ricordatichedevicambiare -V | awk '{print $2}')\";\n\tsummary=\"software installato correttamente\"\n\tstatus='\"PASS\"'\nelse\n\tdetails=\"version: N/D\";\n\tsummary=\"software non installato\"\n\tstatus='\"FAIL\"';\nfi\n\necho '{\n\t\"status\":'$status',\n\t\"summary\":\"'\"$summary\"'\",\n\t\"details\":\"'\"$details\"'\"\n}'\n\n\n\n";
+        let mut env = TestEnv::new("operator-model");
+        let home = env.root.join("home");
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        env.set("HOME", &home);
+        let folder = env.custom_dir().join("CUSTOM-001");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("CUSTOM-001.sh"), SCRIPT).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                folder.join("CUSTOM-001.sh"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        // Verbatim configuration layout, including tabs and `"arguments":[""]`.
+        fs::write(
+            folder.join("configuration.json"),
+            format!(
+                "{{\n  \t\"schemaVersion\": \"baradwatchu.custom-checks.v1\",\n\t\"id\": \"CUSTOM-001\",\n\t\"name\": \"Password Reminder\",\n\t\"description\": \"Verifica se è installato \\\"ricordatichedevicambiare\\\" per monitorare il cambio della password\",\n\t\"priority\": \"OPTIONAL\",\n\t\"enabled\": true,\n\t\"toolPath\": \"./CUSTOM-001.sh\",\n\t\"arguments\":[\"\"],\n\t\"expectedSha256\": \"{}\",\n\t\"version\": 1,\n\t\"parameters\": {{}},\n\t\"overrideBuiltinId\": null\n}}\n",
+                sha256_bytes(SCRIPT).unwrap()
+            ),
+        )
+        .unwrap();
+        let catalog = catalog().unwrap();
+        let check = find(&catalog, "CUSTOM-001");
+        assert!(
+            check.configuration_error.is_none(),
+            "{:?}",
+            check.configuration_error
+        );
+        assert_eq!(check.priority, Priority::Optional);
+        assert_eq!(check.arguments, vec![""]);
+        let missing = execute(&check, check.priority, &check.parameters);
+        assert_eq!(missing.status, ResultStatus::Fail, "{missing:?}");
+        assert_eq!(missing.summary, "software non installato");
+        // Provide the program in ~/.local/bin, which custom tools get on PATH.
+        let fake = home.join(".local/bin/ricordatichedevicambiare");
+        fs::write(&fake, "#!/bin/sh\necho 'ricordatichedevicambiare 1.0.0'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let present = execute(&check, check.priority, &check.parameters);
+        assert_eq!(present.status, ResultStatus::Pass, "{present:?}");
+        assert!(present.details.iter().any(|d| d == "version: 1.0.0"));
+        assert_eq!(
+            present.provenance.unwrap().integrity_status,
+            IntegrityStatus::Verified
+        );
     }
 
     #[test]
-    fn custom_tool_arguments_are_passed_as_direct_argv() {
-        let temp =
-            std::env::temp_dir().join(format!("bwu-argv-{}-{}", std::process::id(), now_ms()));
-        fs::create_dir_all(&temp).unwrap();
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", &temp);
-        let bytes = b"#!/bin/sh\nprintf '{\\\"status\\\":\\\"PASS\\\",\\\"summary\\\":\\\"%s\\\",\\\"details\\\":[]}' \"$1\"";
-        let (path, hash) = store_custom_tool("CUSTOM-ARGV", bytes).unwrap();
-        let requirement = Requirement {
-            id: "CUSTOM-ARGV".into(),
-            name: "Arguments".into(),
-            description: "test".into(),
-            enabled: true,
-            priority: Priority::High,
-            parameters: serde_json::json!({}),
-            arguments: vec!["one value".into()],
-            tools: BTreeMap::from([("linux".into(), path)]),
-            origin: ControlOrigin::Custom,
-            expected_sha256: Some(hash),
-            replaces_builtin: None,
-            custom_tool_id: Some("CUSTOM-ARGV".into()),
-            custom_tool_version: Some(1),
-            builtin_tool_path: None,
-            actual_sha256: None,
-            integrity_status: IntegrityStatus::Unknown,
-        };
-        let result = execute(&requirement, Priority::High, &requirement.parameters);
-        assert_eq!(result.status, ResultStatus::Pass);
-        assert_eq!(result.summary, "one value");
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
+    fn legacy_custom_tools_folder_is_migrated_once() {
+        let env = TestEnv::new("migration");
+        let legacy = env.root.join("config/baradwatchu/custom-tools/CUSTOM-OLD");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("marker"), "keep").unwrap();
+        let root = custom_root().unwrap();
+        assert_eq!(root, env.custom_dir());
+        assert_eq!(
+            fs::read_to_string(root.join("CUSTOM-OLD/marker")).unwrap(),
+            "keep"
+        );
+        assert!(!env.root.join("config/baradwatchu/custom-tools").exists());
+        // An existing custom-checks folder is never replaced by a later legacy folder.
+        fs::create_dir_all(env.root.join("config/baradwatchu/custom-tools/CUSTOM-NEW")).unwrap();
+        custom_root().unwrap();
+        assert!(env
+            .root
+            .join("config/baradwatchu/custom-tools/CUSTOM-NEW")
+            .exists());
+        assert!(root.join("CUSTOM-OLD").exists());
+    }
+
+    #[test]
+    fn broken_custom_folders_are_isolated_reported_and_removable() {
+        let env = TestEnv::new("broken");
+        fs::create_dir_all(env.custom_dir().join("CUSTOM-BADJSON")).unwrap();
+        fs::write(
+            env.custom_dir().join("CUSTOM-BADJSON/configuration.json"),
+            "{ not json",
+        )
+        .unwrap();
+        write_custom_folder(
+            &env,
+            "CUSTOM-WRONGID",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"id":"CUSTOM-OTHER"}),
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-NOHASH",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"expectedSha256": null}),
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-BADOVR",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"overrideBuiltinId":"REQ-999"}),
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-TIMEOUT",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"timeoutSeconds": 0}),
+        );
+        write_custom_folder(
+            &env,
+            "lowercase-name",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"id":"lowercase-name"}),
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-GOOD",
+            "c.sh",
+            &pass_tool("good"),
+            serde_json::json!({}),
+        );
+        let (catalog, registry) = catalog_with_registry().unwrap();
+        // All nine built-ins and the healthy custom check survive the broken neighbours.
+        assert_eq!(
+            catalog
+                .requirements
+                .iter()
+                .filter(|r| r.origin == ControlOrigin::Builtin)
+                .count(),
+            9
+        );
+        assert!(find(&catalog, "CUSTOM-GOOD").configuration_error.is_none());
+        assert_eq!(registry.ignored, vec!["lowercase-name"]);
+        for (id, needle) in [
+            ("CUSTOM-BADJSON", "non valido"),
+            ("CUSTOM-WRONGID", "diverso dal nome della cartella"),
+            ("CUSTOM-NOHASH", "custom accept CUSTOM-NOHASH"),
+            ("CUSTOM-BADOVR", "REQ-999"),
+            ("CUSTOM-TIMEOUT", "timeoutSeconds"),
+        ] {
+            let broken = find(&catalog, id);
+            let reason = broken.configuration_error.clone().unwrap();
+            assert!(reason.contains(needle), "{id}: {reason}");
+            let result = execute(&broken, broken.priority, &broken.parameters);
+            assert_eq!(result.status, ResultStatus::Error);
+            assert!(result.details.iter().any(|d| d == &reason));
         }
-        fs::remove_dir_all(temp).unwrap();
+        // A full audit still runs and stores ERROR for the broken folders.
+        let settings = load_settings(&catalog).unwrap();
+        let output = run_audit(&catalog, &settings, true, false, false).unwrap();
+        let report: AuditReport = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .find(|r| r.id == "CUSTOM-GOOD")
+                .unwrap()
+                .status,
+            ResultStatus::Pass
+        );
+        assert_eq!(
+            report
+                .results
+                .iter()
+                .find(|r| r.id == "CUSTOM-BADJSON")
+                .unwrap()
+                .status,
+            ResultStatus::Error
+        );
+        // Broken folders can be deleted through the same path the dashboard uses.
+        let data: serde_json::Value =
+            serde_json::from_str(&dashboard_remove_custom("CUSTOM-BADJSON").unwrap()).unwrap();
+        assert!(!data["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == "CUSTOM-BADJSON"));
+        assert!(!env.custom_dir().join("CUSTOM-BADJSON").exists());
+        assert!(dashboard_remove_custom("CUSTOM-BADJSON").is_err());
+        assert!(dashboard_remove_custom("../config").is_err());
+        assert!(dashboard_remove_custom("REQ-001").is_err());
+    }
+
+    #[test]
+    fn accept_pins_hand_written_tool_and_mismatch_never_executes() {
+        let env = TestEnv::new("accept");
+        let marker = env.root.join("executed");
+        let tool = format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '{{\"status\":\"PASS\",\"summary\":\"ran\"}}'\n",
+            marker.display()
+        );
+        let folder = write_custom_folder(
+            &env,
+            "CUSTOM-PIN",
+            "check.sh",
+            tool.as_bytes(),
+            serde_json::json!({"expectedSha256": null}),
+        );
+        assert!(find(&catalog().unwrap(), "CUSTOM-PIN")
+            .configuration_error
+            .is_some());
+        let (hash, version) = accept_custom("CUSTOM-PIN").unwrap();
+        assert_eq!(hash, sha256_bytes(tool.as_bytes()).unwrap());
+        assert_eq!(version, 1);
+        let check = find(&catalog().unwrap(), "CUSTOM-PIN");
+        assert_eq!(
+            execute(&check, check.priority, &check.parameters).status,
+            ResultStatus::Pass
+        );
+        assert!(marker.exists());
+        fs::remove_file(&marker).unwrap();
+        // Editing the tool by hand without accepting it blocks execution.
+        let edited = tool.replace("ran", "edited");
+        fs::write(folder.join("check.sh"), &edited).unwrap();
+        let check = find(&catalog().unwrap(), "CUSTOM-PIN");
+        let blocked = execute(&check, check.priority, &check.parameters);
+        assert_eq!(blocked.status, ResultStatus::Error);
+        assert!(blocked.summary.contains("Integrità non verificata"));
+        assert_eq!(
+            blocked.provenance.as_ref().unwrap().integrity_status,
+            IntegrityStatus::Mismatch
+        );
+        assert!(!marker.exists(), "a mismatched tool must not run");
+        let (_, version) = accept_custom("CUSTOM-PIN").unwrap();
+        assert_eq!(version, 2);
+        let check = find(&catalog().unwrap(), "CUSTOM-PIN");
+        let accepted = execute(&check, check.priority, &check.parameters);
+        assert_eq!(accepted.summary, "edited");
+        // The rewritten configuration keeps the documented field order.
+        let text = fs::read_to_string(folder.join("configuration.json")).unwrap();
+        let order = [
+            "schemaVersion",
+            "\"id\"",
+            "\"name\"",
+            "toolPath",
+            "expectedSha256",
+            "\"version\"",
+            "overrideBuiltinId",
+        ];
+        let positions: Vec<_> = order.iter().map(|key| text.find(key).unwrap()).collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+    }
+
+    #[test]
+    fn requirement_api_uses_camel_case_for_the_dashboard() {
+        let env = TestEnv::new("camel");
+        write_custom_folder(
+            &env,
+            "CUSTOM-CAMEL",
+            "c.sh",
+            &pass_tool("x"),
+            serde_json::json!({"timeoutSeconds": 7}),
+        );
+        let data: serde_json::Value =
+            serde_json::from_str(&dashboard_data_json().unwrap()).unwrap();
+        let custom = data["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "CUSTOM-CAMEL")
+            .unwrap()
+            .clone();
+        for key in [
+            "customToolId",
+            "integrityStatus",
+            "expectedSha256",
+            "actualSha256",
+            "timeoutSeconds",
+        ] {
+            assert!(custom.get(key).is_some(), "missing {key}: {custom}");
+        }
+        assert!(custom.get("custom_tool_id").is_none());
+        assert_eq!(custom["customToolId"], "CUSTOM-CAMEL");
+        assert_eq!(custom["timeoutSeconds"], 7);
+        assert_eq!(custom["integrityStatus"], "VERIFIED");
+        assert!(data["customChecksDir"]
+            .as_str()
+            .unwrap()
+            .ends_with(CUSTOM_DIR));
+    }
+
+    #[test]
+    fn tools_run_in_their_folder_and_report_stderr_on_failure() {
+        let env = TestEnv::new("cwd");
+        let folder = write_custom_folder(
+            &env,
+            "CUSTOM-CWD",
+            "check.sh",
+            b"#!/bin/sh\nprintf '{\"status\":\"PASS\",\"summary\":\"%s\"}' \"$(cat ./data.txt)\"\n",
+            serde_json::json!({}),
+        );
+        fs::write(folder.join("data.txt"), "from-folder").unwrap();
+        let check = find(&catalog().unwrap(), "CUSTOM-CWD");
+        assert_eq!(
+            execute(&check, check.priority, &check.parameters).summary,
+            "from-folder"
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-EXIT",
+            "check.sh",
+            b"#!/bin/sh\necho 'missing dependency xyz' >&2\nexit 3\n",
+            serde_json::json!({}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-EXIT");
+        let failed = execute(&check, check.priority, &check.parameters);
+        assert_eq!(failed.status, ResultStatus::Error);
+        assert!(
+            failed.summary.contains("codice uscita 3"),
+            "{}",
+            failed.summary
+        );
+        assert!(failed
+            .details
+            .iter()
+            .any(|d| d.contains("missing dependency xyz")));
+    }
+
+    #[test]
+    fn timeout_kills_background_helpers_without_hanging() {
+        let env = TestEnv::new("timeout");
+        write_custom_folder(
+            &env,
+            "CUSTOM-SLOW",
+            "check.sh",
+            b"#!/bin/sh\nsleep 30 &\nsleep 30\n",
+            serde_json::json!({"timeoutSeconds": 1}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-SLOW");
+        assert_eq!(check.timeout_seconds, 1);
+        let started = std::time::Instant::now();
+        let result = execute(&check, check.priority, &check.parameters);
+        assert_eq!(result.status, ResultStatus::Error);
+        assert!(result.summary.contains("timeout"), "{}", result.summary);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "background helper kept the pipe open for {:?}",
+            started.elapsed()
+        );
+        // A tool that succeeds but leaves a helper behind does not block either.
+        write_custom_folder(
+            &env,
+            "CUSTOM-BG",
+            "check.sh",
+            b"#!/bin/sh\nsleep 30 &\nprintf '{\"status\":\"PASS\",\"summary\":\"done\"}'\n",
+            serde_json::json!({}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-BG");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            execute(&check, check.priority, &check.parameters).status,
+            ResultStatus::Pass
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn folder_discovery_reads_configuration_and_direct_arguments() {
+        let env = TestEnv::new("discovery");
+        write_custom_folder(
+            &env,
+            "CUSTOM-ARG",
+            "check.sh",
+            b"#!/bin/sh\nprintf '{\"status\":\"PASS\",\"summary\":\"%s|%s\"}' \"$1\" \"$2\"\n",
+            serde_json::json!({"arguments":["one value", "two"]}),
+        );
+        let found = discover_check_folders(&env.custom_dir()).unwrap();
+        assert_eq!(found.len(), 1);
+        let config = found[0].2.as_ref().unwrap();
+        assert_eq!(config.arguments, vec!["one value", "two"]);
+        assert_eq!(config.tool_path, "./check.sh");
+        let check = find(&catalog().unwrap(), "CUSTOM-ARG");
+        assert_eq!(
+            execute(&check, check.priority, &check.parameters).summary,
+            "one value|two"
+        );
     }
 
     fn import_request(id: &str, override_id: Option<&str>) -> String {
@@ -2220,14 +3320,7 @@ mod tests {
 
     #[test]
     fn shipped_catalog_has_unique_ids_safe_paths_and_nine_requirements() {
-        let temp = std::env::temp_dir().join(format!(
-            "bwu-catalog-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        fs::create_dir_all(&temp).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &temp);
+        let _env = TestEnv::new("catalog");
         let catalog = catalog().unwrap();
         assert_eq!(catalog.requirements.len(), 9);
         assert_eq!(
@@ -2248,23 +3341,13 @@ mod tests {
             .expected_sha256
             .as_ref()
             .is_some_and(|hash| hash.len() == 64)));
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
+        // checkupdates contacts mirrors: REQ-001 gets a longer timeout than the default.
+        assert!(find(&catalog, "REQ-001").timeout_seconds > DEFAULT_TIMEOUT_SECONDS);
     }
 
     #[test]
     fn settings_for_removed_folders_do_not_block_discovery_refresh() {
-        let temp = std::env::temp_dir().join(format!(
-            "bwu-stale-settings-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        fs::create_dir_all(&temp).unwrap();
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", &temp);
+        let _env = TestEnv::new("stale-settings");
         let directory = state_dir().unwrap();
         fs::create_dir_all(&directory).unwrap();
         let settings = serde_json::json!({
@@ -2275,23 +3358,11 @@ mod tests {
         let current = catalog().unwrap();
         let loaded = load_settings(&current).unwrap();
         assert!(!loaded.requirements.contains_key("CUSTOM-REMOVED"));
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
     fn builtin_tool_hashes_match_distribution_manifest_and_legacy_reports_remain_unknown() {
-        let temp = std::env::temp_dir().join(format!(
-            "bwu-builtin-test-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        fs::create_dir_all(&temp).unwrap();
-        std::env::set_var("XDG_CONFIG_HOME", &temp);
+        let _env = TestEnv::new("builtin");
         let catalog = catalog().unwrap();
         for requirement in &catalog.requirements {
             let evidence = control_provenance(requirement);
@@ -2308,37 +3379,40 @@ mod tests {
             r#"{"id":"REQ-001","name":"x","priority":"HIGH","status":"PASS","summary":"x","details":[],"completedAtUnixMs":1}"#,
         ).unwrap();
         assert!(legacy.provenance.is_none());
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
-    fn custom_import_mismatch_explicit_update_remove_and_historical_provenance() {
-        let temp =
-            std::env::temp_dir().join(format!("bwu-custom-{}-{}", std::process::id(), now_ms()));
-        fs::create_dir_all(&temp).unwrap();
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        let old_state = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
-        std::env::set_var("XDG_STATE_HOME", temp.join("state"));
+    fn custom_import_update_remove_and_historical_provenance() {
+        let _env = TestEnv::new("custom");
         let request = import_request("CUSTOM-001", None);
         let mut spoof: serde_json::Value = serde_json::from_str(&request).unwrap();
         spoof["origin"] = serde_json::json!("BUILTIN");
         assert!(dashboard_import_custom(&spoof.to_string()).is_err());
+        let mut traversal: serde_json::Value = serde_json::from_str(&request).unwrap();
+        traversal["fileName"] = serde_json::json!("../evil.sh");
+        assert!(dashboard_import_custom(&traversal.to_string()).is_err());
         dashboard_import_custom(&request).unwrap();
-        let config_path = state_dir()
-            .unwrap()
-            .join("custom-tools/CUSTOM-001/configuration.json");
+        assert!(
+            dashboard_import_custom(&request).is_err(),
+            "duplicate ID accepted"
+        );
+        let folder = custom_root().unwrap().join("CUSTOM-001");
+        // The imported file keeps its name inside the check folder.
+        assert!(folder.join("check.sh").is_file());
+        let config_path = folder.join("configuration.json");
         let original_config = fs::read(&config_path).unwrap();
         let mut forged_config: serde_json::Value =
             serde_json::from_slice(&original_config).unwrap();
         forged_config["origin"] = serde_json::json!("BUILTIN");
         fs::write(&config_path, forged_config.to_string()).unwrap();
+        let forged = find(&catalog().unwrap(), "CUSTOM-001");
+        assert_eq!(forged.origin, ControlOrigin::Custom);
         assert!(
-            catalog().is_err(),
+            forged
+                .configuration_error
+                .as_deref()
+                .unwrap()
+                .contains("origin"),
             "custom configuration accepted a BUILTIN origin"
         );
         fs::write(&config_path, original_config).unwrap();
@@ -2381,21 +3455,10 @@ mod tests {
             report.results[0].compliance_status,
             Some(ResultStatus::Pass)
         );
-        assert_eq!(
-            report.results[0]
-                .provenance
-                .as_ref()
-                .unwrap()
-                .integrity_status,
-            IntegrityStatus::Verified
-        );
-        let tool = state_dir()
-            .unwrap()
-            .join("custom-tools/CUSTOM-001/CUSTOM-001.tool");
-        fs::write(&tool, b"#!/bin/sh\nprintf '{\"status\":\"WARNING\",\"summary\":\"changed\",\"details\":[\"second method unavailable\"]}'").unwrap();
+        fs::write(folder.join("check.sh"), b"#!/bin/sh\nprintf '{\"status\":\"WARNING\",\"summary\":\"changed\",\"details\":[\"second method unavailable\"]}'").unwrap();
         thread::sleep(Duration::from_millis(3));
         report = serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
-        assert_eq!(report.results[0].status, ResultStatus::Warn);
+        assert_eq!(report.results[0].status, ResultStatus::Error);
         assert_eq!(
             report.results[0]
                 .provenance
@@ -2411,27 +3474,14 @@ mod tests {
         let update =
             output_json(&serde_json::json!({"fileBase64":base64_encode(update_bytes)})).unwrap();
         dashboard_update_custom("CUSTOM-001", &update).unwrap();
+        assert_eq!(fs::read(folder.join("check.sh")).unwrap(), update_bytes);
         report = serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
         assert_eq!(report.results[0].status, ResultStatus::Warn);
-        assert_eq!(
-            report.results[0].provenance.as_ref().unwrap().tool_version,
-            Some(2)
-        );
-        assert_eq!(
-            report.results[0]
-                .provenance
-                .as_ref()
-                .unwrap()
-                .integrity_status,
-            IntegrityStatus::Verified
-        );
+        let provenance = report.results[0].provenance.as_ref().unwrap();
+        assert_eq!(provenance.tool_version, Some(2));
+        assert_eq!(provenance.integrity_status, IntegrityStatus::Verified);
         assert_ne!(
-            report.results[0]
-                .provenance
-                .as_ref()
-                .unwrap()
-                .actual_sha256
-                .as_deref(),
+            provenance.actual_sha256.as_deref(),
             Some(first_hash.as_str())
         );
         let historic = dashboard_history_report_json(&before_update_stamp.to_string()).unwrap();
@@ -2450,27 +3500,20 @@ mod tests {
             .requirements
             .iter()
             .any(|r| r.id == "CUSTOM-001"));
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match old_state {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
+        assert!(!load_settings(&catalog().unwrap())
+            .unwrap()
+            .requirements
+            .contains_key("CUSTOM-001"));
     }
 
     #[test]
-    fn override_is_reported_as_custom_and_builtin_restore_keeps_custom_entry() {
-        let temp =
-            std::env::temp_dir().join(format!("bwu-override-{}-{}", std::process::id(), now_ms()));
-        fs::create_dir_all(&temp).unwrap();
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        let old_state = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
-        std::env::set_var("XDG_STATE_HOME", temp.join("state"));
+    fn override_is_reported_as_custom_and_restore_or_remove_brings_builtin_back() {
+        let _env = TestEnv::new("override");
         dashboard_import_custom(&import_request("CUSTOM-OVR-001", Some("REQ-001"))).unwrap();
+        assert!(
+            dashboard_import_custom(&import_request("CUSTOM-OVR-002", Some("REQ-001"))).is_err(),
+            "second override of the same builtin accepted"
+        );
         let report: AuditReport =
             serde_json::from_str(&dashboard_check_json("REQ-001").unwrap()).unwrap();
         let provenance = report.results[0].provenance.as_ref().unwrap();
@@ -2481,63 +3524,39 @@ mod tests {
         assert!(provenance.builtin_expected_sha256.is_some());
         assert!(provenance.builtin_tool_path.is_some());
         dashboard_restore_builtin("REQ-001").unwrap();
-        let catalog = catalog().unwrap();
+        let catalog_after = catalog().unwrap();
         assert_eq!(
-            catalog
-                .requirements
-                .iter()
-                .find(|r| r.id == "REQ-001")
-                .unwrap()
-                .origin,
+            find(&catalog_after, "REQ-001").origin,
             ControlOrigin::Builtin
         );
-        assert!(catalog
-            .requirements
-            .iter()
-            .any(|r| r.id == "CUSTOM-OVR-001" && r.origin == ControlOrigin::Custom));
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match old_state {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
+        assert_eq!(
+            find(&catalog_after, "CUSTOM-OVR-001").origin,
+            ControlOrigin::Custom
+        );
+        dashboard_import_custom(&import_request("CUSTOM-OVR-003", Some("REQ-002"))).unwrap();
+        assert_eq!(
+            find(&catalog().unwrap(), "REQ-002").origin,
+            ControlOrigin::Custom
+        );
+        dashboard_remove_custom("CUSTOM-OVR-003").unwrap();
+        assert_eq!(
+            find(&catalog().unwrap(), "REQ-002").origin,
+            ControlOrigin::Builtin
+        );
     }
 
     #[test]
     fn custom_tool_missing_non_executable_bad_output_and_timeout_are_errors() {
-        let temp =
-            std::env::temp_dir().join(format!("bwu-exec-{}-{}", std::process::id(), now_ms()));
-        fs::create_dir_all(&temp).unwrap();
-        let old_config = std::env::var_os("XDG_CONFIG_HOME");
-        let old_state = std::env::var_os("XDG_STATE_HOME");
-        std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
-        std::env::set_var("XDG_STATE_HOME", temp.join("state"));
+        let env = TestEnv::new("exec");
         let no_id_error = b"#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ERROR\",\"summary\":\"check failed\",\"details\":\"version unavailable\"}'";
-        let (path, hash) = store_custom_tool("CUSTOM-ERR", no_id_error).unwrap();
-        let mut tools = BTreeMap::new();
-        tools.insert("linux".into(), path.clone());
-        let requirement = Requirement {
-            id: "CUSTOM-ERR".into(),
-            name: "Custom".into(),
-            description: "Test".into(),
-            enabled: true,
-            priority: Priority::High,
-            parameters: serde_json::json!({}),
-            arguments: vec![],
-            tools: tools.clone(),
-            origin: ControlOrigin::Custom,
-            expected_sha256: Some(hash),
-            replaces_builtin: None,
-            custom_tool_id: Some("CUSTOM-ERR".into()),
-            custom_tool_version: Some(1),
-            builtin_tool_path: None,
-            actual_sha256: None,
-            integrity_status: IntegrityStatus::Unknown,
-        };
-        let path = state_dir().unwrap().join(&path);
+        let folder = write_custom_folder(
+            &env,
+            "CUSTOM-ERR",
+            "check.sh",
+            no_id_error,
+            serde_json::json!({}),
+        );
+        let requirement = find(&catalog().unwrap(), "CUSTOM-ERR");
         let declared_error_result = execute(&requirement, Priority::High, &requirement.parameters);
         assert_eq!(declared_error_result.status, ResultStatus::Error);
         assert!(declared_error_result.summary.contains("check failed"));
@@ -2545,48 +3564,46 @@ mod tests {
             .details
             .iter()
             .any(|d| d == "version unavailable"));
-
-        let with_forbidden_id = b"#!/bin/sh\nprintf '%s\\n' '{\"id\":\"CUSTOM-ERR\",\"status\":\"PASS\",\"summary\":\"not allowed\",\"details\":[]}'";
-        let (_, hash) = store_custom_tool("CUSTOM-ERR", with_forbidden_id).unwrap();
-        let id_result = Requirement {
-            expected_sha256: Some(hash),
-            ..requirement.clone()
+        let rewrite = |bytes: &[u8]| -> Requirement {
+            let (_, hash) = store_custom_tool("CUSTOM-ERR", "check.sh", bytes).unwrap();
+            Requirement {
+                expected_sha256: Some(hash),
+                ..requirement.clone()
+            }
         };
-        assert!(execute(&id_result, Priority::High, &id_result.parameters)
-            .summary
-            .contains("invalid JSON or fields"));
-
-        let (_, hash) = store_custom_tool("CUSTOM-ERR", b"#!/bin/sh\nprintf 'not-json'").unwrap();
-        let invalid_json = Requirement {
-            expected_sha256: Some(hash),
-            ..requirement.clone()
-        };
+        let id_result = rewrite(b"#!/bin/sh\nprintf '%s\\n' '{\"id\":\"CUSTOM-ERR\",\"status\":\"PASS\",\"summary\":\"not allowed\",\"details\":[]}'");
+        let rejected = execute(&id_result, Priority::High, &id_result.parameters);
+        assert!(rejected.summary.contains("invalid JSON or fields"));
+        assert!(rejected.details.iter().any(|d| d.contains("unknown field")));
+        let invalid_json = rewrite(b"#!/bin/sh\nprintf 'not-json'");
         assert_eq!(
             execute(&invalid_json, Priority::High, &invalid_json.parameters).status,
             ResultStatus::Error
         );
+        let large = rewrite(b"#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n");
+        assert!(execute(&large, Priority::High, &large.parameters)
+            .summary
+            .contains("too large"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::set_permissions(folder.join("check.sh"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let not_executable = execute(&large, Priority::High, &large.parameters);
+            assert_eq!(not_executable.status, ResultStatus::Error);
+            assert!(not_executable.summary.contains("not executable"));
+            fs::set_permissions(folder.join("check.sh"), fs::Permissions::from_mode(0o700))
+                .unwrap();
         }
-        assert_eq!(
-            execute(&requirement, Priority::High, &requirement.parameters).status,
-            ResultStatus::Error
-        );
         let missing = Requirement {
-            tools: BTreeMap::from([("linux".into(), "custom-tools/missing.tool".into())]),
+            tools: BTreeMap::from([("linux".into(), format!("{CUSTOM_DIR}/missing.tool"))]),
             ..requirement.clone()
         };
         assert_eq!(
             execute(&missing, Priority::High, &missing.parameters).status,
             ResultStatus::Error
         );
-        let (_, hash) = store_custom_tool("CUSTOM-ERR", b"#!/bin/sh\nwhile :; do :; done").unwrap();
-        let timeout_req = Requirement {
-            expected_sha256: Some(hash),
-            ..requirement
-        };
+        let timeout_req = rewrite(b"#!/bin/sh\nwhile :; do :; done");
         let timed = execute_with_timeout(
             &timeout_req,
             Priority::High,
@@ -2594,16 +3611,34 @@ mod tests {
             Duration::from_millis(40),
         );
         assert_eq!(timed.status, ResultStatus::Error);
-        assert!(timed.summary.contains("timed out"));
-        match old_config {
-            Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match old_state {
-            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
-            None => std::env::remove_var("XDG_STATE_HOME"),
-        }
-        fs::remove_dir_all(temp).unwrap();
+        assert!(timed.summary.contains("timeout"));
+    }
+
+    #[test]
+    fn cli_custom_commands_work_without_a_valid_catalog_entry() {
+        let env = TestEnv::new("cli-custom");
+        write_custom_folder(
+            &env,
+            "CUSTOM-CLI",
+            "c.sh",
+            &pass_tool("cli"),
+            serde_json::json!({"expectedSha256": null}),
+        );
+        let accept = run(&["custom", "accept", "CUSTOM-CLI"].map(OsString::from)).unwrap();
+        assert!(accept.text.contains("SHA-256 atteso aggiornato"));
+        let refreshed = run(&[OsString::from("refresh")]).unwrap();
+        assert!(
+            refreshed.text.contains("1 personalizzati"),
+            "{}",
+            refreshed.text
+        );
+        let check = run(&["check", "CUSTOM-CLI"].map(OsString::from)).unwrap();
+        assert_eq!(check.code, 0, "{}", check.text);
+        run(&["custom", "remove", "CUSTOM-CLI"].map(OsString::from)).unwrap();
+        assert!(!env.custom_dir().join("CUSTOM-CLI").exists());
+        assert!(run(&["custom", "remove", "CUSTOM-CLI"].map(OsString::from)).is_err());
+        assert!(run(&["custom", "drop", "CUSTOM-CLI"].map(OsString::from)).is_err());
+        assert!(run(&[OsString::from("bogus")]).is_err());
     }
 
     #[test]
@@ -2614,6 +3649,12 @@ mod tests {
         assert!(safe_relative_path(
             "share/baradwatchu-client/catalog/checks/REQ-001/check.sh"
         ));
+        for name in ["check.sh", "my tool"] {
+            assert!(valid_tool_file_name(name), "{name}");
+        }
+        for name in ["", ".hidden", "configuration.json", "a/b", "..", "x\\y"] {
+            assert!(!valid_tool_file_name(name), "{name}");
+        }
     }
 
     #[test]
@@ -2649,27 +3690,23 @@ mod tests {
             summary: "Secure Boot non determinabile".into(),
             details: vec![
                 "Tool eseguito: /opt/baradwatchu/catalog/checks/REQ-009/check.sh".into(),
-                "Comando: /usr/bin/mokutil --sb-state".into(),
-                "Codice uscita: 127".into(),
-                "Output: mokutil non è installato".into(),
+                "Comando: /usr/bin/od -An -tu1 -j4 -N1 /sys/firmware/efi/efivars/SecureBoot".into(),
+                "Codice uscita: 1".into(),
             ],
             completed_at_unix_ms: 1,
             provenance: None,
         };
         let log = human_result(&result);
         assert!(log.starts_with("REQ-009  WARN"));
-        assert!(log.contains("Comando: /usr/bin/mokutil --sb-state"));
-        assert!(log.contains("Codice uscita: 127"));
+        assert!(log.contains("Comando: /usr/bin/od"));
+        assert!(log.contains("Codice uscita: 1"));
         assert!(!log.trim_start().starts_with('{'));
     }
 
     #[test]
     fn audit_report_is_saved_without_text_log_unless_requested() {
-        let directory = std::env::temp_dir().join(format!(
-            "baradwatchu-log-option-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let env = TestEnv::new("log-option");
+        let directory = env.root.join("audits");
         let mut report = AuditReport {
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: now_ms(),
@@ -2693,16 +3730,64 @@ mod tests {
             .unwrap();
         assert!(log_path.is_file());
         assert_eq!(report.log_file.as_deref(), Some(log_path.to_str().unwrap()));
-        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn audit_exit_codes_follow_error_fail_warn_precedence() {
+        let env = TestEnv::new("exit-codes");
+        for (id, status) in [("CUSTOM-A", "PASS"), ("CUSTOM-B", "WARNING")] {
+            write_custom_folder(
+                &env,
+                id,
+                "c.sh",
+                format!("#!/bin/sh\nprintf '{{\"status\":\"{status}\",\"summary\":\"s\"}}'\n")
+                    .as_bytes(),
+                serde_json::json!({}),
+            );
+        }
+        let mut catalog = catalog().unwrap();
+        // Keep only the two custom checks so the host's real tools do not affect the code.
+        catalog.requirements.retain(|r| r.id.starts_with("CUSTOM-"));
+        let settings = load_settings(&catalog).unwrap();
+        assert_eq!(
+            run_audit(&catalog, &settings, true, false, false)
+                .unwrap()
+                .code,
+            4
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-C",
+            "c.sh",
+            b"#!/bin/sh\nprintf '{\"status\":\"FAIL\",\"summary\":\"s\"}'\n",
+            serde_json::json!({}),
+        );
+        let mut catalog = super::catalog().unwrap();
+        catalog.requirements.retain(|r| r.id.starts_with("CUSTOM-"));
+        let settings = load_settings(&catalog).unwrap();
+        assert_eq!(
+            run_audit(&catalog, &settings, true, false, false)
+                .unwrap()
+                .code,
+            3
+        );
+        fs::create_dir_all(env.custom_dir().join("CUSTOM-D")).unwrap();
+        fs::write(env.custom_dir().join("CUSTOM-D/configuration.json"), "{}").unwrap();
+        let mut catalog = super::catalog().unwrap();
+        catalog.requirements.retain(|r| r.id.starts_with("CUSTOM-"));
+        let settings = load_settings(&catalog).unwrap();
+        let output = run_audit(&catalog, &settings, true, false, false).unwrap();
+        assert_eq!(output.code, 1);
+        // Every audit is persisted for `status` and the dashboard history.
+        let history = history_reports_at(&history_dir().unwrap()).unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history_entry(&history[0]).overall_status, "ERROR");
     }
 
     #[test]
     fn dashboard_history_lists_reports_newest_first_and_validates_selected_report() {
-        let directory = std::env::temp_dir().join(format!(
-            "baradwatchu-dashboard-history-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let env = TestEnv::new("dashboard-history");
+        let directory = env.root.join("history");
         let reports = directory.join("reports");
         fs::create_dir_all(&reports).unwrap();
         for (stamp, status) in [(100, ResultStatus::Pass), (200, ResultStatus::Warn)] {
@@ -2742,6 +3827,5 @@ mod tests {
             "Diagnostic fixture"
         );
         assert!(read_history_report(&reports.join("100.json"), 200).is_err());
-        fs::remove_dir_all(directory).unwrap();
     }
 }

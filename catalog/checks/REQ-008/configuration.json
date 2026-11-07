@@ -7,12 +7,14 @@
   "enabled": true,
   "toolPath": "./check.sh",
   "arguments": [],
-  "expectedSha256": "3f3f7c538c1698e1d29bff5032cfe2ca8ca3884e1f134087168d761c999b254b",
+  "expectedSha256": "b74ce98e9b56324038b1ca5c08c32489bb8aa098b682e18b7f504b091f83f2ad",
   "version": 1,
   "parameters": {
     "maxPasswordAgeDays": 60,
+    "minimumWarningDays": 10,
     "minimumLength": 14,
-    "minimumClasses": 4
+    "minimumClasses": 4,
+    "requireCharacterCredits": true
   },
   "overrideBuiltinId": null
 }

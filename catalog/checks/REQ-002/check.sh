@@ -51,25 +51,38 @@ if ((newest > 0)); then
   if [[ $now =~ ^[0-9]+$ ]] && ((now >= newest)); then sig_age=$(((now-newest)/86400)); fi
 fi
 
-status=WARN
-summary='ClamAV è installato; vedere i dettagli per le prove mancanti'
-if [[ $daemon == active && $updater == active && $onaccess == active && $prevention == yes && $paths -gt 0 && $sig_age =~ ^[0-9]+$ ]] && ((sig_age <= 3)); then
+# Criterion (skill audit-postazione R5): daemon, freshclam and clamonacc active,
+# OnAccessPrevention yes with at least one watched path, daily signatures <= 3 days old.
+# Anything explicitly off is FAIL; anything that cannot be observed is WARN.
+problems=() unknown=()
+for pair in "motore (clamd):$daemon" "aggiornamento firme (freshclam):$updater" "scansione in accesso (clamonacc):$onaccess"; do
+  label=${pair%:*} state=${pair##*:}
+  case $state in
+    active) ;;
+    unknown) unknown+=("stato $label") ;;
+    *) problems+=("$label non attivo") ;;
+  esac
+done
+if [[ -z $config ]]; then unknown+=("configurazione clamd non leggibile")
+else
+  [[ $prevention == yes ]] || problems+=("OnAccessPrevention=${prevention:-assente} (richiesto yes)")
+  ((paths > 0)) || problems+=("nessun percorso OnAccessIncludePath/OnAccessMountPath")
+fi
+if [[ $sig_age =~ ^[0-9]+$ ]]; then
+  ((sig_age <= 3)) || problems+=("firme giornaliere vecchie di $sig_age giorni (massimo 3)")
+else unknown+=("età delle firme"); fi
+join() { local IFS=';'; printf '%s' "$*" | /usr/bin/sed 's/;/; /g'; }
+if ((${#problems[@]})); then
+  status=FAIL
+  summary="Protezione antivirus non conforme: $(join "${problems[@]}")"
+elif ((${#unknown[@]})); then
+  status=WARN
+  summary="Protezione antivirus non verificabile: $(join "${unknown[@]}")"
+else
   status=PASS
   summary='Motore, aggiornamento firme e scansione on-access risultano attivi; database firme aggiornato'
-elif [[ $daemon == unknown || $updater == unknown || $onaccess == unknown ]]; then
-  status=WARN
-  summary='Non è possibile interrogare systemd; lo stato dei servizi ClamAV non è determinabile in questo ambiente'
-elif [[ $daemon != active ]]; then
-  status=FAIL
-  summary='Il motore ClamAV non risulta attivo; verificare daemon e servizio systemd'
-elif [[ $updater != active || $onaccess != active ]]; then
-  summary='Il servizio ClamAV è attivo, ma aggiornamento firme o scansione in accesso non risultano entrambi attivi'
-elif [[ $prevention != yes || $paths -eq 0 ]]; then
-  summary='Il servizio ClamAV è attivo, ma la configurazione di prevenzione o i percorsi da sorvegliare non sono dimostrati'
-elif [[ ! $sig_age =~ ^[0-9]+$ ]] || ((sig_age > 3)); then
-  summary='Il servizio ClamAV è attivo, ma la freschezza delle firme non è verificata o supera 3 giorni'
 fi
 
-printf '{"id":"%s","status":"%s","summary":"%s","details":["daemon=%s%s","updater=%s%s","on-access=%s%s","prevention=%s","on-access-paths=%s","età firme giornaliere (giorni)=%s","Soglia firme: massimo 3 giorni; copertura effettiva delle directory non è attestata"]}' \
+printf '{"id":"%s","status":"%s","summary":"%s","details":["daemon=%s%s","updater=%s%s","on-access=%s%s","prevention=%s","on-access-paths=%s","età firme giornaliere (giorni)=%s","config=%s","Soglia firme: massimo 3 giorni; copertura effettiva delle directory non è attestata"]}' \
   "$id" "$status" "$summary" "$daemon_label" "" "$updater_label" "" \
-  "$onaccess_label" "" "$prevention" "$paths" "$sig_age"
+  "$onaccess_label" "" "${prevention:-unknown}" "$paths" "$sig_age" "${config:-non leggibile}"

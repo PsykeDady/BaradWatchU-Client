@@ -1,5 +1,8 @@
 #!/usr/bin/bash
+# /etc/hosts blocklist method of REQ-004 (skill audit-postazione R7, method A).
+# Output: CODE|detail with CODE in PRESENT (>= threshold), FEW, ABSENT, UNKNOWN.
 set -u -o pipefail
+min_entries=${1:-10000}
 if [[ ! -r /etc/hosts ]]; then
   printf 'UNKNOWN|/etc/hosts non leggibile'
   exit 0
@@ -19,8 +22,10 @@ count=$(/usr/bin/awk '
   }
   END {print entries+0}
 ' /etc/hosts 2>/dev/null) || count=0
-if [[ $count =~ ^[0-9]+$ ]] && ((count > 0)); then
-  printf 'PRESENT|%s voci di blocco rilevate; nomi host omessi' "$count"
+if [[ ! $count =~ ^[0-9]+$ ]] || ((count == 0)); then
+  printf 'ABSENT|nessuna voce di blocco rilevata'
+elif ((count >= min_entries)); then
+  printf 'PRESENT|%s voci di blocco (minimo %s); nomi host omessi' "$count" "$min_entries"
 else
-  printf 'ABSENT|nessuna voce di blocco personalizzata rilevata'
+  printf 'FEW|solo %s voci di blocco (minimo %s): non è una blocklist completa' "$count" "$min_entries"
 fi

@@ -6,71 +6,116 @@
 
 BaradWatchU Client controlla la postazione su cui viene eseguito. Audit, impostazioni e storico restano locali; il Server non è necessario. Il target di sviluppo attuale è Arch Linux; il catalogo dei requisiti non supporta ancora altri sistemi operativi.
 
-## Requisiti ed esiti
+## Controlli: una cartella ciascuno
 
-I controlli vengono scoperti dalle cartelle, una per ciascun controllo. Le cartelle builtin sono in `catalog/checks/REQ-*/`; quelle custom in `$XDG_CONFIG_HOME/baradwatchu/custom-tools/CUSTOM-*/` (oppure `~/.config/baradwatchu/custom-tools/CUSTOM-*/`). Ogni cartella contiene `configuration.json` e il relativo tool. La configurazione registra identità, descrizione, abilitazione, priorità, `toolPath`, `arguments` diretti, parametri e SHA-256 atteso. Runtime e installer scoprono le cartelle senza una seconda lista di ID requisito. Le priorità sono `HIGHEST`, `HIGH`, `MEDIUM`, `LOW` e `OPTIONAL`; non modificano l'esito del controllo.
+Ogni controllo, integrato o personalizzato, è una cartella con il nome del suo ID che contiene `configuration.json` e il tool da eseguire:
 
-Ogni tool viene avviato direttamente, senza shell implicita, con durata e output limitati. I tool builtin identificano il requisito nel risultato; un tool custom restituisce soltanto `status`, `summary` e `details` facoltativi, perché l'ID è già nel requisito configurato. Gli stati custom sono `PASS`, `FAIL`, `WARNING` o `ERROR`; il Client mostra `WARNING` come `WARN`. `details` può essere una stringa o un array di stringhe. L'intera risposta deve essere un unico oggetto JSON su stdout. Evidenze mancanti o ambigue dovrebbero usare `WARNING`; errori di avvio o di protocollo diventano `ERROR`. I tool non elevano i privilegi e non modificano la configurazione di sistema.
+```text
+custom-checks/
+└── CUSTOM-001/
+    ├── configuration.json
+    └── CUSTOM-001.sh
+```
 
-`REQ-001` verifica gli aggiornamenti dei pacchetti usando `/usr/bin/checkupdates --nocolor` fornito da `pacman-contrib`. `checkupdates` usa un database temporaneo e può contattare i mirror Arch: il controllo non è offline. Se `checkupdates` manca, i mirror non rispondono o l'esito non è determinabile, viene restituito `WARN`. Gli aggiornamenti trovati producono `FAIL`; nessun aggiornamento produce `PASS`. Il controllo non determina la presenza di vulnerabilità. Vedi il [manuale Arch di checkupdates](https://man.archlinux.org/man/extra/pacman-contrib/checkupdates.8.en).
+```json
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "CUSTOM-001",
+  "name": "Password Reminder",
+  "description": "Che cosa verifica il controllo",
+  "priority": "OPTIONAL",
+  "enabled": true,
+  "toolPath": "./CUSTOM-001.sh",
+  "arguments": [],
+  "expectedSha256": "<sha256 del tool>",
+  "version": 1,
+  "timeoutSeconds": 20,
+  "parameters": {},
+  "overrideBuiltinId": null
+}
+```
 
-Altri controlli restituiscono intenzionalmente `WARN` quando gli indicatori locali non dimostrano la proprietà di sicurezza. In particolare, la presenza di un servizio antivirus non dimostra la copertura delle scansioni; le impostazioni DNS non dimostrano il filtraggio; lo stato VPN non dimostra la raggiungibilità del tunnel; e i tool attuali per cifratura, password e avvio non dichiarano più di quanto consentano le evidenze disponibili. Valutare il riepilogo e i dettagli prima di considerare conforme un requisito.
+- I controlli integrati stanno in `share/baradwatchu-client/catalog/checks/REQ-*/` dell'installazione; quelli personalizzati in `$XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/` (predefinito `~/.config/baradwatchu/custom-checks/`). Una cartella `custom-tools` della versione precedente viene rinominata in `custom-checks` al primo utilizzo, senza modificarne il contenuto.
+- `id` deve coincidere con il nome della cartella e iniziare con `CUSTOM-` (lettere maiuscole, cifre, trattini). `toolPath` è relativo alla cartella. `arguments` viene passato direttamente al tool, senza shell. `timeoutSeconds` (1–300, predefinito 20) e `version` sono facoltativi. `parameters` è un oggetto JSON inviato al tool su stdin come `{"requirementId":…,"parameters":{…}}`. I campi sconosciuti sono rifiutati. Le priorità sono `HIGHEST`, `HIGH`, `MEDIUM`, `LOW` e `OPTIONAL` e non cambiano l'esito.
+- Un controllo personalizzato stampa su stdout **un solo** oggetto JSON ed esce con codice 0: `{"status":"PASS","summary":"Esito leggibile","details":["prova"]}`. Gli stati sono `PASS`, `FAIL`, `WARNING` (mostrato come `WARN`) ed `ERROR`; `details` è facoltativo, stringa o array. Non ripete il proprio ID. I tool integrati restituiscono anche il loro `id`.
+- Il tool viene avviato nella propria cartella con l'utente corrente, senza shell né elevazione di privilegi, con un ambiente pulito (`PATH` è `/usr/bin:/bin`, più `~/.local/bin` per i controlli personalizzati), un proprio process group e un output limitato. Al timeout viene terminato l'intero process group, compresi gli helper avviati dallo script. Codice di uscita diverso da zero, JSON non valido o timeout danno `ERROR`, e lo stderr del tool compare nei dettagli.
+- **Integrità:** prima di ogni esecuzione lo SHA-256 del tool viene confrontato con `expectedSha256` (per gli integrati: il manifest incorporato nell'agente). Se non coincide il tool **non viene eseguito** e l'esito è `ERROR`. Dopo una modifica voluta, registra il nuovo file con `baradwatchu-agent custom accept CUSTOM-ID` oppure con **Accetta versione attuale** nella dashboard; caricare un nuovo file dalla dashboard fa lo stesso e incrementa `version`. Un controllo scritto a mano senza `expectedSha256` resta bloccato finché non viene accettato. L'hash copre solo il file di ingresso.
+- **Isolamento dei guasti:** una cartella personalizzata con configurazione non valida non blocca gli altri controlli. Compare come controllo in `ERROR` con il motivo esatto (per esempio un campo sconosciuto) e si può eliminare da CLI o dashboard. Le cartelle il cui nome non è un ID `CUSTOM-` valido vengono segnalate come ignorate da `refresh` e dalla dashboard.
+
+Le cartelle vengono riscansionate a ogni `list`, audit e richiesta della dashboard; `baradwatchu-agent refresh` o **Riscansiona cartelle** nella dashboard forzano la scansione e segnalano le cartelle non valide.
+
+## Controlli integrati (Arch Linux)
+
+I criteri seguono la baseline delle postazioni in `REQUIREMENTS.md` §5. Le soglie sono parametri nei rispettivi `configuration.json` e si cambiano con `configure` o dalla dashboard. Se le prove mancano o non sono leggibili l'esito è `WARN`, mai `PASS`; ciò che risulta spento è `FAIL`.
+
+| ID | PASS quando |
+|---|---|
+| REQ-001 | `checkupdates` (pacman-contrib) non trova aggiornamenti nei repository ufficiali (AUR escluso). Viene riportata la data dell'ultimo full upgrade da `pacman.log`. Contatta i mirror Arch; timeout 90 s. |
+| REQ-002 | Daemon ClamAV, freshclam e clamonacc attivi, `OnAccessPrevention yes` con almeno un percorso sorvegliato, firme giornaliere vecchie al massimo 3 giorni. |
+| REQ-003 | UFW, firewalld o nftables mostrano un filtraggio operativo verificato. Tutti i firewall gestiti esplicitamente inattivi danno `FAIL`; regole non leggibili altrimenti `WARN`. |
+| REQ-004 | Almeno un metodo di filtro DNS è completo: dnsmasq attivo **e** abilitato all'avvio con almeno `minimumDnsmasqRules` (1000) regole di blocco, oppure una blocklist di almeno `minimumHostsEntries` (10000) voci in `/etc/hosts`. Un `resolv.conf` che non punta a loopback (per esempio con una VPN connessa) viene riportato come osservazione. |
+| REQ-005 | Cato o WireGuard connessi. Installato ma disconnesso dà `WARN`; nessuno dei due installato dà `FAIL`. |
+| REQ-006 | Almeno un metodo di cifratura attivo: dispositivo LUKS/dm-crypt, eCryptfs montato (i dettagli indicano se copre la home) o container CryFS montato. Non certifica tutte le aree dati. |
+| REQ-007 | KDE Plasma 6 Wayland: `Autolock=true`, `Timeout` ≤ `maxTimeoutMinutes` (5), `LockGrace` ≤ `maxLockGraceSeconds` (0, password richiesta subito), blocco alla ripresa attivo. Le altre sessioni sono `NOT_APPLICABLE`. |
+| REQ-008 | Età massima della password dell'account ≤ `maxPasswordAgeDays` (60) e non "never"; preavviso ≥ `minimumWarningDays` (10); `PASS_MAX_DAYS` in `/etc/login.defs` entro lo stesso limite; pwquality `minlen` ≥ 14, `minclass` ≥ 4, `ucredit`/`lcredit`/`dcredit`/`ocredit` = -1 (`requireCharacterCredits`), con `pam_pwquality` o `pam_passwdqc` in PAM. |
+| REQ-009 | Il firmware riporta Secure Boot attivo e SetupMode disattivato; l'output di `systemd-analyze has-tpm2` viene registrato. |
 
 ## CLI
 
-Compilare con Rust e le dipendenze Angular installate, poi eseguire:
-
 ```sh
-cargo run -p baradwatchu-agent -- list
-cargo run -p baradwatchu-agent -- enable REQ-001
-cargo run -p baradwatchu-agent -- disable REQ-005
-cargo run -p baradwatchu-agent -- priority REQ-001 HIGH
-cargo run -p baradwatchu-agent -- configure REQ-006 '{"sensitivePaths":["/srv/archive"]}'
-cargo run -p baradwatchu-agent -- check REQ-001
-cargo run -p baradwatchu-agent -- check REQ-001 --log
-cargo run -p baradwatchu-agent -- audit
-cargo run -p baradwatchu-agent -- audit --json
-cargo run -p baradwatchu-agent -- audit --log
-cargo run -p baradwatchu-agent -- status
+baradwatchu-agent list [--json]
+baradwatchu-agent refresh
+baradwatchu-agent enable|disable ID
+baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL
+baradwatchu-agent configure REQ-007 '{"maxTimeoutMinutes":5,"maxLockGraceSeconds":0}'
+baradwatchu-agent check ID [--log]
+baradwatchu-agent audit [--json] [--notify] [--log]
+baradwatchu-agent status [--json]
+baradwatchu-agent custom accept CUSTOM-ID
+baradwatchu-agent custom remove CUSTOM-ID
+baradwatchu-agent dashboard
 ```
 
-Usare `--json` esplicitamente per l’output destinato alle macchine e aggiungere `--log` a `audit` o `check ID` per salvare un log di testo `.log` in `~/.local/state/baradwatchu/audits/`. I log di testo sono disattivati per impostazione predefinita. I report JSON strutturati restano salvati per `status` e dashboard in `audits/reports/`: sono la cronologia dell’applicazione, non copie dei log. Il log richiesto mostra risultati, tool eseguiti e diagnostiche. L’installer suggerisce anche i pacchetti Arch per i comandi di audit opzionali mancanti. Disabilitare un requisito lo conserva insieme alle impostazioni. I parametri sono oggetti JSON passati tramite standard input; i tool che non li leggono li ignorano.
-
-I controlli Linux riportano separatamente le evidenze dei metodi: REQ-003 supporta UFW, firewalld e nftables operativi; REQ-004 restituisce PASS se dnsmasq è installato e attivo oppure, se dnsmasq è assente, sono presenti voci di blocco personalizzate in `/etc/hosts`; REQ-005 supporta Cato e WireGuard e restituisce PASS solo se almeno una VPN è connessa. Un dnsmasq installato ma inattivo produce FAIL; una VPN installata ma disconnessa produce WARN perché i servizi aziendali potrebbero non essere raggiungibili. Antivirus e controlli analoghi richiedono che i servizi pertinenti siano attivi: la sola installazione non basta. REQ-003 restituisce `PASS` solo quando l'operatività di un metodo è verificata. Se tutti i servizi firewall gestiti risultano esplicitamente inattivi/disabilitati, restituisce `FAIL` anche quando il ruleset kernel non è leggibile; l'incertezza resta nei dettagli diagnostici. Negli altri casi, regole nftables inaccessibili producono `WARN`, senza presumerne l'assenza o l'efficacia.
-
-I precedenti comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta. I vecchi file d'implementazione restano temporaneamente per test e codice interno della migrazione, ma non sono esposti come comandi.
+In sviluppo usa `cargo run -p baradwatchu-agent -- …`. Codici di uscita di `audit`/`check`: 0 tutto conforme (o disabilitato/non applicabile), 4 almeno un `WARN`, 3 almeno un `FAIL`, 1 almeno un `ERROR`, 2 errore d'uso. Ogni audit viene salvato in JSON in `~/.local/state/baradwatchu/audits/reports/` per `status` e lo storico della dashboard; `--log` scrive anche un `.log` in testo semplice con tool, codici di uscita e diagnostica. `list --json` e l'API della dashboard usano nomi di campo camelCase. `custom accept` e `custom remove` funzionano anche se la configurazione della cartella non è valida. I vecchi comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta prima di leggere qualsiasi dato locale.
 
 ## Dashboard e notifiche
 
-`baradwatchu-agent dashboard` avvia la dashboard Angular su un indirizzo loopback con porta temporanea e prova ad aprirla con `xdg-open`. Non avvia un servizio dell'agente né espone un listener alla rete. La dashboard usa le stesse impostazioni locali, lo stesso runner di audit e lo storico dei report della CLI; l'audit funziona anche senza browser. Per lo sviluppo, compilare prima Angular e poi avviare il bridge Rust; Cargo copia il bundle locale accanto all'eseguibile:
+`baradwatchu-agent dashboard` serve la dashboard Angular su una porta effimera di `127.0.0.1` e la apre con `xdg-open` quando c'è una sessione desktop. Non avvia servizi e non ascolta sulla rete; le richieste che modificano dati devono provenire dall'origine della dashboard. Usa le stesse impostazioni, lo stesso runner e lo stesso storico della CLI.
+
+- **Stato postazione:** riepilogo dell'ultimo audit (i contatori filtrano l'elenco), filtri per esito, ricerca, requisiti ordinati per gravità dopo un audit, dettagli per requisito, impostazioni, parametri e dettagli tecnici/integrità compressi. Gli audit storici si aprono dal pannello laterale senza modificare lo stato corrente.
+- **Controlli personalizzati:** una sezione separata elenca i tuoi controlli con stato d'integrità e ultimo esito, e offre **Controlla ora**, **Accetta versione attuale**, **Carica nuovo file**, **Ripristina** l'integrato (per gli override) ed **Elimina**. Le cartelle non valide compaiono con il loro errore e si possono eliminare. **Nuovo controllo** apre il modulo di importazione: ID (viene proposto il primo `CUSTOM-NNN` libero), nome, descrizione, priorità, timeout, file, argomenti e, nelle opzioni avanzate, copia dei metadati o sostituzione di un integrato. Il file mantiene il suo nome nella nuova cartella. La sezione spiega anche la struttura delle cartelle e il formato dell'output.
+
+Build di sviluppo:
 
 ```sh
-cd web
-npm ci
-npm run build
-cd ..
+cd web && npm ci && npm run build && cd ..
 cargo run -p baradwatchu-agent -- dashboard
 ```
 
-`baradwatchu-agent audit --notify` chiede a `notify-send` di mostrare un riepilogo al termine dell'audit, se il programma è installato e la sessione desktop accetta notifiche. Le notifiche sono facoltative e non servono per eseguire l'audit.
+`baradwatchu-agent audit --notify` chiede a `notify-send` di mostrare il riepilogo dell'audit quando è installato ed è disponibile una sessione di notifiche.
 
-La sezione **Controlli personalizzati** della dashboard importa, aggiorna, rimuove e abilita eseguibili locali. Puoi copiare i metadati di un requisito esistente per creare un controllo custom oppure sostituire esplicitamente un controllo builtin; il ripristino riattiva il tool builtin e conserva il controllo importato come controllo custom autonomo. Prima dell'importazione BaradWatchU avvisa che il file è eseguibile e verrà avviato con i privilegi dell'utente corrente. I controlli importati vengono salvati in una cartella con `configuration.json` e il tool in `$XDG_CONFIG_HOME/baradwatchu/custom-tools/CUSTOM-*/` (oppure `~/.config/baradwatchu/custom-tools/CUSTOM-*/`). `arguments` è un array JSON di stringhe passato direttamente all'eseguibile, senza shell. Il tool custom restituisce soltanto il proprio esito, per esempio `{"status":"PASS","summary":"Controllo superato","details":["Metodo: dnsmasq"]}`; non ripete l'ID del requisito, neanche in caso di override. BaradWatchU non aggiunge una shell e non eleva i privilegi.
+Un `PASS` personalizzato è un'affermazione del tool stesso, non una prova di sicurezza indipendente. Il Server non ha ancora un catalogo degli audit né una registrazione autenticata, quindi non verifica questi hash.
 
-L'inventario viene riscoperto all'avvio e a ogni richiesta di elenco, audit o dati dashboard. Per forzare la scansione usa `baradwatchu-agent refresh` oppure **Riscansiona controlli** nella dashboard. Una cartella custom aggiunta manualmente compare dopo il refresh se il nome della cartella corrisponde all'ID `CUSTOM-*` e `configuration.json` e il percorso del tool sono validi.
+## Build e installazione
 
-Ogni risultato mantiene separati conformità e integrità. Al file custom viene assegnato uno SHA-256 atteso all'importazione; le modifiche producono `MISMATCH`, mentre la sostituzione del file dalla dashboard registra un aggiornamento esplicito. Gli hash builtin attesi provengono dal manifest statico incluso nell'agente e convalidato dall'installer. L'hash copre solo il file entrypoint: script o eseguibili di sistema richiamati da esso non rientrano nell'impronta. I tool custom sono eseguiti da uno snapshot privato dei byte importati. Un `PASS` custom è la dichiarazione del tool, non una verifica di sicurezza indipendente. I report includono identità, origine, percorsi, hash attesi/effettivi e dettagli degli override. Il Server non dispone ancora di un catalogo audit compatibile o di una registrazione autenticata, quindi non verifica questi hash in modo indipendente.
-
-## Compilazione e installazione su Arch Linux
-
-L'installer dei sorgenti mantiene il flusso di cache di build, staging, reinstallazione e disinstallazione tramite manifest. Avviarlo come utente normale; chiede `sudo` solo per copiare i file in un prefisso protetto:
+L'installer da sorgente compila come utente normale e usa `sudo` solo per copiare i file in un prefix protetto:
 
 ```sh
-./install.sh --missing-deps
-./install.sh --build-only
-./install.sh
+./install.sh --missing-deps                        # controllo dipendenze in sola lettura
+./install.sh --dry-run                             # mostra il piano
+./install.sh                                       # compila e installa in /usr/local
+./install.sh --build-only --build-dir=DIR          # compila e valida solo la cache
+./install.sh -U                                    # disinstalla
 ```
 
-Servono Rust/Cargo, tool di compilazione C/C++, Python, tar, Node.js 20 (almeno 20.11.1) e npm. Se nvm è già installato, l'installer seleziona la versione indicata da `web/.nvmrc`; non scarica Node automaticamente. Installare `pacman-contrib` per eseguire `REQ-001`. `./install.sh --help` elenca le opzioni per build-only, cache, prefisso e disinstallazione. L'installer non crea un servizio di sistema né un pacchetto per il package manager.
+Ogni esecuzione inizia con un riepilogo delle opzioni effettive. Il controllo delle dipendenze elenca:
+
+- **[REQUIRED] strumenti di build** (Rust/Cargo ≥ 1.80, strumenti C/C++, make, tar, glibc, Node.js 20 ≥ 20.11.1 selezionato tramite `web/.nvmrc` e nvm se disponibile, npm) e **[REQUIRED] strumenti di runtime** usati da agente e controlli (bash, python3, awk, sed, grep, coreutils). Se ne manca uno l'installer si ferma prima di compilare o modificare file e stampa il comando per installarlo.
+- **[optional] strumenti di audit — solo Arch Linux** (`checkupdates`, `systemctl`, `ufw`/`firewalld`/`nftables`, `dnsmasq`, Cato/`wg`, `lsblk`, `findmnt`, `kreadconfig6`, `pgrep`, `chage`, `systemd-analyze`, `notify-send`, `xdg-open`), ciascuno con il controllo che lo usa. Se ne manca uno l'installazione non si blocca; il relativo controllo dà `WARN`. Per le alternative (un firewall, un client VPN) ne basta uno. Sulle altre distribuzioni la sezione viene saltata con una nota, perché i controlli integrati sono pensati per Arch.
+
+**Istanze in esecuzione:** prima di sostituire o rimuovere file, un `baradwatchu-agent` avviato dalla stessa installazione (riconosciuto dal percorso dell'eseguibile, mai dal nome; per esempio una dashboard aperta) riceve SIGTERM e ha fino a `BARADWATCHU_STOP_TIMEOUT` secondi (predefinito 10) per chiudersi. Non viene mai ucciso: se non si chiude, l'installer si ferma senza modificare nulla. Le istanze di altri utenti vengono solo segnalate. `--dry-run` mostra che cosa verrebbe chiuso.
+
+L'installer mantiene cache di build, reinstallazione e disinstallazione basate sul manifest; impostazioni utente, controlli personalizzati e storico non vengono mai toccati. Non crea servizi di sistema né pacchetti del package manager. `./install.sh --help` elenca tutte le opzioni.
 
 ## Verifiche di sviluppo
 
@@ -81,8 +126,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cd web && npm test && npm run build
 ```
 
-I comandi npm usano la versione Node selezionata da `web/.nvmrc`.
+I test puntano ogni directory XDG a cartelle temporanee private e serializzano le modifiche all'ambiente, quindi girano in parallelo e non toccano mai configurazione o storico dello sviluppatore. Gli script dei controlli integrati sono testati con file di fixture e comandi stub (`tests/workstation_criteria.rs`, `tests/req003_firewall.rs`, `tests/req004_005_methods.rs`).
 
-## Limiti attuali della migrazione
+## Limiti attuali
 
-Questo è il primo checkpoint d'implementazione del Client semplificato, non la migrazione conclusa. Il valutatore legacy delle policy, i collector nativi e il registro workstation sono ancora nel codice, ma i relativi vecchi comandi CLI sono stati rimossi. Alcuni dei nove tool Arch sono prudenti e restituiscono `WARN`; la verifica della cifratura dei percorsi e una più ampia validazione su host reale sono incomplete. Non sono presenti pianificazione/daemon, comunicazione con il Server, policy remote, download dinamico dei tool, implementazioni Windows/macOS o correzione automatica.
+L'architettura legacy (valutazione delle policy, collector nativi Fedora/Arch, adapter, registro workstation, `policies/`, `scripts/`, `configs/`) è stata rimossa il 2026-11-07; il sorgente contiene solo catalogo a cartelle, runner, CLI e dashboard. Alcuni controlli sono volutamente prudenti e restituiscono `WARN`; la validazione su host reali diversi dalla postazione Arch dello sviluppatore è ancora da fare. Non ci sono scheduler/daemon, comunicazione con il Server, policy remote, download dinamico dei tool, implementazioni Windows/macOS o remediation automatica.
