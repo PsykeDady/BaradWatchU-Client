@@ -155,3 +155,17 @@ footer { display: flex; align-items: center; justify-content: space-between; gap
   footer { align-items: flex-start; flex-direction: column; gap: 7px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
+.custom-manager { margin: 14px 0 18px; padding: 16px; }
+.custom-manager h3 { margin: 0 0 6px; font-size: 15px; }
+.custom-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
+.custom-form label, .update-tool { display: grid; gap: 5px; color: #647269; font-size: 11px; }
+.custom-form input, .custom-form select, .custom-form textarea, .update-tool input { width: 100%; min-width: 0; padding: 8px; border: 1px solid #dfe5df; border-radius: 6px; color: #24362b; background: white; font: inherit; }
+.custom-form .custom-description { grid-column: 1 / -1; }
+.custom-existing { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; padding: 11px; border: 1px solid #e3e9e3; border-radius: 7px; }
+.custom-existing.is-override { border-color: #d68d3d; background: #fffaf2; }
+.custom-existing > div { display: grid; flex: 1 1 220px; gap: 4px; min-width: 0; }
+.custom-existing span { color: #7d5c2c; font-size: 10px; }
+.integrity-warning { color: #a24632 !important; font-weight: 750; }
+.custom-existing code, .control-origin code { overflow-wrap: anywhere; font: 10px/1.5 ui-monospace, monospace; }
+.update-tool { flex: 0 1 200px; }
+@media (max-width: 700px) { .custom-form { grid-template-columns: 1fr; } .custom-form .custom-description { grid-column: auto; } }

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-008",
+  "name": "Sicurezza delle password",
+  "description": "Verifica scadenza, lunghezza e varietà minima richieste per le password degli account locali.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "3f3f7c538c1698e1d29bff5032cfe2ca8ca3884e1f134087168d761c999b254b",
+  "version": 1,
+  "parameters": {
+    "maxPasswordAgeDays": 60,
+    "minimumLength": 14,
+    "minimumClasses": 4
+  },
+  "overrideBuiltinId": null
+}

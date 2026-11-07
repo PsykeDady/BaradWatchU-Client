@@ -9,12 +9,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const DNS_CHECK: &str = include_str!("../../../tools/linux/dns-filter/check.sh");
-const DNSMASQ: &str = include_str!("../../../tools/linux/dns-filter/dnsmasq.sh");
-const HOSTS: &str = include_str!("../../../tools/linux/dns-filter/hosts.sh");
-const VPN_CHECK: &str = include_str!("../../../tools/linux/vpn/check.sh");
-const CATO: &str = include_str!("../../../tools/linux/vpn/cato.sh");
-const WIREGUARD: &str = include_str!("../../../tools/linux/vpn/wireguard.sh");
+const DNS_CHECK: &str = include_str!("../../../catalog/checks/REQ-004/check.sh");
+const DNSMASQ: &str = include_str!("../../../catalog/checks/REQ-004/dnsmasq.sh");
+const HOSTS: &str = include_str!("../../../catalog/checks/REQ-004/hosts.sh");
+const VPN_CHECK: &str = include_str!("../../../catalog/checks/REQ-005/check.sh");
+const CATO: &str = include_str!("../../../catalog/checks/REQ-005/cato.sh");
+const WIREGUARD: &str = include_str!("../../../catalog/checks/REQ-005/wireguard.sh");
 
 struct Fixture {
     root: PathBuf,

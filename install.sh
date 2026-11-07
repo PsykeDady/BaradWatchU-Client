@@ -186,7 +186,7 @@ authenticate_sudo() {
     done
 }
 fingerprint() {
-    (cd "$ROOT"; local paths=(Cargo.toml install.sh crates scripts catalog tools web); [[ ! -f Cargo.lock ]] || paths+=(Cargo.lock); [[ ! -d .cargo ]] || paths+=(.cargo); find "${paths[@]}" -type d \( -name .git -o -name target -o -name node_modules -o -name dist -o -name .angular -o -name out-tsc \) -prune -o \( -type f -o -type l \) -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+    (cd "$ROOT"; local paths=(Cargo.toml install.sh crates scripts catalog web); [[ ! -f Cargo.lock ]] || paths+=(Cargo.lock); [[ ! -d .cargo ]] || paths+=(.cargo); find "${paths[@]}" -type d \( -name .git -o -name target -o -name node_modules -o -name dist -o -name .angular -o -name out-tsc \) -prune -o \( -type f -o -type l \) -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
 }
 web_ok() {
     local pv av lv
@@ -212,7 +212,7 @@ validate_build() {
     web_ok || fail 'Angular version metadata mismatch; run node web/sync-version.mjs and rebuild'
     [[ $(mvget fingerprint "$m") == "$(fingerprint)" ]] || fail 'build cache is stale for current sources'
     [[ -x "$BUILD_DIR/cargo-target/release/$BIN" && ! -L "$BUILD_DIR/cargo-target/release/$BIN" ]] || fail 'release executable missing or unsafe'
-    validate_requirement_assets "$BUILD_DIR/cargo-target" || fail 'cached requirement catalog or Arch tools are incomplete or unsafe; rebuild'
+    validate_requirement_assets "$BUILD_DIR/cargo-target" || fail 'cached check folders or trusted builtin hashes are incomplete or unsafe; rebuild'
     [[ -s "$BUILD_DIR/angular/browser/index.html" ]] || fail 'Angular assets incomplete'
     [[ -n "$(find "$BUILD_DIR/angular/browser" -type f -name '*.js' -print -quit)" ]] || fail 'Angular JavaScript bundle missing'
     [[ ! -L "$BUILD_DIR/angular" && ! -L "$BUILD_DIR/angular/browser" && -z "$(find "$BUILD_DIR/angular/browser" -type l -print -quit)" ]] || fail 'symlinks are not allowed in built web assets'
@@ -221,26 +221,16 @@ validate_build() {
 }
 validate_requirement_assets() {
     python3 -c '
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
-catalog_path = root / "share/baradwatchu-client/catalog/requirements.json"
-expected = {
-    "REQ-001": "share/baradwatchu-client/tools/linux/updates/check.sh",
-    "REQ-002": "share/baradwatchu-client/tools/linux/antivirus/check.sh",
-    "REQ-003": "share/baradwatchu-client/tools/linux/firewall/check.sh",
-    "REQ-004": "share/baradwatchu-client/tools/linux/dns-filter/check.sh",
-    "REQ-005": "share/baradwatchu-client/tools/linux/vpn/check.sh",
-    "REQ-006": "share/baradwatchu-client/tools/linux/encryption/check.sh",
-    "REQ-007": "share/baradwatchu-client/tools/linux/screen-lock/check.sh",
-    "REQ-008": "share/baradwatchu-client/tools/linux/password-security/check.sh",
-    "REQ-009": "share/baradwatchu-client/tools/linux/boot-security/check.sh",
-}
+base = "share/baradwatchu-client/"
+checks_relative = base + "catalog/checks"
 required_helpers = [
-    "tools/linux/vpn/cato.sh", "tools/linux/vpn/wireguard.sh",
-    "tools/linux/dns-filter/dnsmasq.sh", "tools/linux/dns-filter/hosts.sh",
-    "tools/linux/firewall/ufw.sh", "tools/linux/firewall/firewalld.sh",
-    "tools/linux/firewall/nftables.sh",
-    "tools/linux/encryption/luks.sh", "tools/linux/encryption/ecryptfs.sh",
+    "catalog/checks/REQ-003/ufw.sh", "catalog/checks/REQ-003/firewalld.sh",
+    "catalog/checks/REQ-003/nftables.sh",
+    "catalog/checks/REQ-004/dnsmasq.sh", "catalog/checks/REQ-004/hosts.sh",
+    "catalog/checks/REQ-005/cato.sh", "catalog/checks/REQ-005/wireguard.sh",
+    "catalog/checks/REQ-006/luks.sh", "catalog/checks/REQ-006/ecryptfs.sh",
 ]
 try:
     def safe_file(relative, executable=False):
@@ -249,20 +239,47 @@ try:
             return False
         path = root / relative
         return path.is_file() and (not executable or os.access(path, os.X_OK))
-    if not safe_file("share/baradwatchu-client/catalog/requirements.json"):
-        raise ValueError("catalog missing or symlink")
-    catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
-    items = catalog["requirements"]
-    if catalog["schema_version"] != "baradwatchu.requirements.v1" or len(items) != len(expected):
-        raise ValueError("wrong catalog schema or count")
-    by_id = {item["id"]: item for item in items}
-    if set(by_id) != set(expected):
-        raise ValueError("wrong requirement IDs")
-    for ident, relative in expected.items():
-        if by_id[ident]["tools"] != {"linux": relative}:
-            raise ValueError("unexpected tool path")
+    checks_dir = root / checks_relative
+    if checks_dir.is_symlink() or not checks_dir.is_dir():
+        raise ValueError("check folders missing or symlink")
+    if (root / "share/baradwatchu-client/tools").exists() or (root / "share/baradwatchu-client/tools").is_symlink():
+        raise ValueError("obsolete duplicated tools tree remains in staged runtime")
+    digest_path = root / "share/baradwatchu-client/catalog/builtin-tools.sha256"
+    if not safe_file("share/baradwatchu-client/catalog/builtin-tools.sha256"):
+        raise ValueError("builtin hash manifest missing or symlink")
+    hashes = {}
+    for line in digest_path.read_text(encoding="ascii").splitlines():
+        ident, platform, tool, digest = line.split()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("invalid builtin hash entry")
+        hashes[(ident, platform)] = (tool, digest)
+    discovered = set()
+    for folder in checks_dir.iterdir():
+        if folder.is_symlink() or not folder.is_dir():
+            raise ValueError("unsafe check folder")
+        ident = folder.name
+        config_relative = f"{checks_relative}/{ident}/configuration.json"
+        if not safe_file(config_relative):
+            raise ValueError("check configuration missing or symlink")
+        config = json.loads((root / config_relative).read_text(encoding="utf-8"))
+        if config.get("id") != ident or config.get("schemaVersion") != "baradwatchu.custom-checks.v1":
+            raise ValueError("invalid check configuration identity")
+        tool_path = pathlib.Path(config.get("toolPath", ""))
+        if tool_path.is_absolute() or any(part in ("..", "") for part in tool_path.parts):
+            raise ValueError("unsafe relative tool path")
+        relative = f"{checks_relative}/{ident}/{tool_path}"
         if not safe_file(relative, executable=True):
             raise ValueError("tool missing, non-executable, or symlink")
+        digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+        entry = hashes.get((ident, "linux"))
+        asset_relative = relative.removeprefix(base)
+        if entry != (asset_relative, digest) or config.get("expectedSha256") != digest:
+            raise ValueError("builtin tool hash manifest mismatch")
+        if ident in discovered:
+            raise ValueError("duplicate check ID")
+        discovered.add(ident)
+    if not discovered or {ident for ident, platform in hashes if platform == "linux"} != discovered:
+        raise ValueError("builtin hash manifest does not match discovered folders")
     for relative in required_helpers:
         if not safe_file("share/baradwatchu-client/" + relative, executable=True):
             raise ValueError("method tool missing, non-executable, or symlink")
@@ -404,7 +421,7 @@ install_source() {
         rel=${rels[$i]}; dest="$PREFIX/$rel"; mkdir -p -- "$(dirname -- "$dest")"
         tmp=$(mktemp "${dest}.baradwatchu.XXXXXX")
         if ! install -m 0644 "${files[$i]}" "$tmp"; then unlink -- "$tmp"; fail "could not stage destination file: $dest"; fi
-        if [[ "$rel" == "bin/$BIN" || "$rel" == share/baradwatchu-client/tools/* ]]; then chmod 0755 "$tmp"; fi
+        if [[ "$rel" == "bin/$BIN" || "$rel" == share/baradwatchu-client/catalog/checks/*/*.sh ]]; then chmod 0755 "$tmp"; fi
         if ! mv -f -- "$tmp" "$dest"; then unlink -- "$tmp"; fail "could not replace destination file: $dest"; fi
         unset 'old[$rel]'
     done

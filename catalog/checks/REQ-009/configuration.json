@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-009",
+  "name": "Sicurezza di avvio",
+  "description": "Verifica le protezioni della piattaforma che contribuiscono all’avvio sicuro.",
+  "priority": "OPTIONAL",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "75096519e1a39437e64a1b5654f5cf69f4b2444fa582e7192fbf088e828f244d",
+  "version": 1,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

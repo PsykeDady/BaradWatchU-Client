@@ -29,13 +29,12 @@ fn copy_tree(source: &Path, destination: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=../../scripts/adapters/SEC-011.sh");
     println!("cargo:rerun-if-changed=../../catalog");
-    println!("cargo:rerun-if-changed=../../tools");
+    println!("cargo:rerun-if-changed=../../catalog/checks");
     println!("cargo:rerun-if-changed=../../web/src");
     println!("cargo:rerun-if-changed=../../web/dist/client-status/browser");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let source = manifest.join("../../scripts/adapters/SEC-011.sh");
     let catalog = manifest.join("../../catalog");
-    let tools = manifest.join("../../tools");
     let web = manifest.join("../../web/dist/client-status/browser");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let profile = out
@@ -46,7 +45,25 @@ fn main() {
     for prefix in [profile.parent().unwrap(), profile] {
         let target = prefix.join("share/baradwatchu-client");
         copy_tree(&catalog, &target.join("catalog"));
-        copy_tree(&tools, &target.join("tools"));
+        let obsolete_catalog = target.join("catalog/requirements.json");
+        match fs::symlink_metadata(&obsolete_catalog) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                fs::remove_file(&obsolete_catalog)
+                    .expect("Remove obsolete static requirements catalog");
+            }
+            Ok(_) => panic!("Obsolete requirements catalog path is not a file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("Inspect obsolete requirements catalog: {error}"),
+        }
+        let obsolete_tools = target.join("tools");
+        match fs::symlink_metadata(&obsolete_tools) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(&obsolete_tools).expect("Remove obsolete duplicated tools tree");
+            }
+            Ok(_) => fs::remove_file(&obsolete_tools).expect("Remove obsolete tools artifact"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("Inspect obsolete tools tree: {error}"),
+        }
         if web.is_dir() {
             copy_tree(&web, &target.join("web"));
         }

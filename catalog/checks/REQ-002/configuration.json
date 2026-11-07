@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-002",
+  "name": "Protezione antivirus",
+  "description": "Verifica che la protezione prevista sia disponibile e operativa.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "5eccfb34718ff6adddb58397c6a3eadd66b89ffe012e60646a065bb333b80a16",
+  "version": 1,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

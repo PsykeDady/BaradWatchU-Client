@@ -10,7 +10,7 @@ use std::{
 };
 
 const MAX_HEADERS: usize = 16 * 1024;
-const MAX_BODY: usize = 64 * 1024;
+const MAX_BODY: usize = 2 * 1024 * 1024;
 
 struct Response {
     status: u16,
@@ -164,7 +164,7 @@ fn handle(mut stream: TcpStream, origin: &str, port: u16, root: &Path) -> io::Re
     }
     let is_api = target.starts_with("/api/");
     if is_api
-        && matches!(method, "POST" | "PUT")
+        && matches!(method, "POST" | "PUT" | "DELETE")
         && (request_origin.as_deref() != Some(origin)
             || content_type.as_deref() != Some("application/json"))
     {
@@ -183,12 +183,31 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
     let path = target.split('?').next().unwrap_or("");
     match (method, path) {
         ("GET", "/api/requirements") => api(requirements::dashboard_data_json()),
+        ("POST", "/api/refresh") => api(requirements::dashboard_refresh_json()),
         ("GET", "/api/status") => api(requirements::dashboard_status_json()),
         ("GET", "/api/history") => api(requirements::dashboard_history_json()),
         ("POST", "/api/audit") => api(requirements::dashboard_audit_json()),
         ("PUT", "/api/settings") => api(requirements::update_dashboard_settings(
             std::str::from_utf8(body).unwrap_or(""),
         )),
+        ("POST", "/api/custom-checks") => api(requirements::dashboard_import_custom(
+            std::str::from_utf8(body).unwrap_or(""),
+        )),
+        ("POST", path) if path.starts_with("/api/custom-checks/update/") => {
+            let id = &path["/api/custom-checks/update/".len()..];
+            api(requirements::dashboard_update_custom(
+                id,
+                std::str::from_utf8(body).unwrap_or(""),
+            ))
+        }
+        ("POST", path) if path.starts_with("/api/custom-checks/restore/") => {
+            let id = &path["/api/custom-checks/restore/".len()..];
+            api(requirements::dashboard_restore_builtin(id))
+        }
+        ("DELETE", path) if path.starts_with("/api/custom-checks/") => {
+            let id = &path["/api/custom-checks/".len()..];
+            api(requirements::dashboard_remove_custom(id))
+        }
         ("POST", route) if route.starts_with("/api/check/") => {
             let id = &route["/api/check/".len()..];
             if id.is_empty() || id.contains('/') {
@@ -293,6 +312,18 @@ mod tests {
         assert_eq!(route("DELETE", "/api/audit", &[], &path).status, 405);
         assert_eq!(
             route("POST", "/api/check/REQ-999", b"{}", &path).status,
+            400
+        );
+        assert_eq!(
+            route("POST", "/api/custom-checks", b"{}", &path).status,
+            400
+        );
+        assert_eq!(
+            route("POST", "/api/custom-checks/restore/REQ-001", b"{}", &path).status,
+            400
+        );
+        assert_eq!(
+            route("DELETE", "/api/custom-checks/CUSTOM-UNKNOWN", b"{}", &path).status,
             400
         );
         assert_eq!(

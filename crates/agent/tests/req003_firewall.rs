@@ -9,10 +9,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const CHECK: &str = include_str!("../../../tools/linux/firewall/check.sh");
-const UFW: &str = include_str!("../../../tools/linux/firewall/ufw.sh");
-const FIREWALLD: &str = include_str!("../../../tools/linux/firewall/firewalld.sh");
-const NFTABLES: &str = include_str!("../../../tools/linux/firewall/nftables.sh");
+const CHECK: &str = include_str!("../../../catalog/checks/REQ-003/check.sh");
+const UFW: &str = include_str!("../../../catalog/checks/REQ-003/ufw.sh");
+const FIREWALLD: &str = include_str!("../../../catalog/checks/REQ-003/firewalld.sh");
+const NFTABLES: &str = include_str!("../../../catalog/checks/REQ-003/nftables.sh");
 
 struct Fixture {
     root: PathBuf,
