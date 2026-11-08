@@ -19,6 +19,11 @@ package_artifact_status = "planned-not-built-or-tested"
 [desktop]
 viewer_is_independent = true
 viewer_launcher_status = "deferred"
+tray_binary = "baradwatchu-tray"
+tray_menu_entry = "share/applications/baradwatchu-tray.desktop"
+tray_runs_as = "user-session-process"
+tray_autostart = "per-user, opt-in (XDG autostart / HKCU Run / LaunchAgent)"
+tray_platform_status = { linux = "verified-kde-plasma-6-wayland", windows = "compile-checked-only", macos = "compile-checked-only" }
 
 [windows]
 artifact = "setup.exe"

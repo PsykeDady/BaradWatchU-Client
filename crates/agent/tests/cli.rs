@@ -6,7 +6,8 @@ fn agent() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_baradwatchu-agent"));
     command
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("XDG_STATE_HOME", root.join("state"));
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_CACHE_HOME", root.join("cache"));
     command
 }
 

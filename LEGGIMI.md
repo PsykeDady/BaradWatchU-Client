@@ -73,17 +73,25 @@ baradwatchu-agent audit [--json] [--notify] [--log]
 baradwatchu-agent status [--json]
 baradwatchu-agent custom accept CUSTOM-ID
 baradwatchu-agent custom remove CUSTOM-ID
-baradwatchu-agent dashboard
+baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]
+baradwatchu-agent notifications [--json]
+baradwatchu-agent notifications set enabled|informative on|off
+baradwatchu-agent events --json [--after ID]
+baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]
+baradwatchu-agent consent list [--json]
+baradwatchu-agent consent accept|reject REQUEST-ID
+baradwatchu-tray [--version | --help | autostart enable|disable|status]
 ```
 
-In sviluppo usa `cargo run -p baradwatchu-agent -- …`. Codici di uscita di `audit`/`check`: 0 tutto conforme (o disabilitato/non applicabile), 4 almeno un `WARN`, 3 almeno un `FAIL`, 1 almeno un `ERROR`, 2 errore d'uso. Ogni audit viene salvato in JSON in `~/.local/state/baradwatchu/audits/reports/` per `status` e lo storico della dashboard; `--log` scrive anche un `.log` in testo semplice con tool, codici di uscita e diagnostica. `list --json` e l'API della dashboard usano nomi di campo camelCase. `custom accept` e `custom remove` funzionano anche se la configurazione della cartella non è valida. I vecchi comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta prima di leggere qualsiasi dato locale.
+In sviluppo usa `cargo run -p baradwatchu-agent -- …`. Codici di uscita di `audit`/`check`: 0 tutto conforme (o disabilitato/non applicabile), 4 almeno un `WARN`, 3 almeno un `FAIL`, 1 almeno un `ERROR`, 2 errore d'uso. Ogni audit viene salvato in JSON in `~/.cache/baradwatchu/audit/reports/` per `status` e lo storico della dashboard; `--log` scrive anche un `.log` in testo semplice con tool, codici di uscita e diagnostica in `~/.cache/baradwatchu/audit/`. La cartella si può cancellare: si perdono solo lo storico e l'ultimo risultato. Lo storico in `~/.local/state/baradwatchu/audits/` viene spostato lì automaticamente una volta. `list --json` e l'API della dashboard usano nomi di campo camelCase. `custom accept` e `custom remove` funzionano anche se la configurazione della cartella non è valida. I vecchi comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta prima di leggere qualsiasi dato locale. Ogni audit completato (da CLI, dashboard o tray) aggiunge anche un evento a `~/.local/state/baradwatchu/events.jsonl` (si tengono gli ultimi 200); `events --json` è lo stato compatto che la tray interroga e `notifications` mostra o modifica le preferenze di notifica (`~/.config/baradwatchu/notifications.json`).
 
 ## Dashboard e notifiche
 
-`baradwatchu-agent dashboard` serve la dashboard Angular su una porta effimera di `127.0.0.1` e la apre con `xdg-open` quando c'è una sessione desktop. Non avvia servizi e non ascolta sulla rete; le richieste che modificano dati devono provenire dall'origine della dashboard. Usa le stesse impostazioni, lo stesso runner e lo stesso storico della CLI.
+`baradwatchu-agent dashboard` serve la dashboard Angular su una porta effimera di `127.0.0.1` e la apre nel browser quando c'è una sessione desktop. Non avvia servizi e non ascolta sulla rete. Il loopback non è considerato un confine di sicurezza: ogni chiamata `/api/` richiede un token casuale di sessione (altrimenti `401`), le richieste che modificano dati devono anche provenire dall'origine della dashboard con corpo JSON, e l'intestazione `Host` deve corrispondere. Il browser riceve il token tramite un file di avvio privato (`$XDG_RUNTIME_DIR/baradwatchu/open-dashboard.html`, permessi 0600), quindi il token non compare mai sulla riga di comando di un processo; la scheda lo conserva in `sessionStorage` e lo toglie dalla barra degli indirizzi. Una seconda chiamata a `dashboard` (per esempio dalla tray) riusa l'istanza attiva registrata in `$XDG_RUNTIME_DIR/baradwatchu/dashboard.json` invece di avviarne un'altra. Usa le stesse impostazioni, lo stesso runner e lo stesso storico della CLI.
 
 - **Stato postazione:** riepilogo dell'ultimo audit (i contatori filtrano l'elenco), filtri per esito, ricerca, requisiti ordinati per gravità dopo un audit, dettagli per requisito, impostazioni, parametri e dettagli tecnici/integrità compressi. Gli audit storici si aprono dal pannello laterale senza modificare lo stato corrente.
 - **Controlli personalizzati:** una sezione separata elenca i tuoi controlli con stato d'integrità e ultimo esito, e offre **Controlla ora**, **Accetta versione attuale**, **Carica nuovo file**, **Ripristina** l'integrato (per gli override) ed **Elimina**. Le cartelle non valide compaiono con il loro errore e si possono eliminare. **Nuovo controllo** apre il modulo di importazione: ID (viene proposto il primo `CUSTOM-NNN` libero), nome, descrizione, priorità, timeout, file, argomenti e, nelle opzioni avanzate, copia dei metadati o sostituzione di un integrato. Il file mantiene il suo nome nella nuova cartella. La sezione spiega anche la struttura delle cartelle e il formato dell'output.
+- **Notifiche:** preferenze di notifica (notifiche desktop sì/no, informative sì/no), stato della tray, storico locale degli eventi e richieste di consenso. **Simula una richiesta** crea una richiesta di prova locale da 60 secondi; la dashboard non decide mai una richiesta. `#/history` apre la pagina di stato sullo storico degli audit.
 
 Build di sviluppo:
 
@@ -92,9 +100,23 @@ cd web && npm ci && npm run build && cd ..
 cargo run -p baradwatchu-agent -- dashboard
 ```
 
-`baradwatchu-agent audit --notify` chiede a `notify-send` di mostrare il riepilogo dell'audit quando è installato ed è disponibile una sessione di notifiche.
+Le notifiche native sono inviate dalla tray (vedi sotto), anche quando nessun browser è aperto. Senza tray, `baradwatchu-agent audit --notify` chiede ancora a `notify-send` di mostrare il riepilogo dell'audit; con la tray attiva duplica la notifica della tray. Gli audit dalla dashboard non chiamano più `notify-send`.
 
 Un `PASS` personalizzato è un'affermazione del tool stesso, non una prova di sicurezza indipendente. Il Server non ha ancora un catalogo degli audit né una registrazione autenticata, quindi non verifica questi hash.
+
+## Tray
+
+`baradwatchu-tray` è un piccolo processo separato per la sessione desktop dell'utente. Non esegue audit da solo: avvia l'agente installato accanto a sé con un insieme fisso di sottocomandi (`events --json`, `audit --json`, `dashboard --open …`, `consent accept|reject ID --via window`), senza shell e con timeout. L'agente funziona anche senza tray, e chiudere la tray non arresta l'agente né una dashboard aperta. Gira una sola tray per utente (file di lock `$XDG_RUNTIME_DIR/baradwatchu/tray.lock`); un secondo avvio segnala che è già attiva.
+
+- **Menu:** riga di stato e ultimo audit, Apri dashboard, Esegui audit (disattivato durante l'esecuzione), Visualizza ultimo risultato, Storico audit, Richieste in sospeso, Notifiche recenti, Avvia al login, Informazioni, Chiudi tray.
+- **Icona:** verde operativo, blu ardesia nessun audit ancora, ambra `FAIL`/`WARN`, rossa `ERROR` o blocco di integrità, blu richiesta in attesa di decisione, grigia agente non raggiungibile. Il tooltip riporta separatamente conteggi, blocchi di integrità e controlli personalizzati e precisa che l'esito dei controlli locali non è una certificazione di sicurezza.
+- **Notifiche:** una per audit, classificata in base all'aspetto più grave (problema di integrità, errore di esecuzione, anomalie, completato). Ogni evento compare una sola volta; al massimo tre per interrogazione, le altre riassunte; un insieme di anomalie identico all'audit precedente conta come informativo. L'agente non raggiungibile viene notificato una volta, dopo due interrogazioni fallite (ogni 5 s), e il ripristino una volta. Preferenze: tutte le notifiche disattivate, oppure solo le informative; le richieste di consenso non si possono silenziare.
+- **Richieste di consenso (solo predisposizione):** l'agente modella una richiesta del report della postazione con `requestId`, ID del server, nome e ID dell'account, dispositivo dichiarato, operazione (`AUDIT_REPORT`), scadenza e stato. In questa milestone le richieste si possono solo simulare in locale (`consent simulate`, pulsante della dashboard); non ci sono richieste remote, autenticazione del Server né contratti crittografici. La tray apre una finestra dedicata (zenity, oppure kdialog in alternativa su Linux): **Accetta**, **Rifiuta**, **Decidi più tardi**. Accetta non è mai il pulsante predefinito. Solo un Accetta esplicito autorizza, e solo quella richiesta; rifiuto, chiusura, «decidi più tardi», timeout e una notifica soltanto mostrata non autorizzano nulla, e una richiesta scaduta non si può accettare. Si può decidere anche con `baradwatchu-agent consent accept|reject ID`.
+- **Avvio al login:** `baradwatchu-tray autostart enable|disable|status` oppure la casella nel menu. Su Linux scrive `~/.config/autostart/baradwatchu-tray.desktop` (XDG, usato da KDE Plasma); su Windows usa la chiave per utente `HKCU\…\Run`; su macOS un LaunchAgent per utente limitato alla sessione Aqua. Nessun privilegio di amministratore e nessun servizio di sistema.
+
+Librerie: [`tray-icon`](https://github.com/tauri-apps/tray-icon) 0.26 (su Linux il backend `ksni` StatusNotifierItem via D-Bus, quindi non servono librerie GTK/AppIndicator), [`notify-rust`](https://github.com/hoodie/notify-rust) 4.18 (D-Bus freedesktop, toast di Windows, Centro notifiche di macOS) e, solo su Windows/macOS, `tao` 0.37 (ciclo di eventi) e `rfd` 0.18 (finestre di messaggio). Il framework Tauri completo e le WebView non sono usati; la dashboard resta nel browser.
+
+**Stato delle piattaforme.** Linux (Arch, KDE Plasma 6 su Wayland) è compilato e verificato da cima a fondo. Il codice Windows e macOS supera il controllo dei tipi e Clippy (`cargo check`/`cargo clippy --target x86_64-pc-windows-msvc|x86_64-pc-windows-gnu|aarch64-apple-darwin|x86_64-apple-darwin`; per macOS la parte Objective-C di `mac-notification-sys` richiede l'SDK Apple e non è stata compilata). Non è mai stato eseguito, quindi quelle piattaforme **non sono ancora supportate**. I controlli integrati dell'agente sono comunque solo Linux. Su Windows/macOS la finestra di consenso non si chiude da sola alla scadenza (un Accetta tardivo viene rifiutato dall'agente).
 
 ## Build e installazione
 
@@ -105,15 +127,20 @@ L'installer da sorgente compila come utente normale e usa `sudo` solo per copiar
 ./install.sh --dry-run                             # mostra il piano
 ./install.sh                                       # compila e installa in /usr/local
 ./install.sh --build-only --build-dir=DIR          # compila e valida solo la cache
+./install.sh --tray-autostart                      # installa e avvia la tray al login
+./install.sh --without-tray                        # solo agente e dashboard
 ./install.sh -U                                    # disinstalla
 ```
 
 Ogni esecuzione inizia con un riepilogo delle opzioni effettive. Il controllo delle dipendenze elenca:
 
-- **[REQUIRED] strumenti di build** (Rust/Cargo ≥ 1.80, strumenti C/C++, make, tar, glibc, Node.js 20 ≥ 20.11.1 selezionato tramite `web/.nvmrc` e nvm se disponibile, npm) e **[REQUIRED] strumenti di runtime** usati da agente e controlli (bash, python3, awk, sed, grep, coreutils). Se ne manca uno l'installer si ferma prima di compilare o modificare file e stampa il comando per installarlo.
+- **[REQUIRED] strumenti di build** (Rust/Cargo ≥ 1.92 con la tray, ≥ 1.80 con `--without-tray`; strumenti C/C++, make, tar, glibc, Node.js 20 ≥ 20.11.1 selezionato tramite `web/.nvmrc` e nvm se disponibile, npm) e **[REQUIRED] strumenti di runtime** usati da agente e controlli (bash, python3, awk, sed, grep, coreutils). Se ne manca uno l'installer si ferma prima di compilare o modificare file e stampa il comando per installarlo.
 - **[optional] strumenti di audit — solo Arch Linux** (`checkupdates`, `systemctl`, `ufw`/`firewalld`/`nftables`, `dnsmasq`, Cato/`wg`, `lsblk`, `findmnt`, `kreadconfig6`, `pgrep`, `chage`, `systemd-analyze`, `notify-send`, `xdg-open`), ciascuno con il controllo che lo usa. Se ne manca uno l'installazione non si blocca; il relativo controllo dà `WARN`. Per le alternative (un firewall, un client VPN) ne basta uno. Sulle altre distribuzioni la sezione viene saltata con una nota, perché i controlli integrati sono pensati per Arch.
+- **[optional] tray:** `zenity` o `kdialog` per la finestra di consenso (senza, la tray chiede di decidere con la CLI). La tray richiede anche una sessione desktop con D-Bus e un host StatusNotifierItem (KDE Plasma; GNOME richiede l'estensione AppIndicator).
 
-**Istanze in esecuzione:** prima di sostituire o rimuovere file, un `baradwatchu-agent` avviato dalla stessa installazione (riconosciuto dal percorso dell'eseguibile, mai dal nome; per esempio una dashboard aperta) riceve SIGTERM e ha fino a `BARADWATCHU_STOP_TIMEOUT` secondi (predefinito 10) per chiudersi. Non viene mai ucciso: se non si chiude, l'installer si ferma senza modificare nulla. Le istanze di altri utenti vengono solo segnalate. `--dry-run` mostra che cosa verrebbe chiuso.
+Con la tray (predefinito) l'installer aggiunge al manifest `bin/baradwatchu-tray` e la voce di menu `share/applications/baradwatchu-tray.desktop`. `--tray-autostart` attiva l'avvio al login per l'utente che lancia l'installer dopo aver installato i file (come quell'utente, mai come root). La disinstallazione rimuove la voce di avvio automatico di quell'utente se punta a questa installazione.
+
+**Istanze in esecuzione:** prima di sostituire o rimuovere file, un `baradwatchu-agent` o `baradwatchu-tray` avviato dalla stessa installazione (riconosciuto dal percorso dell'eseguibile, mai dal nome; per esempio una dashboard aperta) riceve SIGTERM e ha fino a `BARADWATCHU_STOP_TIMEOUT` secondi (predefinito 10) per chiudersi. Non viene mai ucciso: se non si chiude, l'installer si ferma senza modificare nulla. Le istanze di altri utenti vengono solo segnalate. `--dry-run` mostra che cosa verrebbe chiuso.
 
 L'installer mantiene cache di build, reinstallazione e disinstallazione basate sul manifest; impostazioni utente, controlli personalizzati e storico non vengono mai toccati. Non crea servizi di sistema né pacchetti del package manager. `./install.sh --help` elenca tutte le opzioni.
 
@@ -126,8 +153,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cd web && npm test && npm run build
 ```
 
-I test puntano ogni directory XDG a cartelle temporanee private e serializzano le modifiche all'ambiente, quindi girano in parallelo e non toccano mai configurazione o storico dello sviluppatore. Gli script dei controlli integrati sono testati con file di fixture e comandi stub (`tests/workstation_criteria.rs`, `tests/req003_firewall.rs`, `tests/req004_005_methods.rs`).
+I test puntano ogni directory XDG a cartelle temporanee private e serializzano le modifiche all'ambiente, quindi girano in parallelo e non toccano mai configurazione o storico dello sviluppatore. Gli script dei controlli integrati sono testati con file di fixture e comandi stub (`tests/workstation_criteria.rs`, `tests/req003_firewall.rs`, `tests/req004_005_methods.rs`). La logica della tray (stato dell'icona, politica delle notifiche, contratto dello snapshot) è testata senza GUI in `crates/tray/src/model.rs`.
 
 ## Limiti attuali
 
-L'architettura legacy (valutazione delle policy, collector nativi Fedora/Arch, adapter, registro workstation, `policies/`, `scripts/`, `configs/`) è stata rimossa il 2026-11-07; il sorgente contiene solo catalogo a cartelle, runner, CLI e dashboard. Alcuni controlli sono volutamente prudenti e restituiscono `WARN`; la validazione su host reali diversi dalla postazione Arch dello sviluppatore è ancora da fare. Non ci sono scheduler/daemon, comunicazione con il Server, policy remote, download dinamico dei tool, implementazioni Windows/macOS o remediation automatica.
+L'architettura legacy (valutazione delle policy, collector nativi Fedora/Arch, adapter, registro workstation, `policies/`, `scripts/`, `configs/`) è stata rimossa il 2026-11-07; il sorgente contiene solo catalogo a cartelle, runner, CLI e dashboard. Alcuni controlli sono volutamente prudenti e restituiscono `WARN`; la validazione su host reali diversi dalla postazione Arch dello sviluppatore è ancora da fare. Non ci sono scheduler/daemon, comunicazione con il Server, policy remote o richieste di consenso remote, download dinamico dei tool, implementazioni di audit per Windows/macOS o remediation automatica. Le decisioni di consenso sono legate all'utente locale: qualsiasi processo dello stesso utente può chiamare `consent accept`, così come può leggere i file di quell'utente.

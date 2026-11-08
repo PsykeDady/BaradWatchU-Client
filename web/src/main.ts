@@ -6,7 +6,7 @@ import { APP_VERSION } from './app-version';
 type Priority = 'HIGHEST' | 'HIGH' | 'MEDIUM' | 'LOW' | 'OPTIONAL';
 type ResultStatus = 'PASS' | 'FAIL' | 'WARN' | 'ERROR' | 'DISABLED' | 'NOT_APPLICABLE';
 type Integrity = 'VERIFIED' | 'MISMATCH' | 'UNKNOWN';
-type View = 'overview' | 'custom';
+type View = 'overview' | 'custom' | 'notifications';
 type StatusFilter = 'ALL' | 'FAIL' | 'WARN' | 'ERROR' | 'PASS' | 'PENDING';
 interface Provenance { toolId: string; toolVersion?: number; origin: 'BUILTIN' | 'CUSTOM'; toolPath?: string; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; integrityScope: string; isOverride: boolean; overrideBuiltinId?: string; builtinToolPath?: string; builtinExpectedSha256?: string; }
 interface Requirement { id: string; name: string; description: string; enabled: boolean; priority: Priority; parameters: Record<string, unknown>; arguments: string[]; timeoutSeconds: number; tools: Record<string, string>; configurationError?: string; origin: 'BUILTIN' | 'CUSTOM'; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; replacesBuiltin?: string; customToolId?: string; customToolVersion?: number; }
@@ -15,6 +15,24 @@ interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFil
 interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; }
 interface HistoryEntry { completedAtUnixMs: number; overallStatus: ResultStatus; pass: number; fail: number; warn: number; error: number; other: number; }
 interface SummaryCounts { pass: number; fail: number; warn: number; error: number; other: number; }
+type EventSeverity = 'INFO' | 'WARNING' | 'CRITICAL' | 'ACTION';
+type ConsentState = 'PENDING' | 'ACCEPTED' | 'REJECTED' | 'EXPIRED';
+interface AppEvent { id: number; atUnixMs: number; kind: string; severity: EventSeverity; title: string; body: string; repeated: boolean; }
+interface NotificationPreferences { schemaVersion?: string; enabled: boolean; informative: boolean; }
+interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
+interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
+
+const TOKEN_KEY = 'bwu-session-token';
+/** The agent opens the dashboard with ?k=<token>; keep it for this tab only and drop it from the address bar. */
+function sessionToken(): string {
+  const fromUrl = new URLSearchParams(location.search).get('k');
+  if (fromUrl && /^[0-9a-f]{64}$/.test(fromUrl)) {
+    try { sessionStorage.setItem(TOKEN_KEY, fromUrl); } catch { /* storage unavailable: keep in memory */ }
+    window.history.replaceState(null, '', location.pathname + location.hash);
+    return fromUrl;
+  }
+  try { return sessionStorage.getItem(TOKEN_KEY) ?? ''; } catch { return ''; }
+}
 
 const PRIORITIES: Priority[] = ['HIGHEST', 'HIGH', 'MEDIUM', 'LOW', 'OPTIONAL'];
 const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 3, PASS: 4, NOT_APPLICABLE: 5, DISABLED: 6 };
@@ -28,6 +46,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
         <nav class="tabs" role="tablist" aria-label="Sezioni">
           <button type="button" role="tab" class="tab" [class.active]="view === 'overview'" [attr.aria-selected]="view === 'overview'" (click)="go('overview')">Stato postazione</button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'custom'" [attr.aria-selected]="view === 'custom'" (click)="go('custom')">Controlli personalizzati<span class="tab-count" *ngIf="customs.length">{{ customs.length }}</span><span class="tab-alert" *ngIf="customProblems > 0" [attr.aria-label]="customProblems + ' da sistemare'">!</span></button>
+          <button type="button" role="tab" class="tab" [class.active]="view === 'notifications'" [attr.aria-selected]="view === 'notifications'" (click)="go('notifications')">Notifiche<span class="tab-alert" *ngIf="pendingConsents > 0" [attr.aria-label]="pendingConsents + ' richieste in sospeso'">{{ pendingConsents }}</span></button>
         </nav>
         <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? 'Audit in corso…' : 'Esegui audit' }}</button>
       </header>
@@ -230,6 +249,46 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
         </div>
       </ng-container>
 
+      <!-- ================================== NOTIFICHE ================================== -->
+      <ng-container *ngIf="!loading && view === 'notifications'">
+        <section class="intro">
+          <div><p class="eyebrow">TRAY E NOTIFICHE DESKTOP</p><h1>Notifiche</h1><p class="intro-copy">Le notifiche native sono inviate da BaradWatchU Tray, anche a dashboard chiusa. L’agente registra gli eventi qui sotto.</p></div>
+          <div class="intro-actions"><button class="button secondary" type="button" (click)="loadNotifications()" [disabled]="saving">Aggiorna</button></div>
+        </section>
+        <div class="custom-layout">
+          <section aria-labelledby="events-title">
+            <div class="form-panel">
+              <div class="form-head"><h2>Preferenze</h2><span class="tag" [class.muted]="notifications?.trayRunning !== true">{{ trayText }}</span></div>
+              <div class="settings-row" *ngIf="notifications as data">
+                <label class="toggle"><input type="checkbox" [checked]="data.preferences.enabled" [disabled]="saving" (change)="setPreference('enabled', $event)"><span>Notifiche desktop su audit, errori e integrità</span></label>
+                <label class="toggle"><input type="checkbox" [checked]="data.preferences.informative" [disabled]="saving || !data.preferences.enabled" (change)="setPreference('informative', $event)"><span>Anche quelle informative (audit senza anomalie, anomalie ripetute, esiti del consenso)</span></label>
+              </div>
+              <p class="hint">Le richieste di consenso aprono sempre la finestra dedicata della tray e non si possono silenziare.</p>
+            </div>
+            <div class="section-heading"><div><p class="eyebrow">STORICO LOCALE</p><h2 id="events-title">Eventi recenti</h2></div><span class="section-count">{{ notifications?.events?.length ?? 0 }}</span></div>
+            <div *ngIf="!notifications?.events?.length" class="empty-card">Nessun evento: gli audit completati e le richieste di consenso appariranno qui.</div>
+            <article class="custom-card" *ngFor="let event of notifications?.events ?? []" [attr.data-severity]="event.severity">
+              <div class="custom-head"><div><div class="tags"><span class="tag" [class.danger]="event.severity === 'CRITICAL'" [class.override]="event.severity === 'ACTION'">{{ severityText(event.severity) }}</span><span class="tag muted" *ngIf="event.repeated">Ripetuto</span></div><h3>{{ event.title }}</h3></div><span class="history-time">{{ formatDate(event.atUnixMs) }}</span></div>
+              <p class="result-summary">{{ event.body }}</p>
+            </article>
+          </section>
+          <aside class="guide" aria-labelledby="consent-title">
+            <h2 id="consent-title">Richieste di consenso</h2>
+            <p class="hint">In futuro il Server potrà chiedere il report di questa postazione. Ogni richiesta vale una sola volta: solo «Accetta» nella finestra della tray autorizza; rifiuto, chiusura o scadenza non autorizzano nulla. La dashboard non decide.</p>
+            <button class="button secondary small" type="button" (click)="simulateConsent()" [disabled]="saving">Simula una richiesta (60 s)</button>
+            <p *ngIf="!notifications?.consents?.length" class="history-empty">Nessuna richiesta.</p>
+            <dl class="facts compact" *ngFor="let consent of notifications?.consents ?? []">
+              <dt>Stato</dt><dd><strong>{{ consentText(consent.state) }}</strong><span *ngIf="consent.state === 'PENDING'"> · scade tra {{ consent.remainingSeconds }} s</span><span *ngIf="consent.source === 'LOCAL_SIMULATION'"> · simulata</span></dd>
+              <dt>Server</dt><dd>{{ consent.serverId }}</dd>
+              <dt>Account</dt><dd>{{ consent.accountName }} ({{ consent.accountId }})</dd>
+              <dt>Dispositivo</dt><dd>{{ consent.declaredDevice }}</dd>
+              <dt>Esito</dt><dd>{{ consent.effect }}</dd>
+              <dt>ID</dt><dd><code>{{ consent.requestId }}</code></dd>
+            </dl>
+          </aside>
+        </div>
+      </ng-container>
+
       <footer><span>BaradWatchU Client {{ version }}</span><span>I dati di audit restano sul dispositivo.</span><button class="text-button" type="button" (click)="refresh()" [disabled]="busy || saving">Aggiorna dati</button></footer>
     </main>
   `,
@@ -265,12 +324,16 @@ class AppComponent implements OnInit {
   showForm = false;
   form = this.emptyForm();
   importFile: File | null = null;
+  notifications: NotificationsView | null = null;
+  private readonly token = sessionToken();
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
 
   get viewingHistory(): boolean { return this.selectedHistoryStamp !== null; }
   get visibleReport(): AuditReport | null { return this.viewingHistory ? this.historicalReport : this.currentReport; }
   get counts(): SummaryCounts { return this.visibleReport ? this.countsFor(this.visibleReport) : { pass: 0, fail: 0, warn: 0, error: 0, other: 0 }; }
   get customs(): Requirement[] { return this.requirements.filter(item => item.origin === 'CUSTOM'); }
+  get pendingConsents(): number { return this.notifications?.consents.filter(item => item.state === 'PENDING').length ?? 0; }
+  get trayText(): string { const running = this.notifications?.trayRunning; return running === true ? 'Tray attiva' : running === false ? 'Tray non attiva' : 'Stato tray non rilevabile'; }
   get customProblems(): number { return this.customs.filter(item => item.configurationError || item.integrityStatus !== 'VERIFIED').length; }
   get overridableBuiltins(): Requirement[] { return this.requirements.filter(item => item.origin === 'BUILTIN'); }
   get canImport(): boolean { return !!this.importFile && this.validId(this.form.id) && this.form.name.trim().length > 0; }
@@ -284,13 +347,13 @@ class AppComponent implements OnInit {
     }).sort((a, b) => this.visibleReport ? (SEVERITY[this.statusOf(a)] ?? 9) - (SEVERITY[this.statusOf(b)] ?? 9) : 0);
   }
 
-  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh(); }
-  @HostListener('window:hashchange') onHashChange(): void { this.view = this.viewFromHash(); }
+  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); }
+  @HostListener('window:hashchange') onHashChange(): void { this.view = this.viewFromHash(); this.scrollToHistory(); }
 
   go(view: View, event?: Event): void {
     event?.preventDefault();
     this.view = view;
-    const hash = view === 'custom' ? '#/custom' : '#/';
+    const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : '#/';
     if (location.hash !== hash) window.history.replaceState(null, '', hash);
     window.scrollTo({ top: 0 });
   }
@@ -298,10 +361,12 @@ class AppComponent implements OnInit {
   async refresh(): Promise<void> {
     this.loading = true;
     this.error = '';
+    if (!this.token) { this.error = 'Sessione mancante: apri la dashboard dalla tray oppure con «baradwatchu-agent dashboard».'; this.loading = false; return; }
     const outcomes = await Promise.allSettled([
       this.request<DashboardData>('/api/requirements'),
       this.request<AuditReport | null>('/api/status'),
-      this.loadHistory()
+      this.loadHistory(),
+      this.loadNotifications()
     ]);
     const errors: string[] = [];
     if (outcomes[0].status === 'fulfilled') this.setData(outcomes[0].value);
@@ -309,6 +374,7 @@ class AppComponent implements OnInit {
     if (outcomes[1].status === 'fulfilled') this.currentReport = outcomes[1].value;
     else errors.push(`Ultimo risultato: ${this.errorText(outcomes[1].reason)}`);
     if (outcomes[2].status === 'rejected') errors.push(`Storico: ${this.errorText(outcomes[2].reason)}`);
+    if (outcomes[3].status === 'rejected') errors.push(`Notifiche: ${this.errorText(outcomes[3].reason)}`);
     this.error = errors.join(' · ');
     this.loading = false;
   }
@@ -452,6 +518,28 @@ class AppComponent implements OnInit {
     await this.mutate(() => this.request<DashboardData>(`/api/custom-checks/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: '{}' }), () => `Controllo ${id} eliminato.`);
   }
 
+  async loadNotifications(): Promise<void> { this.notifications = await this.request<NotificationsView>('/api/notifications'); }
+  async setPreference(key: 'enabled' | 'informative', event: Event): Promise<void> {
+    if (!this.notifications) return;
+    const preferences = { ...this.notifications.preferences, [key]: (event.target as HTMLInputElement).checked };
+    this.saving = true; this.error = '';
+    try {
+      this.notifications = await this.request<NotificationsView>('/api/notifications', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(preferences) });
+      this.flash('Preferenze di notifica salvate.');
+    } catch (error: unknown) { this.error = this.errorText(error); await this.loadNotifications().catch(() => undefined); }
+    finally { this.saving = false; }
+  }
+  async simulateConsent(): Promise<void> {
+    this.saving = true; this.error = '';
+    try {
+      this.notifications = await this.post<NotificationsView>('/api/consent/simulate', { ttlSeconds: 60 });
+      this.flash(this.notifications.trayRunning === true ? 'Richiesta simulata creata: la tray aprirà la finestra di consenso.' : 'Richiesta simulata creata. Avvia BaradWatchU Tray per decidere, oppure usa baradwatchu-agent consent accept|reject ID.');
+    } catch (error: unknown) { this.error = this.errorText(error); }
+    finally { this.saving = false; }
+  }
+  severityText(severity: EventSeverity): string { return { INFO: 'Informativa', WARNING: 'Attenzione', CRITICAL: 'Critica', ACTION: 'Richiede decisione' }[severity]; }
+  consentText(state: ConsentState): string { return { PENDING: 'In attesa', ACCEPTED: 'Accettata', REJECTED: 'Rifiutata', EXPIRED: 'Scaduta (non autorizzata)' }[state]; }
+
   formatDate(timestamp: number): string {
     if (!Number.isFinite(timestamp)) return 'Data non disponibile';
     return new Intl.DateTimeFormat('it-IT', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(timestamp));
@@ -462,7 +550,10 @@ class AppComponent implements OnInit {
     const used = this.customs.map(item => /^CUSTOM-(\d+)$/.exec(item.customToolId ?? item.id)?.[1]).filter((n): n is string => !!n).map(Number);
     return `CUSTOM-${String((used.length ? Math.max(...used) : 0) + 1).padStart(3, '0')}`;
   }
-  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : 'overview'; }
+  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : location.hash.startsWith('#/notifiche') ? 'notifications' : 'overview'; }
+  private scrollToHistory(): void {
+    if (location.hash.startsWith('#/history')) setTimeout(() => document.getElementById('history-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
+  }
   private flash(message: string): void {
     this.message = message;
     clearTimeout(this.messageTimer);
@@ -516,7 +607,10 @@ class AppComponent implements OnInit {
     return this.request<T>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   }
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(path, { ...options, cache: 'no-store' });
+    const headers = new Headers(options?.headers);
+    headers.set('X-BaradWatchU-Token', this.token);
+    const response = await fetch(path, { ...options, headers, cache: 'no-store' });
+    if (response.status === 401) throw new Error('Sessione non valida o scaduta: riapri la dashboard dalla tray oppure con «baradwatchu-agent dashboard».');
     const body: unknown = await response.json();
     if (!response.ok) {
       const detail = typeof body === 'object' && body !== null && 'error' in body ? String(body.error) : `Richiesta non riuscita (${response.status})`;

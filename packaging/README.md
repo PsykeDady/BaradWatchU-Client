@@ -10,12 +10,14 @@ Status: package channels remain planning only. The source installer was exercise
 
 | Channel | Planned payload / ownership | Configuration and data | Service / privileges |
 |---|---|---|---|
-| Source | `bin/baradwatchu-agent`, `share/baradwatchu-client/web`; source manifest owns only unchanged listed files | Preserve `/etc/baradwatchu/client`, `/var/lib/baradwatchu/client` and custom-check data; source installer creates none | No service/helper yet. User-local install is development-only and offers no system auditing |
+| Source | `bin/baradwatchu-agent`, `bin/baradwatchu-tray` (unless `--without-tray`), `share/applications/baradwatchu-tray.desktop`, `share/baradwatchu-client/web`; source manifest owns only unchanged listed files | Preserve `/etc/baradwatchu/client`, `/var/lib/baradwatchu/client` and custom-check data; source installer creates none | No service/helper yet. User-local install is development-only and offers no system auditing |
 | Arch `pacman` | `/usr/bin/baradwatchu-agent`, `/usr/share/baradwatchu-client/web`; PKGBUILD/pacman owns files | `/etc/baradwatchu/client`, `/var/lib/baradwatchu/client`; preserve enrollment identity and audit data | Future systemd system service, installed/enabled only by explicit package/operator policy; no privileged helper in this checkpoint |
 | Debian/Ubuntu `.deb` | `/usr/bin`, `/usr/share/baradwatchu-client`; dpkg owns files | `/etc` conffiles and `/var/lib`; uninstall preserves device identity and audit history | Future unit; no implicit start/restart from package scripts |
 | Fedora `.rpm` | `/usr/bin`, `/usr/share/baradwatchu-client`; rpm owns files | `/etc` and `/var/lib`; preserve data on update/erase | Future unit; service state changes require explicit policy |
 | Windows `setup.exe` | Planned WiX Burn bundle around a signed client package; Windows Installer owns binaries | `%ProgramData%\BaradWatchU\Client` for machine config/state; preserve on uninstall unless a reviewed decommission flow explicitly removes identity | Administrator approval to register a Windows Service; Authenticode signing required; no arbitrary privileged helper |
 | macOS `.dmg` | Planned DMG containing a signed/notarized installer package and local viewer | `/Library/Application Support/BaradWatchU/Client`; preserve identity and audit data on uninstall | Admin-authorized `launchd` LaunchDaemon; Developer ID signing and notarization required; no helper until separately reviewed |
+
+The tray companion is a per-user desktop-session process, never a system service: packages may ship its binary and menu entry, but start at login stays a per-user choice (XDG autostart, `HKCU\…\Run`, per-user LaunchAgent). Its Windows/macOS code is compile-checked only.
 
 Package-manager installs must refuse source-installer overwrite/uninstall. Source uninstall uses its own hash manifest and leaves config/data. Windows/macOS installers must remove only package-owned files and preserve machine identity by default.
 

@@ -35,7 +35,14 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
         }
         _ => {}
     }
-    crate::requirements::run(args)
+    let routed = match args.first().and_then(|arg| arg.to_str()) {
+        Some("consent") => Some(crate::consent::run(&args[1..])),
+        Some("notifications") => Some(crate::events::run_notifications(&args[1..])),
+        Some("events") => Some(crate::events::run_events(&args[1..])),
+        _ => None,
+    };
+    routed
+        .unwrap_or_else(|| crate::requirements::run(args))
         .map(|output| Output {
             text: output.text,
             code: output.code,

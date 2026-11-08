@@ -22,6 +22,8 @@ const CUSTOM_DIR: &str = "custom-checks";
 /// Pre-release name of [`CUSTOM_DIR`]; migrated once by renaming it.
 const LEGACY_CUSTOM_DIR: &str = "custom-tools";
 const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
+/// Summary of a result blocked by the SHA-256 gate (also used to classify events).
+pub(crate) const INTEGRITY_GATE_SUMMARY: &str = "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito";
 
 fn default_timeout_seconds() -> u64 {
     DEFAULT_TIMEOUT_SECONDS
@@ -316,14 +318,14 @@ pub struct AuditReport {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AuditHistoryEntry {
-    completed_at_unix_ms: u64,
-    overall_status: String,
-    pass: usize,
-    fail: usize,
-    warn: usize,
-    error: usize,
-    other: usize,
+pub(crate) struct AuditHistoryEntry {
+    pub(crate) completed_at_unix_ms: u64,
+    pub(crate) overall_status: String,
+    pub(crate) pass: usize,
+    pub(crate) fail: usize,
+    pub(crate) warn: usize,
+    pub(crate) error: usize,
+    pub(crate) other: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1202,7 +1204,7 @@ fn safe_relative_path(value: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-fn state_dir() -> Result<PathBuf, CliError> {
+pub(crate) fn state_dir() -> Result<PathBuf, CliError> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
@@ -1210,12 +1212,55 @@ fn state_dir() -> Result<PathBuf, CliError> {
     Ok(base.join("baradwatchu"))
 }
 
-fn history_dir() -> Result<PathBuf, CliError> {
+/// `$XDG_STATE_HOME/baradwatchu`: application events, consent requests (audit history lives
+/// in the cache folder, see `history_dir`).
+pub(crate) fn state_home() -> Result<PathBuf, CliError> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .ok_or_else(|| CliError("Cannot locate the user state directory".into()))?;
-    Ok(base.join("baradwatchu").join("audits"))
+    Ok(base.join("baradwatchu"))
+}
+
+/// Per-session runtime files (dashboard session, tray lock): `$XDG_RUNTIME_DIR/baradwatchu`,
+/// falling back to `state_home()/run`. The tray companion uses the same rule.
+pub(crate) fn runtime_dir() -> Result<PathBuf, CliError> {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(base) if !base.is_empty() => Ok(PathBuf::from(base).join("baradwatchu")),
+        _ => Ok(state_home()?.join("run")),
+    }
+}
+
+/// Creates `path` (and parents) and restricts it to the current user.
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(path).map_err(|_| CliError("Cannot create local data directory".into()))?;
+    secure_dir(path)
+}
+
+/// `$XDG_CACHE_HOME/baradwatchu/audit`: audit reports and `--log` files. Disposable by
+/// design (operator choice): deleting it only clears the history and the last result.
+/// The previous `$XDG_STATE_HOME/baradwatchu/audits` folder is moved here once.
+fn history_dir() -> Result<PathBuf, CliError> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or_else(|| CliError("Cannot locate the user cache directory".into()))?;
+    let current = base.join("baradwatchu").join("audit");
+    if fs::symlink_metadata(&current).is_err() {
+        let legacy = state_home()?.join("audits");
+        if fs::symlink_metadata(&legacy)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            if let Some(parent) = current.parent() {
+                ensure_private_dir(parent)?;
+            }
+            // Best effort: on failure (e.g. another filesystem) the old history stays where
+            // it was and new audits start in the cache folder.
+            let _ = fs::rename(&legacy, &current);
+        }
+    }
+    Ok(current)
 }
 
 fn initial_settings(catalog: &Catalog) -> Settings {
@@ -1310,7 +1355,7 @@ fn remove_local_requirement_setting(id: &str) -> Result<(), CliError> {
     save_settings(&settings)
 }
 
-fn secure_dir(path: &Path) -> Result<(), CliError> {
+pub(crate) fn secure_dir(path: &Path) -> Result<(), CliError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| CliError("Cannot inspect local data directory".into()))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -1325,11 +1370,18 @@ fn secure_dir(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
+/// Unique per process and call, so concurrent writers never share a temporary file.
+fn temp_name() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".tmp-{}-{sequence}", std::process::id())
+}
+
+pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     let parent = path
         .parent()
         .ok_or_else(|| CliError("Invalid local data path".into()))?;
-    let temp = parent.join(format!(".tmp-{}", std::process::id()));
+    let temp = parent.join(temp_name());
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|_| CliError("Cannot encode local data".into()))?;
     let mut options = OpenOptions::new();
@@ -1349,11 +1401,11 @@ fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
     Ok(())
 }
 
-fn atomic_text(path: &Path, value: &str) -> Result<(), CliError> {
+pub(crate) fn atomic_text(path: &Path, value: &str) -> Result<(), CliError> {
     let parent = path
         .parent()
         .ok_or_else(|| CliError("Invalid local log path".into()))?;
-    let temp = parent.join(format!(".tmp-{}", std::process::id()));
+    let temp = parent.join(temp_name());
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -1393,12 +1445,32 @@ fn platform_key() -> &'static str {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+/// Explains why the OS refused to start a tool, so the author can fix it from the report.
+fn spawn_failure(error: &std::io::Error, tool: &Path) -> (&'static str, Vec<String>) {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(libc::ENOEXEC) {
+        return (
+            "Requirement tool has no valid interpreter line",
+            vec![
+                format!(
+                    "Il sistema non sa come eseguire {}: gli script devono iniziare con una riga #! (es. #!/bin/sh). Dopo la modifica aggiorna expectedSha256.",
+                    tool.display()
+                ),
+            ],
+        );
+    }
+    (
+        "Could not start requirement tool",
+        vec![format!("Avvio di {} non riuscito: {error}", tool.display())],
+    )
 }
 
 fn error_result(requirement: &Requirement, priority: Priority, summary: &str) -> ResultRecord {
@@ -1629,13 +1701,19 @@ fn execute_with_timeout(
         let mut result = error_with_details(
             requirement,
             priority,
-            "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito",
+            INTEGRITY_GATE_SUMMARY,
             vec![
                 format!(
                     "SHA-256 atteso: {}",
-                    provenance.expected_sha256.as_deref().unwrap_or("non disponibile")
+                    provenance
+                        .expected_sha256
+                        .as_deref()
+                        .unwrap_or("non disponibile")
                 ),
-                format!("SHA-256 attuale: {}", actual.as_deref().unwrap_or("non disponibile")),
+                format!(
+                    "SHA-256 attuale: {}",
+                    actual.as_deref().unwrap_or("non disponibile")
+                ),
                 integrity_hint(requirement),
             ],
         );
@@ -1755,7 +1833,10 @@ fn execute_with_timeout(
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return error_result(requirement, priority, "Could not start requirement tool"),
+        Err(error) => {
+            let (summary, details) = spawn_failure(&error, &canonical_tool);
+            return error_with_details(requirement, priority, summary, details);
+        }
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         kill_process_group(&child);
@@ -1966,7 +2047,7 @@ fn save_audit_at(
     Ok(include_log.then_some(log_path))
 }
 
-fn load_last_audit() -> Result<Option<AuditReport>, CliError> {
+pub(crate) fn load_last_audit() -> Result<Option<AuditReport>, CliError> {
     let directory = history_dir()?;
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -2064,7 +2145,7 @@ fn history_reports_at(directory: &Path) -> Result<Vec<AuditReport>, CliError> {
     Ok(reports)
 }
 
-fn history_entry(report: &AuditReport) -> AuditHistoryEntry {
+pub(crate) fn history_entry(report: &AuditReport) -> AuditHistoryEntry {
     let mut entry = AuditHistoryEntry {
         completed_at_unix_ms: report.completed_at_unix_ms,
         overall_status: "PASS".into(),
@@ -2126,7 +2207,7 @@ fn human_result(result: &ResultRecord) -> String {
     text
 }
 
-fn output_json<T: Serialize>(value: &T) -> Result<String, CliError> {
+pub(crate) fn output_json<T: Serialize>(value: &T) -> Result<String, CliError> {
     serde_json::to_string_pretty(value)
         .map(|s| s + "\n")
         .map_err(|_| CliError("Cannot encode JSON output".into()))
@@ -2143,7 +2224,7 @@ fn parse_priority(value: &OsString) -> Option<Priority> {
     }
 }
 
-const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | custom accept ID | custom remove ID | dashboard | --version";
+const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | custom accept ID | custom remove ID | dashboard [--no-browser] [--open ROUTE] | notifications [--json] | notifications set enabled|informative on|off | events --json [--after ID] | consent simulate|list|accept|reject … | --version";
 
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     // Custom-check maintenance must work even when the catalog cannot be built.
@@ -2515,6 +2596,9 @@ fn run_audit(
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
+    // The event log feeds the tray companion and the dashboard; failing to record it
+    // must not discard a completed audit.
+    let _ = crate::events::record_audit(&report);
     if notify {
         send_notification(&report);
     }
@@ -2626,7 +2710,8 @@ pub(crate) fn update_dashboard_settings(text: &str) -> Result<String, CliError> 
 pub(crate) fn dashboard_audit_json() -> Result<String, CliError> {
     let catalog = catalog()?;
     let settings = load_settings(&catalog)?;
-    Ok(run_audit(&catalog, &settings, true, true, false)?.text)
+    // Desktop notifications are owned by the tray companion (it reads the event log).
+    Ok(run_audit(&catalog, &settings, true, false, false)?.text)
 }
 
 pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
@@ -2743,7 +2828,7 @@ fn send_notification(report: &AuditReport) {
 }
 
 pub fn help() -> String {
-    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user.\n", env!("CARGO_PKG_VERSION"))
+    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent notifications set enabled|informative on|off\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]\n  baradwatchu-agent consent list [--json]\n  baradwatchu-agent consent accept|reject ID\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user. Desktop notifications and the consent window are provided by the optional baradwatchu-tray companion; consent requests are local simulations only (no remote requests yet) and only an explicit accept authorizes one request.\n", env!("CARGO_PKG_VERSION"))
 }
 
 /// Serialises tests that change process-wide environment variables and points every
@@ -2777,6 +2862,8 @@ impl TestEnv {
         };
         env.set("XDG_CONFIG_HOME", root.join("config"));
         env.set("XDG_STATE_HOME", root.join("state"));
+        env.set("XDG_CACHE_HOME", root.join("cache"));
+        env.set("XDG_RUNTIME_DIR", root.join("run"));
         env
     }
 
@@ -2975,6 +3062,22 @@ mod tests {
             present.provenance.unwrap().integrity_status,
             IntegrityStatus::Verified
         );
+    }
+
+    #[test]
+    fn audit_history_moves_from_state_to_cache_once() {
+        let env = TestEnv::new("history-move");
+        let legacy = env.root.join("state/baradwatchu/audits/reports");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("1.json"), "{}").unwrap();
+        let current = history_dir().unwrap();
+        assert_eq!(current, env.root.join("cache/baradwatchu/audit"));
+        assert!(current.join("reports/1.json").is_file());
+        assert!(!env.root.join("state/baradwatchu/audits").exists());
+        // Once the cache folder exists a stale legacy folder is left alone.
+        fs::create_dir_all(env.root.join("state/baradwatchu/audits")).unwrap();
+        assert_eq!(history_dir().unwrap(), current);
+        assert!(env.root.join("state/baradwatchu/audits").exists());
     }
 
     #[test]
@@ -3580,6 +3683,16 @@ mod tests {
             execute(&invalid_json, Priority::High, &invalid_json.parameters).status,
             ResultStatus::Error
         );
+        #[cfg(unix)]
+        {
+            let no_shebang = rewrite(
+                b"printf '%s\\n' '{\"status\":\"PASS\",\"summary\":\"ok\",\"details\":[]}'\n",
+            );
+            let refused = execute(&no_shebang, Priority::High, &no_shebang.parameters);
+            assert_eq!(refused.status, ResultStatus::Error);
+            assert!(refused.summary.contains("no valid interpreter line"));
+            assert!(refused.details.iter().any(|d| d.contains("#!")));
+        }
         let large = rewrite(b"#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n");
         assert!(execute(&large, Priority::High, &large.parameters)
             .summary
