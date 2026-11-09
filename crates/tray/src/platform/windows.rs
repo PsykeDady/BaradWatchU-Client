@@ -15,6 +15,46 @@ pub fn check_session() -> Result<(), String> {
     Ok(())
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn AttachConsole(process_id: u32) -> i32;
+    fn GetStdHandle(std_handle: u32) -> *mut std::ffi::c_void;
+    fn SetStdHandle(std_handle: u32, handle: *mut std::ffi::c_void) -> i32;
+}
+
+const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+/// The tray is a GUI-subsystem program on Windows (no console window from the Start menu or
+/// at login). For command-line use (`--version`, `--help`, `autostart`) its output goes to
+/// redirected handles when there are any (pipes, files: installers capture it), otherwise to
+/// the console of the terminal that started it. Never called when the tray itself runs, so
+/// closing that terminal cannot end the tray.
+pub fn attach_parent_console() {
+    let missing = |handle: *mut std::ffi::c_void| handle.is_null() || handle as isize == -1;
+    // SAFETY: plain kernel32 calls; handles opened here are handed over to the process
+    // standard handles and intentionally never closed.
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let err = GetStdHandle(STD_ERROR_HANDLE);
+        if !missing(out) && !missing(err) {
+            return;
+        }
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        for (id, current) in [(STD_OUTPUT_HANDLE, out), (STD_ERROR_HANDLE, err)] {
+            if missing(current) {
+                use std::os::windows::io::IntoRawHandle;
+                if let Ok(console) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
+                    SetStdHandle(id, console.into_raw_handle());
+                }
+            }
+        }
+    }
+}
+
 fn ask(title: &str, text: &str) -> DialogOutcome {
     let text = format!("{text}\n\n(Sì/Accetta = autorizza solo questa richiesta · No/Rifiuta · Annulla = decidi più tardi)");
     match rfd::MessageDialog::new()

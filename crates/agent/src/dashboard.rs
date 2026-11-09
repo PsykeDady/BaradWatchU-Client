@@ -174,16 +174,20 @@ fn open_in_browser(dir: &Path, session: &Session, route: Route) {
     if requirements::atomic_text(&launcher, &html).is_err() {
         return;
     }
-    let opener = if cfg!(target_os = "macos") {
+    // Windows: Explorer opens the .html launcher with the user's default browser.
+    #[cfg(windows)]
+    let opener = requirements::windows_root().join("explorer.exe");
+    #[cfg(not(windows))]
+    let opener = PathBuf::from(if cfg!(target_os = "macos") {
         "/usr/bin/open"
     } else {
         "/usr/bin/xdg-open"
-    };
-    let graphical = cfg!(target_os = "macos")
+    });
+    let graphical = cfg!(any(target_os = "macos", windows))
         || std::env::var_os("WAYLAND_DISPLAY").is_some()
         || std::env::var_os("DISPLAY").is_some();
-    if graphical && Path::new(opener).is_file() {
-        let _ = Command::new(opener)
+    if graphical && opener.is_file() {
+        let _ = Command::new(&opener)
             .arg(&launcher)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -467,7 +471,11 @@ fn static_file(path: &str, root: &Path) -> Response {
     let Ok(path) = candidate.canonicalize() else {
         return Response::error(404, "File non trovato");
     };
-    if !path.starts_with(root) {
+    // Compare canonical forms (on Windows canonical paths carry the `\\?\` prefix).
+    let Ok(canonical_root) = root.canonicalize() else {
+        return Response::error(404, "File non trovato");
+    };
+    if !path.starts_with(&canonical_root) {
         return Response::error(404, "File non trovato");
     }
     let Ok(body) = fs::read(path) else {

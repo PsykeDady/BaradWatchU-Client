@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-008",
+  "name": "Sicurezza delle password",
+  "description": "Verifica scadenza, preavviso, lunghezza e complessità richieste per le password degli account locali.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.ps1",
+  "arguments": [],
+  "expectedSha256": "6ca882d01a6a3bcf05cfd6a6ea8a0a1ad5c7581ad0c0251a1bb90c11d43fbd9a",
+  "version": 1,
+  "timeoutSeconds": 60,
+  "parameters": {
+    "maxPasswordAgeDays": 60,
+    "minimumWarningDays": 10,
+    "minimumLength": 14,
+    "requireComplexity": true
+  },
+  "overrideBuiltinId": null
+}

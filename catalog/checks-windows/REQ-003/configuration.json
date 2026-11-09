@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-003",
+  "name": "Protezione firewall",
+  "description": "Verifica che Windows Defender Firewall (o un firewall registrato) blocchi il traffico in ingresso su tutti i profili.",
+  "priority": "HIGH",
+  "enabled": true,
+  "toolPath": "./check.ps1",
+  "arguments": [],
+  "expectedSha256": "3bda7cab4786a6d12a5750aedef59d362313f1fd2ec35a2dee54c052f5a61cd0",
+  "version": 1,
+  "timeoutSeconds": 60,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

@@ -103,7 +103,8 @@ impl Default for NotificationPreferences {
     }
 }
 
-/// Holds an exclusive advisory lock on `dir/name` for the guard's lifetime (Unix `flock`).
+/// Holds an exclusive lock on `dir/name` for the guard's lifetime (Unix `flock`; Windows
+/// exclusive share-mode open).
 pub(crate) struct DirLock(#[allow(dead_code)] File);
 
 pub(crate) fn lock_dir(dir: &Path, name: &str) -> Result<DirLock, CliError> {
@@ -115,6 +116,31 @@ pub(crate) fn lock_dir(dir: &Path, name: &str) -> Result<DirLock, CliError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    let file = {
+        // No flock on Windows: an exclusive (share mode 0) open is the lock. Another holder
+        // makes the open fail with a sharing violation, so retry for a bounded time.
+        use std::os::windows::fs::OpenOptionsExt;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        options.share_mode(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match options.open(dir.join(name)) {
+                Ok(file) => break file,
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                    ) && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(_) => return Err(CliError("Cannot lock local data".into())),
+            }
+        }
+    };
+    #[cfg(not(windows))]
     let file = options
         .open(dir.join(name))
         .map_err(|_| CliError("Cannot open local lock file".into()))?;

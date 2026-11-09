@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-001",
+  "name": "Aggiornamenti software",
+  "description": "Verifica tramite Windows Update che non ci siano aggiornamenti software in sospeso.",
+  "priority": "HIGH",
+  "enabled": true,
+  "toolPath": "./check.ps1",
+  "arguments": [],
+  "expectedSha256": "7ae7c1fac6c77ba211233ab5c7a41a2b21c48b44207b7c1527ca111de5fed077",
+  "version": 1,
+  "timeoutSeconds": 240,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

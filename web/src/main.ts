@@ -60,7 +60,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
       <!-- ============================== STATO POSTAZIONE ============================== -->
       <ng-container *ngIf="!loading && view === 'overview'">
         <section class="intro">
-          <div><p class="eyebrow">POSTAZIONE · ARCH LINUX</p><h1>Stato della sicurezza</h1><p class="intro-copy">Controlli e risultati restano su questo dispositivo. La dashboard non richiede il Server.</p></div>
+          <div><p class="eyebrow">POSTAZIONE · {{ platformLabel() }}</p><h1>Stato della sicurezza</h1><p class="intro-copy">Controlli e risultati restano su questo dispositivo. La dashboard non richiede il Server.</p></div>
         </section>
 
         <section class="summary-panel" aria-labelledby="summary-title">
@@ -136,7 +136,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
                     <summary>Dettagli tecnici e integrità</summary>
                     <dl class="facts">
                       <dt>Origine</dt><dd>{{ item.origin === 'BUILTIN' ? 'Integrato' : 'Personalizzato' }}<span *ngIf="item.replacesBuiltin"> · sostituisce {{ item.replacesBuiltin }}</span></dd>
-                      <dt>Tool</dt><dd><code>{{ item.tools['linux'] || 'non disponibile' }}</code></dd>
+                      <dt>Tool</dt><dd><code>{{ toolPath(item) || 'non disponibile' }}</code></dd>
                       <dt>Argomenti</dt><dd><code>{{ item.arguments | json }}</code></dd>
                       <dt>Timeout</dt><dd>{{ item.timeoutSeconds }} s</dd>
                       <dt>Integrità</dt><dd><span class="integrity" [attr.data-integrity]="item.integrityStatus">{{ integrityText(item.integrityStatus) }}</span></dd>
@@ -221,7 +221,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <p class="result-summary" *ngIf="resultFor(item.id) as result">{{ result.summary }}</p>
               <p class="description" *ngIf="!item.configurationError">{{ item.description }}</p>
               <dl class="facts compact" *ngIf="!item.configurationError">
-                <dt>Tool</dt><dd><code>{{ item.tools['linux'] }}</code></dd>
+                <dt>Tool</dt><dd><code>{{ toolPath(item) }}</code></dd>
                 <dt>Integrità</dt><dd><span class="integrity" [attr.data-integrity]="item.integrityStatus">{{ integrityText(item.integrityStatus) }}</span></dd>
                 <dt>SHA-256</dt><dd><code>{{ item.expectedSha256 }}</code></dd>
               </dl>
@@ -416,7 +416,7 @@ class AppComponent implements OnInit {
   }
 
   async runAudit(): Promise<void> {
-    await this.runWithProgress('Controllo dei requisiti in corso. Può richiedere fino a un minuto (REQ-001 interroga i mirror).', async () => {
+    await this.runWithProgress('Controllo dei requisiti in corso. Può richiedere alcuni minuti (REQ-001 interroga il servizio di aggiornamento del sistema).', async () => {
       this.currentReport = await this.post<AuditReport>('/api/audit');
       this.showCurrent();
       await this.loadHistory();
@@ -586,6 +586,18 @@ class AppComponent implements OnInit {
       else counts.other += 1;
     }
     return counts;
+  }
+  /** Tool path for this OS: the agent lists only the running platform's tool. */
+  toolPath(item: Requirement): string {
+    return Object.values(item.tools ?? {})[0] ?? '';
+  }
+  /** Operating system of the audited device, from the platform key of the built-in tools. */
+  platformLabel(): string {
+    const keys = new Set(this.requirements.flatMap(item => Object.keys(item.tools ?? {})));
+    if (keys.has('windows')) return 'WINDOWS';
+    if (keys.has('macos')) return 'MACOS';
+    if (keys.has('linux')) return 'LINUX';
+    return 'LOCALE';
   }
   private setData(data: DashboardData): void {
     this.requirements = data.requirements.map(item => ({ ...item, parameters: item.parameters ?? {}, arguments: item.arguments ?? [] }));

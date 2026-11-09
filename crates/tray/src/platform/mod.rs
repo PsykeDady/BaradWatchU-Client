@@ -53,20 +53,26 @@ pub enum DialogOutcome {
 }
 
 /// Same rule as the agent: `$XDG_RUNTIME_DIR/baradwatchu`, else the state dir (`run/`).
+/// State dir: `$XDG_STATE_HOME/baradwatchu`, on Windows `%LOCALAPPDATA%\baradwatchu\state`,
+/// else `$HOME/.local/state/baradwatchu`.
 pub fn runtime_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        return std::env::var_os("LOCALAPPDATA")
-            .map(|base| PathBuf::from(base).join("BaradWatchU"));
+    if let Some(base) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(base).join("baradwatchu"));
     }
-    #[allow(unreachable_code)]
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(base) if !base.is_empty() => Some(PathBuf::from(base).join("baradwatchu")),
-        _ => std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-            .map(|base| base.join("baradwatchu").join("run")),
-    }
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|base| PathBuf::from(base).join("baradwatchu"))
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()))
+                .flatten()
+                .map(|base| PathBuf::from(base).join("baradwatchu").join("state"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".local/state").join("baradwatchu"))
+        })?;
+    Some(state.join("run"))
 }
 
 fn private_dir(path: &std::path::Path) -> Result<(), String> {

@@ -2,16 +2,18 @@
   "schemaVersion": "baradwatchu.custom-checks.v1",
   "id": "REQ-004",
   "name": "Filtro DNS",
-  "description": "Verifica che dnsmasq sia attivo oppure, se non è installato, che /etc/hosts contenga voci di blocco.",
+  "description": "Verifica che dnsmasq filtri il DNS oppure che /etc/hosts contenga una lista HaGeZi completa e aggiornata.",
   "priority": "HIGHEST",
   "enabled": true,
   "toolPath": "./check.sh",
   "arguments": [],
-  "expectedSha256": "1037388c9a37041357ed36dd118b12491062a30c6cbdbd94b87c5be06ee72162",
+  "expectedSha256": "71e1401c95c4989333c61ae3daaa0c94fa001d99f67e3346732c935f9826ab74",
   "version": 1,
   "parameters": {
     "minimumHostsEntries": 10000,
-    "minimumDnsmasqRules": 1000
+    "minimumDnsmasqRules": 1000,
+    "maxListAgeDays": 30,
+    "requireHagezi": true
   },
   "overrideBuiltinId": null
 }

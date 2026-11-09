@@ -148,10 +148,18 @@ impl Fixture {
         fs::remove_file(self.root.join("bin").join(name)).unwrap();
     }
 
+    /// A two-entry HaGeZi-style list (header as published in hagezi/dns-blocklists-legacy).
     fn set_hosts_block(&self) {
+        self.set_hosts_list(
+            "# Title: HaGeZi's Multi LIGHT - basic protection\n# Homepage: https://github.com/hagezi/dns-blocklists-legacy\n# Last modified: 01 Jan 2020 10:00 UTC\n# Number of entries: 2\n",
+            "0.0.0.0 ads.example\n0.0.0.0 tracker.example\n",
+        );
+    }
+
+    fn set_hosts_list(&self, header: &str, entries: &str) {
         fs::write(
             self.root.join("hosts"),
-            "127.0.0.1 localhost\n0.0.0.0 ads.example\n0.0.0.0 tracker.example\n",
+            format!("127.0.0.1 localhost\n{header}#\n{entries}"),
         )
         .unwrap();
     }
@@ -215,17 +223,76 @@ fn dns_passes_when_at_least_one_complete_method_is_active() {
     assert!(inactive["details"][1]
         .as_str()
         .unwrap()
-        .contains("solo 2 voci"));
+        .contains("solo 2 nomi bloccati"));
+    let small = serde_json::json!({"minimumHostsEntries": 2, "minimumDnsmasqRules": 1000, "maxListAgeDays": 0});
     let hosts_ok = fixture.run_with_parameters(
         "dns-filter",
         &[("DNS_STATE", "inactive")],
-        Some(serde_json::json!({"minimumHostsEntries": 2, "minimumDnsmasqRules": 1000})),
+        Some(small.clone()),
     );
     assert_eq!(hosts_ok["status"], "PASS", "{hosts_ok}");
     assert!(
         summary(&hosts_ok).contains("blocklist completa"),
         "{hosts_ok}"
     );
+    // HaGeZi constraint (operator decision 2026-11-08): an old list is inconclusive...
+    let stale = fixture.run_with_parameters(
+        "dns-filter",
+        &[("DNS_STATE", "inactive")],
+        Some(serde_json::json!({"minimumHostsEntries": 2, "maxListAgeDays": 30})),
+    );
+    assert_eq!(stale["status"], "WARN", "{stale}");
+    assert!(stale["details"][1].as_str().unwrap().contains("30 giorni"));
+    // ...a truncated list fails...
+    fixture.set_hosts_list(
+        "# Title: HaGeZi's Pro\n# Homepage: https://github.com/hagezi/dns-blocklists-legacy\n# Number of entries: 3\n",
+        "0.0.0.0 ads.example\n0.0.0.0 tracker.example\n",
+    );
+    let truncated = fixture.run_with_parameters(
+        "dns-filter",
+        &[("DNS_STATE", "inactive")],
+        Some(small.clone()),
+    );
+    assert_eq!(truncated["status"], "FAIL", "{truncated}");
+    assert!(
+        truncated["details"][1]
+            .as_str()
+            .unwrap()
+            .contains("incompleta"),
+        "{truncated}"
+    );
+    // ...and a list without a HaGeZi header (or with a foreign homepage) is refused
+    // unless requireHagezi is false.
+    fixture.set_hosts_list(
+        "# Title: HaGeZi's Pro\n# Homepage: https://example.com/copy\n# Number of entries: 2\n",
+        "0.0.0.0 ads.example\n0.0.0.0 tracker.example\n",
+    );
+    let foreign = fixture.run_with_parameters(
+        "dns-filter",
+        &[("DNS_STATE", "inactive")],
+        Some(small.clone()),
+    );
+    assert_eq!(foreign["status"], "FAIL", "{foreign}");
+    assert!(
+        foreign["details"][1]
+            .as_str()
+            .unwrap()
+            .contains("nessuna intestazione HaGeZi"),
+        "{foreign}"
+    );
+    let any_list = fixture.run_with_parameters(
+        "dns-filter",
+        &[("DNS_STATE", "inactive")],
+        Some(serde_json::json!({"minimumHostsEntries": 2, "requireHagezi": false})),
+    );
+    assert_eq!(any_list["status"], "PASS", "{any_list}");
+    let bad_flag = fixture.run_with_parameters(
+        "dns-filter",
+        &[],
+        Some(serde_json::json!({"requireHagezi": "yes"})),
+    );
+    assert_eq!(bad_flag["status"], "ERROR");
+    fixture.set_hosts_block();
 
     fixture.remove_tool("dnsmasq");
     assert_eq!(fixture.run("dns-filter", &[])["status"], "FAIL");

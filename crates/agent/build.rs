@@ -29,6 +29,7 @@ fn copy_tree(source: &Path, destination: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=../../catalog");
     println!("cargo:rerun-if-changed=../../catalog/checks");
+    println!("cargo:rerun-if-changed=../../catalog/checks-windows");
     println!("cargo:rerun-if-changed=../../web/src");
     println!("cargo:rerun-if-changed=../../web/dist/client-status/browser");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -40,9 +41,44 @@ fn main() {
         .nth(3)
         .expect("Cargo profile output directory");
     // Main binaries live in profile/, test executables in profile/deps/.
+    // Only the target OS's builtin checks are staged: Linux `catalog/checks`, Windows
+    // `catalog/checks-windows`. The hash manifest covers both and is staged as is.
+    let windows = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows");
+    let (own_checks, other_checks) = if windows {
+        ("checks-windows", "checks")
+    } else {
+        ("checks", "checks-windows")
+    };
     for prefix in [profile.parent().unwrap(), profile] {
         let target = prefix.join("share/baradwatchu-client");
-        copy_tree(&catalog, &target.join("catalog"));
+        let staged_catalog = target.join("catalog");
+        fs::create_dir_all(&staged_catalog).expect("Create staged catalog directory");
+        for entry in fs::read_dir(&catalog).expect("Read catalog directory") {
+            let entry = entry.expect("Read catalog entry");
+            let name = entry.file_name();
+            let source_path = entry.path();
+            let metadata = fs::symlink_metadata(&source_path).expect("Inspect catalog entry");
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "Symbolic links are not allowed in installed data"
+            );
+            if name == other_checks {
+                continue;
+            }
+            if metadata.is_dir() {
+                copy_tree(&source_path, &staged_catalog.join(&name));
+            } else if metadata.is_file() {
+                fs::copy(&source_path, staged_catalog.join(&name)).expect("Stage catalog file");
+            }
+        }
+        assert!(
+            staged_catalog.join(own_checks).is_dir(),
+            "Builtin checks for the target OS are missing"
+        );
+        let foreign = staged_catalog.join(other_checks);
+        if fs::symlink_metadata(&foreign).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            fs::remove_dir_all(&foreign).expect("Remove other-OS staged checks");
+        }
         let obsolete_catalog = target.join("catalog/requirements.json");
         match fs::symlink_metadata(&obsolete_catalog) {
             Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {

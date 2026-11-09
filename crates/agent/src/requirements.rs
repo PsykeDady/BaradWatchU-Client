@@ -22,6 +22,11 @@ const CUSTOM_DIR: &str = "custom-checks";
 /// Pre-release name of [`CUSTOM_DIR`]; migrated once by renaming it.
 const LEGACY_CUSTOM_DIR: &str = "custom-tools";
 const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
+/// Package-owned builtin check folders for this OS, relative to the installation root.
+#[cfg(windows)]
+const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-windows";
+#[cfg(not(windows))]
+const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks";
 /// Summary of a result blocked by the SHA-256 gate (also used to classify events).
 pub(crate) const INTEGRITY_GATE_SUMMARY: &str = "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito";
 
@@ -599,7 +604,7 @@ fn discover_check_folders(parent: &Path) -> Result<Vec<DiscoveredFolder>, CliErr
 }
 
 fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError> {
-    let parent = install.join("share/baradwatchu-client/catalog/checks");
+    let parent = install.join(BUILTIN_CATALOG_DIR);
     let root = install
         .canonicalize()
         .map_err(|_| CliError("Cannot locate Client installation".into()))?;
@@ -1132,6 +1137,8 @@ fn control_provenance(requirement: &Requirement) -> ControlProvenance {
     } else {
         state_dir().ok()
     };
+    // Canonical root, so it compares with canonical tool paths (`\\?\` prefix on Windows).
+    let root = root.map(|root| root.canonicalize().unwrap_or(root));
     let relative = requirement.tools.get(platform_key());
     let resolved = root.as_ref().zip(relative).and_then(|(root, relative)| {
         if !safe_relative_path(relative) {
@@ -1144,7 +1151,7 @@ fn control_provenance(requirement: &Requirement) -> ControlProvenance {
             Err(_) => Some(path),
         }
     });
-    let tool_path = resolved.as_ref().map(|path| path.display().to_string());
+    let tool_path = resolved.as_ref().map(|path| shown(path));
     let actual_sha256 = resolved.as_ref().and_then(|path| {
         let metadata = fs::symlink_metadata(path).ok()?;
         if !metadata.is_file()
@@ -1204,22 +1211,37 @@ fn safe_relative_path(value: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
-pub(crate) fn state_dir() -> Result<PathBuf, CliError> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .ok_or_else(|| CliError("Cannot locate the user configuration directory".into()))?;
-    Ok(base.join("baradwatchu"))
+/// Per-user base folder: the XDG variable when set (also used by tests on every OS), then
+/// on Windows the known folder variable (`%APPDATA%` / `%LOCALAPPDATA%` plus `windows_sub`),
+/// then `$HOME/home_sub`. The returned path already ends in `baradwatchu`.
+fn user_base(xdg: &str, windows_var: &str, windows_sub: &str, home_sub: &str) -> Option<PathBuf> {
+    if let Some(base) = std::env::var_os(xdg).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(base).join("baradwatchu"));
+    }
+    if cfg!(windows) {
+        if let Some(base) = std::env::var_os(windows_var).filter(|value| !value.is_empty()) {
+            let base = PathBuf::from(base).join("baradwatchu");
+            return Some(if windows_sub.is_empty() {
+                base
+            } else {
+                base.join(windows_sub)
+            });
+        }
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(home_sub).join("baradwatchu"))
 }
 
-/// `$XDG_STATE_HOME/baradwatchu`: application events, consent requests (audit history lives
-/// in the cache folder, see `history_dir`).
+/// `$XDG_CONFIG_HOME/baradwatchu` (Windows: `%APPDATA%\baradwatchu`): settings, custom checks.
+pub(crate) fn state_dir() -> Result<PathBuf, CliError> {
+    user_base("XDG_CONFIG_HOME", "APPDATA", "", ".config")
+        .ok_or_else(|| CliError("Cannot locate the user configuration directory".into()))
+}
+
+/// `$XDG_STATE_HOME/baradwatchu` (Windows: `%LOCALAPPDATA%\baradwatchu\state`): application
+/// events, consent requests (audit history lives in the cache folder, see `history_dir`).
 pub(crate) fn state_home() -> Result<PathBuf, CliError> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .ok_or_else(|| CliError("Cannot locate the user state directory".into()))?;
-    Ok(base.join("baradwatchu"))
+    user_base("XDG_STATE_HOME", "LOCALAPPDATA", "state", ".local/state")
+        .ok_or_else(|| CliError("Cannot locate the user state directory".into()))
 }
 
 /// Per-session runtime files (dashboard session, tray lock): `$XDG_RUNTIME_DIR/baradwatchu`,
@@ -1241,12 +1263,9 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
 /// design (operator choice): deleting it only clears the history and the last result.
 /// The previous `$XDG_STATE_HOME/baradwatchu/audits` folder is moved here once.
 fn history_dir() -> Result<PathBuf, CliError> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .ok_or_else(|| CliError("Cannot locate the user cache directory".into()))?;
-    let current = base.join("baradwatchu").join("audit");
+    let current = user_base("XDG_CACHE_HOME", "LOCALAPPDATA", "cache", ".cache")
+        .ok_or_else(|| CliError("Cannot locate the user cache directory".into()))?
+        .join("audit");
     if fs::symlink_metadata(&current).is_err() {
         let legacy = state_home()?.join("audits");
         if fs::symlink_metadata(&legacy)
@@ -1469,7 +1488,7 @@ fn spawn_failure(error: &std::io::Error, tool: &Path) -> (&'static str, Vec<Stri
     }
     (
         "Could not start requirement tool",
-        vec![format!("Avvio di {} non riuscito: {error}", tool.display())],
+        vec![format!("Avvio di {} non riuscito: {error}", shown(tool))],
     )
 }
 
@@ -1530,22 +1549,304 @@ fn bounded_reader<R: Read + Send + 'static>(
     })
 }
 
-/// SIGKILL the whole process group of a tool (the tool and any helper it spawned).
+/// The tool and every helper it starts, ended together on timeout and after exit.
+/// Unix: the tool's own process group (SIGKILL to the group).
 #[cfg(unix)]
-fn kill_process_group(child: &std::process::Child) {
-    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
-        if pgid > 1 {
+struct ProcessTree(libc::pid_t);
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn new(child: &std::process::Child) -> Self {
+        Self(libc::pid_t::try_from(child.id()).unwrap_or(0))
+    }
+
+    fn kill(&self) {
+        if self.0 > 1 {
             // SAFETY: plain syscall; a negative PID addresses the group created for the tool.
             unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+                libc::kill(-self.0, libc::SIGKILL);
             }
         }
     }
 }
 
-#[cfg(not(unix))]
-fn kill_process_group(child: &std::process::Child) {
-    let _ = child;
+/// Windows: a Job Object that kills its processes when terminated or closed, so helpers are
+/// ended even after the tool itself exited. If the job cannot be set up, `taskkill /T`
+/// (absolute path, no shell) is the fallback while the tool is still running.
+#[cfg(windows)]
+struct ProcessTree {
+    job: windows_sys::Win32::Foundation::HANDLE,
+    pid: u32,
+}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn new(child: &std::process::Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+        };
+        // SAFETY: plain Win32 calls on a job handle this function owns and on the child's
+        // live process handle; the limit structure outlives the call that reads it.
+        let job = unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                std::ptr::null_mut()
+            } else {
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let configured = SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::addr_of!(limits).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                ) != 0;
+                if configured && AssignProcessToJobObject(job, child.as_raw_handle()) != 0 {
+                    job
+                } else {
+                    CloseHandle(job);
+                    std::ptr::null_mut()
+                }
+            }
+        };
+        Self {
+            job,
+            pid: child.id(),
+        }
+    }
+
+    fn kill(&self) {
+        if self.job.is_null() {
+            use std::os::windows::process::CommandExt;
+            let _ = Command::new(windows_system_dir().join("taskkill.exe"))
+                .args(["/T", "/F", "/PID", &self.pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        } else {
+            // SAFETY: `job` is a valid job handle owned by this value.
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if !self.job.is_null() {
+            // SAFETY: closing the job handle owned by this value (kills what is left).
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+struct ProcessTree;
+
+#[cfg(not(any(unix, windows)))]
+impl ProcessTree {
+    fn new(_child: &std::process::Child) -> Self {
+        Self
+    }
+
+    fn kill(&self) {}
+}
+
+/// `CREATE_NO_WINDOW`: console tools started by the tray or dashboard never flash a window.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `%SystemRoot%` (default `C:\Windows`), used to reach system programs by absolute path.
+#[cfg(windows)]
+pub(crate) fn windows_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+#[cfg(windows)]
+fn windows_system_dir() -> PathBuf {
+    windows_root().join("System32")
+}
+
+/// Windows PowerShell 5.1, present on every supported Windows release.
+#[cfg(windows)]
+fn windows_powershell() -> PathBuf {
+    windows_system_dir().join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
+/// `canonicalize` returns `\\?\C:\…` paths, which Windows PowerShell 5.1 does not accept
+/// for `-File`; plain drive paths are returned without the prefix.
+#[cfg(windows)]
+fn plain_windows_path(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Path as shown to people (reports, CLI): without the Windows `\\?\` prefix.
+fn shown(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        plain_windows_path(path).display().to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        path.display().to_string()
+    }
+}
+
+/// How a tool is started: on Windows `.ps1` scripts go through Windows PowerShell and
+/// `.exe` files run directly; anything else is refused. On Unix the tool is executed
+/// directly and its `#!` line selects the interpreter.
+fn tool_command(tool: &Path) -> Result<Command, (String, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let tool = plain_windows_path(tool);
+        let extension = tool
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut command = match extension.as_str() {
+            "ps1" => {
+                let mut command = Command::new(windows_powershell());
+                command
+                    .args([
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                    ])
+                    .arg(&tool);
+                command
+            }
+            "exe" => Command::new(&tool),
+            _ => {
+                return Err((
+                    "Requirement tool type is not supported on Windows".into(),
+                    vec![format!(
+                        "Su Windows i tool devono essere script PowerShell (.ps1) o eseguibili (.exe): {}",
+                        tool.display()
+                    )],
+                ))
+            }
+        };
+        command.creation_flags(CREATE_NO_WINDOW);
+        Ok(command)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Command::new(tool))
+    }
+}
+
+/// Minimal clean environment for a tool: fixed system search path plus the session
+/// variables the platform's own tools need.
+fn tool_environment(command: &mut Command, origin: ControlOrigin) {
+    command.env_clear();
+    #[cfg(windows)]
+    {
+        let _ = origin;
+        let root = windows_root();
+        let system = windows_system_dir();
+        let path = std::env::join_paths([
+            system.clone(),
+            root.clone(),
+            system.join("Wbem"),
+            system.join(r"WindowsPowerShell\v1.0"),
+        ])
+        .unwrap_or_default();
+        command
+            .env("PATH", path)
+            .env("SystemRoot", &root)
+            .env("windir", &root);
+        for name in [
+            "SystemDrive",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "USERNAME",
+            "USERDOMAIN",
+            "COMPUTERNAME",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "ProgramData",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "CommonProgramFiles",
+            "CommonProgramFiles(x86)",
+            "PROCESSOR_ARCHITECTURE",
+            "NUMBER_OF_PROCESSORS",
+            "OS",
+            "PUBLIC",
+            "ALLUSERSPROFILE",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let mut executable_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        if origin == ControlOrigin::Custom {
+            if let Some(home) = std::env::var_os("HOME") {
+                let user_bin = PathBuf::from(home).join(".local/bin");
+                if user_bin.is_absolute()
+                    && fs::symlink_metadata(&user_bin).is_ok_and(|metadata| {
+                        metadata.is_dir() && !metadata.file_type().is_symlink()
+                    })
+                {
+                    executable_path.push(user_bin);
+                }
+            }
+        }
+        let executable_path = std::env::join_paths(executable_path)
+            .unwrap_or_else(|_| OsString::from("/usr/bin:/bin"));
+        command.env("PATH", executable_path);
+        for name in [
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "LANG",
+            "XDG_CONFIG_HOME",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_TYPE",
+            "XDG_SESSION_ID",
+            "DESKTOP_SESSION",
+            "WAYLAND_DISPLAY",
+            "DISPLAY",
+            "KDE_SESSION_VERSION",
+            "KDE_FULL_SESSION",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
 }
 
 fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
@@ -1668,11 +1969,14 @@ fn execute_with_timeout(
                 "Required tool is not executable",
                 vec![format!(
                     "Rendi eseguibile il file: chmod +x {}",
-                    canonical_tool.display()
+                    shown(&canonical_tool)
                 )],
             );
         }
     }
+    // Only Unix has an executable bit to inspect.
+    #[cfg(not(unix))]
+    let _ = metadata;
     let Some(working_dir) = canonical_tool.parent().map(Path::to_path_buf) else {
         return error_result(requirement, priority, "Invalid tool path");
     };
@@ -1723,7 +2027,16 @@ fn execute_with_timeout(
     // Custom tools run from a private snapshot of the exact bytes hashed (no swap between
     // hash and exec). Built-ins stay at their package-owned path so sibling helpers work.
     let (execution_path, _snapshot) = if requirement.origin == ControlOrigin::Custom {
-        let snapshot = working_dir.join(format!(".run-{}-{}", std::process::id(), now_ms()));
+        // Keep the extension: on Windows it selects how the tool is started.
+        let extension = canonical_tool
+            .extension()
+            .map(|value| format!(".{}", value.to_string_lossy()))
+            .unwrap_or_default();
+        let snapshot = working_dir.join(format!(
+            ".run-{}-{}{extension}",
+            std::process::id(),
+            now_ms()
+        ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1776,7 +2089,14 @@ fn execute_with_timeout(
             };
             Some(encoded)
         };
-    let mut command = Command::new(&execution_path);
+    let mut command = match tool_command(&execution_path) {
+        Ok(command) => command,
+        Err((summary, details)) => {
+            return error_with_details(requirement, priority, &summary, details)
+        }
+    };
+    #[cfg(windows)]
+    let working_dir = plain_windows_path(&working_dir);
     command
         .args(&requirement.arguments)
         .current_dir(&working_dir);
@@ -1786,20 +2106,7 @@ fn execute_with_timeout(
         // Own process group: a timeout kills the tool and every helper it started.
         command.process_group(0);
     }
-    let mut executable_path = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
-    if requirement.origin == ControlOrigin::Custom {
-        if let Some(home) = std::env::var_os("HOME") {
-            let user_bin = PathBuf::from(home).join(".local/bin");
-            if user_bin.is_absolute()
-                && fs::symlink_metadata(&user_bin)
-                    .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            {
-                executable_path.push(user_bin);
-            }
-        }
-    }
-    let executable_path =
-        std::env::join_paths(executable_path).unwrap_or_else(|_| OsString::from("/usr/bin:/bin"));
+    tool_environment(&mut command, requirement.origin);
     command
         .stdin(if parameter_input.is_some() {
             Stdio::piped()
@@ -1807,30 +2114,7 @@ fn execute_with_timeout(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env("PATH", executable_path);
-    for name in [
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "XDG_CONFIG_HOME",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_TYPE",
-        "XDG_SESSION_ID",
-        "DESKTOP_SESSION",
-        "WAYLAND_DISPLAY",
-        "DISPLAY",
-        "KDE_SESSION_VERSION",
-        "KDE_FULL_SESSION",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
+        .stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -1838,8 +2122,9 @@ fn execute_with_timeout(
             return error_with_details(requirement, priority, summary, details);
         }
     };
+    let tree = ProcessTree::new(&child);
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-        kill_process_group(&child);
+        tree.kill();
         let _ = child.kill();
         let _ = child.wait();
         return error_result(
@@ -1866,13 +2151,13 @@ fn execute_with_timeout(
             }
             Ok(None) => {
                 timed_out = true;
-                kill_process_group(&child);
+                tree.kill();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
             }
             Err(_) => {
-                kill_process_group(&child);
+                tree.kill();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -1880,7 +2165,7 @@ fn execute_with_timeout(
         }
     };
     // Helpers left in the background would hold the pipes open: end the whole group.
-    kill_process_group(&child);
+    tree.kill();
     let stderr_text = match stderr_reader.join() {
         Ok(Ok((data, _))) => stderr_excerpt(&data),
         _ => None,
@@ -1898,7 +2183,7 @@ fn execute_with_timeout(
                 "Il tool ha superato il timeout di {} s ed è stato terminato",
                 timeout.as_secs_f32()
             ),
-            with_stderr(vec![format!("Tool: {}", canonical_tool.display())]),
+            with_stderr(vec![format!("Tool: {}", shown(&canonical_tool))]),
         );
     }
     let output = match stdout_result {
@@ -1925,7 +2210,7 @@ fn execute_with_timeout(
                 priority,
                 &format!("Il tool è terminato con un errore (codice uscita {code})"),
                 with_stderr(vec![
-                    format!("Tool: {}", canonical_tool.display()),
+                    format!("Tool: {}", shown(&canonical_tool)),
                     "Un controllo deve uscire con codice 0 e riportare l'esito nel JSON".into(),
                 ]),
             );
@@ -1999,7 +2284,7 @@ fn execute_with_timeout(
             "Requirement tool returned an invalid result",
         );
     }
-    details.insert(0, format!("Tool eseguito: {}", canonical_tool.display()));
+    details.insert(0, format!("Tool eseguito: {}", shown(&canonical_tool)));
     details.insert(1, "Codice uscita tool: 0".into());
     ResultRecord {
         id: requirement.id.clone(),
@@ -2965,9 +3250,36 @@ mod tests {
             .clone()
     }
 
+    /// Entrypoint names for test tools: a shell script on Unix, PowerShell on Windows.
+    #[cfg(not(windows))]
+    const TOOL: &str = "c.sh";
+    #[cfg(windows)]
+    const TOOL: &str = "c.ps1";
+    #[cfg(not(windows))]
+    const CHECK: &str = "check.sh";
+    #[cfg(windows)]
+    const CHECK: &str = "check.ps1";
+
+    /// A test tool that prints `stdout` verbatim (must not contain single quotes).
+    fn print_tool(stdout: &str) -> Vec<u8> {
+        assert!(!stdout.contains('\''));
+        if cfg!(windows) {
+            format!("[Console]::Out.Write('{stdout}')\r\n")
+        } else {
+            format!("#!/bin/sh\nprintf '%s\\n' '{stdout}'\n")
+        }
+        .into_bytes()
+    }
+
+    /// A test tool reporting `status` with `summary` (custom contract).
+    fn status_tool(status: &str, summary: &str) -> Vec<u8> {
+        print_tool(&format!(
+            "{{\"status\":\"{status}\",\"summary\":\"{summary}\",\"details\":[]}}"
+        ))
+    }
+
     fn pass_tool(summary: &str) -> Vec<u8> {
-        format!("#!/bin/sh\nprintf '%s' '{{\"status\":\"PASS\",\"summary\":\"{summary}\",\"details\":[]}}'\n")
-            .into_bytes()
+        status_tool("PASS", summary)
     }
 
     #[test]
@@ -3007,6 +3319,8 @@ mod tests {
 
     /// The operator's own model check (copied verbatim from
     /// ~/.config/baradwatchu/custom-tools/CUSTOM-001) must be accepted as designed.
+    // Shell-script fixture; the Windows runner has its own tests (windows_*).
+    #[cfg(unix)]
     #[test]
     fn operator_model_custom_001_runs_as_designed() {
         const SCRIPT: &[u8] = b"#!/bin/bash\n\nexists=$(ricordatichedevicambiare -V >/dev/null 2>/dev/null; echo $?);\nif ((exists==0)); then \n\tdetails=\"version: $(ricordatichedevicambiare -V | awk '{print $2}')\";\n\tsummary=\"software installato correttamente\"\n\tstatus='\"PASS\"'\nelse\n\tdetails=\"version: N/D\";\n\tsummary=\"software non installato\"\n\tstatus='\"FAIL\"';\nfi\n\necho '{\n\t\"status\":'$status',\n\t\"summary\":\"'\"$summary\"'\",\n\t\"details\":\"'\"$details\"'\"\n}'\n\n\n\n";
@@ -3115,42 +3429,42 @@ mod tests {
         write_custom_folder(
             &env,
             "CUSTOM-WRONGID",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"id":"CUSTOM-OTHER"}),
         );
         write_custom_folder(
             &env,
             "CUSTOM-NOHASH",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"expectedSha256": null}),
         );
         write_custom_folder(
             &env,
             "CUSTOM-BADOVR",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"overrideBuiltinId":"REQ-999"}),
         );
         write_custom_folder(
             &env,
             "CUSTOM-TIMEOUT",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"timeoutSeconds": 0}),
         );
         write_custom_folder(
             &env,
             "lowercase-name",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"id":"lowercase-name"}),
         );
         write_custom_folder(
             &env,
             "CUSTOM-GOOD",
-            "c.sh",
+            TOOL,
             &pass_tool("good"),
             serde_json::json!({}),
         );
@@ -3220,14 +3534,21 @@ mod tests {
     fn accept_pins_hand_written_tool_and_mismatch_never_executes() {
         let env = TestEnv::new("accept");
         let marker = env.root.join("executed");
-        let tool = format!(
-            "#!/bin/sh\ntouch '{}'\nprintf '{{\"status\":\"PASS\",\"summary\":\"ran\"}}'\n",
-            marker.display()
-        );
+        let tool = if cfg!(windows) {
+            format!(
+                "New-Item -ItemType File -Force -Path '{}' | Out-Null\r\n[Console]::Out.Write('{{\"status\":\"PASS\",\"summary\":\"ran\"}}')\r\n",
+                marker.display()
+            )
+        } else {
+            format!(
+                "#!/bin/sh\ntouch '{}'\nprintf '{{\"status\":\"PASS\",\"summary\":\"ran\"}}'\n",
+                marker.display()
+            )
+        };
         let folder = write_custom_folder(
             &env,
             "CUSTOM-PIN",
-            "check.sh",
+            CHECK,
             tool.as_bytes(),
             serde_json::json!({"expectedSha256": null}),
         );
@@ -3246,7 +3567,7 @@ mod tests {
         fs::remove_file(&marker).unwrap();
         // Editing the tool by hand without accepting it blocks execution.
         let edited = tool.replace("ran", "edited");
-        fs::write(folder.join("check.sh"), &edited).unwrap();
+        fs::write(folder.join(CHECK), &edited).unwrap();
         let check = find(&catalog().unwrap(), "CUSTOM-PIN");
         let blocked = execute(&check, check.priority, &check.parameters);
         assert_eq!(blocked.status, ResultStatus::Error);
@@ -3282,7 +3603,7 @@ mod tests {
         write_custom_folder(
             &env,
             "CUSTOM-CAMEL",
-            "c.sh",
+            TOOL,
             &pass_tool("x"),
             serde_json::json!({"timeoutSeconds": 7}),
         );
@@ -3314,6 +3635,8 @@ mod tests {
             .ends_with(CUSTOM_DIR));
     }
 
+    // Shell-script fixture; the Windows runner has its own tests (windows_*).
+    #[cfg(unix)]
     #[test]
     fn tools_run_in_their_folder_and_report_stderr_on_failure() {
         let env = TestEnv::new("cwd");
@@ -3351,6 +3674,8 @@ mod tests {
             .any(|d| d.contains("missing dependency xyz")));
     }
 
+    // Shell-script fixture; the Windows runner has its own tests (windows_*).
+    #[cfg(unix)]
     #[test]
     fn timeout_kills_background_helpers_without_hanging() {
         let env = TestEnv::new("timeout");
@@ -3389,6 +3714,108 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
+    /// Windows runner: `.ps1` tools go through Windows PowerShell with the folder as cwd,
+    /// direct arguments and JSON parameters on stdin; failures, timeouts and unsupported
+    /// tool types are reported as errors.
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_tools_run_with_folder_arguments_parameters_and_errors() {
+        let env = TestEnv::new("win-ps1");
+        let folder = write_custom_folder(
+            &env,
+            "CUSTOM-PS1",
+            "check.ps1",
+            b"$p = [Console]::In.ReadToEnd() | ConvertFrom-Json\r\n$d = (Get-Content -Raw .\\data.txt).Trim()\r\n[Console]::Out.Write((@{ status = 'PASS'; summary = \"$d|$($args[0])|$($args[1])|$($p.parameters.level)\" } | ConvertTo-Json -Compress))\r\n",
+            serde_json::json!({"arguments": ["one value", "two"], "parameters": {"level": 3}}),
+        );
+        fs::write(folder.join("data.txt"), "from-folder").unwrap();
+        let check = find(&catalog().unwrap(), "CUSTOM-PS1");
+        let result = execute(&check, check.priority, &check.parameters);
+        assert_eq!(result.status, ResultStatus::Pass, "{result:?}");
+        assert_eq!(result.summary, "from-folder|one value|two|3");
+        // The snapshot used for custom tools keeps the extension and is removed afterwards.
+        assert!(fs::read_dir(&folder).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".run-")));
+
+        write_custom_folder(
+            &env,
+            "CUSTOM-PS1EXIT",
+            "check.ps1",
+            b"[Console]::Error.WriteLine('missing dependency xyz')\r\nexit 3\r\n",
+            serde_json::json!({}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-PS1EXIT");
+        let failed = execute(&check, check.priority, &check.parameters);
+        assert_eq!(failed.status, ResultStatus::Error);
+        assert!(
+            failed.summary.contains("codice uscita 3"),
+            "{}",
+            failed.summary
+        );
+        assert!(failed
+            .details
+            .iter()
+            .any(|d| d.contains("missing dependency xyz")));
+
+        write_custom_folder(
+            &env,
+            "CUSTOM-SH",
+            "check.sh",
+            b"#!/bin/sh\necho no\n",
+            serde_json::json!({}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-SH");
+        let refused = execute(&check, check.priority, &check.parameters);
+        assert_eq!(refused.status, ResultStatus::Error);
+        assert!(
+            refused.summary.contains("not supported on Windows"),
+            "{}",
+            refused.summary
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_timeout_kills_the_whole_tool_tree() {
+        let env = TestEnv::new("win-timeout");
+        // A helper process inherits the output pipe: only killing the tree ends the read.
+        let helper = "Start-Process -NoNewWindow -FilePath \"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 40'";
+        write_custom_folder(
+            &env,
+            "CUSTOM-PS1SLOW",
+            "check.ps1",
+            format!("{helper}\r\nStart-Sleep -Seconds 40\r\n").as_bytes(),
+            serde_json::json!({"timeoutSeconds": 2}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-PS1SLOW");
+        let started = std::time::Instant::now();
+        let result = execute(&check, check.priority, &check.parameters);
+        assert_eq!(result.status, ResultStatus::Error);
+        assert!(result.summary.contains("timeout"), "{}", result.summary);
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "helper kept the pipe open for {:?}",
+            started.elapsed()
+        );
+        write_custom_folder(
+            &env,
+            "CUSTOM-PS1BG",
+            "check.ps1",
+            format!("{helper}\r\n[Console]::Out.Write('{{\"status\":\"PASS\",\"summary\":\"done\"}}')\r\n").as_bytes(),
+            serde_json::json!({}),
+        );
+        let check = find(&catalog().unwrap(), "CUSTOM-PS1BG");
+        let started = std::time::Instant::now();
+        let result = execute(&check, check.priority, &check.parameters);
+        assert_eq!(result.status, ResultStatus::Pass, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    // Shell-script fixture; the Windows runner has its own tests (windows_*).
+    #[cfg(unix)]
     #[test]
     fn folder_discovery_reads_configuration_and_direct_arguments() {
         let env = TestEnv::new("discovery");
@@ -3412,13 +3839,13 @@ mod tests {
     }
 
     fn import_request(id: &str, override_id: Option<&str>) -> String {
-        let bytes =
-            "#!/bin/sh\nprintf '{\"status\":\"PASS\",\"summary\":\"custom pass\",\"details\":[]}'";
+        let bytes = pass_tool("custom pass");
         output_json(&serde_json::json!({
             "id": id, "name": "Custom check", "description": "Local custom check",
             "priority": "HIGH", "enabled": true, "overrideBuiltinId": override_id,
-            "cloneFrom": override_id, "fileName": "check.sh", "fileBase64": base64_encode(bytes.as_bytes())
-        })).unwrap()
+            "cloneFrom": override_id, "fileName": CHECK, "fileBase64": base64_encode(&bytes)
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -3501,7 +3928,7 @@ mod tests {
         );
         let folder = custom_root().unwrap().join("CUSTOM-001");
         // The imported file keeps its name inside the check folder.
-        assert!(folder.join("check.sh").is_file());
+        assert!(folder.join(CHECK).is_file());
         let config_path = folder.join("configuration.json");
         let original_config = fs::read(&config_path).unwrap();
         let mut forged_config: serde_json::Value =
@@ -3558,7 +3985,11 @@ mod tests {
             report.results[0].compliance_status,
             Some(ResultStatus::Pass)
         );
-        fs::write(folder.join("check.sh"), b"#!/bin/sh\nprintf '{\"status\":\"WARNING\",\"summary\":\"changed\",\"details\":[\"second method unavailable\"]}'").unwrap();
+        fs::write(
+            folder.join(CHECK),
+            print_tool("{\"status\":\"WARNING\",\"summary\":\"changed\",\"details\":[\"second method unavailable\"]}"),
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(3));
         report = serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
         assert_eq!(report.results[0].status, ResultStatus::Error);
@@ -3572,12 +4003,11 @@ mod tests {
         );
         let before_update_stamp = report.completed_at_unix_ms;
         thread::sleep(Duration::from_millis(3));
-        let update_bytes =
-            b"#!/bin/sh\nprintf '{\"status\":\"WARNING\",\"summary\":\"updated\",\"details\":[]}'";
+        let update_bytes = status_tool("WARNING", "updated");
         let update =
-            output_json(&serde_json::json!({"fileBase64":base64_encode(update_bytes)})).unwrap();
+            output_json(&serde_json::json!({"fileBase64":base64_encode(&update_bytes)})).unwrap();
         dashboard_update_custom("CUSTOM-001", &update).unwrap();
-        assert_eq!(fs::read(folder.join("check.sh")).unwrap(), update_bytes);
+        assert_eq!(fs::read(folder.join(CHECK)).unwrap(), update_bytes);
         report = serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
         assert_eq!(report.results[0].status, ResultStatus::Warn);
         let provenance = report.results[0].provenance.as_ref().unwrap();
@@ -3651,12 +4081,14 @@ mod tests {
     #[test]
     fn custom_tool_missing_non_executable_bad_output_and_timeout_are_errors() {
         let env = TestEnv::new("exec");
-        let no_id_error = b"#!/bin/sh\nprintf '%s\\n' '{\"status\":\"ERROR\",\"summary\":\"check failed\",\"details\":\"version unavailable\"}'";
+        let no_id_error = print_tool(
+            "{\"status\":\"ERROR\",\"summary\":\"check failed\",\"details\":\"version unavailable\"}",
+        );
         let folder = write_custom_folder(
             &env,
             "CUSTOM-ERR",
-            "check.sh",
-            no_id_error,
+            CHECK,
+            &no_id_error,
             serde_json::json!({}),
         );
         let requirement = find(&catalog().unwrap(), "CUSTOM-ERR");
@@ -3668,17 +4100,19 @@ mod tests {
             .iter()
             .any(|d| d == "version unavailable"));
         let rewrite = |bytes: &[u8]| -> Requirement {
-            let (_, hash) = store_custom_tool("CUSTOM-ERR", "check.sh", bytes).unwrap();
+            let (_, hash) = store_custom_tool("CUSTOM-ERR", CHECK, bytes).unwrap();
             Requirement {
                 expected_sha256: Some(hash),
                 ..requirement.clone()
             }
         };
-        let id_result = rewrite(b"#!/bin/sh\nprintf '%s\\n' '{\"id\":\"CUSTOM-ERR\",\"status\":\"PASS\",\"summary\":\"not allowed\",\"details\":[]}'");
+        let id_result = rewrite(&print_tool(
+            "{\"id\":\"CUSTOM-ERR\",\"status\":\"PASS\",\"summary\":\"not allowed\",\"details\":[]}",
+        ));
         let rejected = execute(&id_result, Priority::High, &id_result.parameters);
         assert!(rejected.summary.contains("invalid JSON or fields"));
         assert!(rejected.details.iter().any(|d| d.contains("unknown field")));
-        let invalid_json = rewrite(b"#!/bin/sh\nprintf 'not-json'");
+        let invalid_json = rewrite(&print_tool("not-json"));
         assert_eq!(
             execute(&invalid_json, Priority::High, &invalid_json.parameters).status,
             ResultStatus::Error
@@ -3693,7 +4127,11 @@ mod tests {
             assert!(refused.summary.contains("no valid interpreter line"));
             assert!(refused.details.iter().any(|d| d.contains("#!")));
         }
-        let large = rewrite(b"#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n");
+        let large = rewrite(if cfg!(windows) {
+            b"[Console]::Out.Write('x' * 200000)\r\n".as_slice()
+        } else {
+            b"#!/bin/sh\nhead -c 200000 /dev/zero | tr '\\0' 'x'\n".as_slice()
+        });
         assert!(execute(&large, Priority::High, &large.parameters)
             .summary
             .contains("too large"));
@@ -3708,15 +4146,22 @@ mod tests {
             fs::set_permissions(folder.join("check.sh"), fs::Permissions::from_mode(0o700))
                 .unwrap();
         }
+        // The executable-bit check above exists only on Unix.
+        #[cfg(not(unix))]
+        let _ = &folder;
         let missing = Requirement {
-            tools: BTreeMap::from([("linux".into(), format!("{CUSTOM_DIR}/missing.tool"))]),
+            tools: BTreeMap::from([(platform_key().into(), format!("{CUSTOM_DIR}/missing.tool"))]),
             ..requirement.clone()
         };
         assert_eq!(
             execute(&missing, Priority::High, &missing.parameters).status,
             ResultStatus::Error
         );
-        let timeout_req = rewrite(b"#!/bin/sh\nwhile :; do :; done");
+        let timeout_req = rewrite(if cfg!(windows) {
+            b"while ($true) { }\r\n".as_slice()
+        } else {
+            b"#!/bin/sh\nwhile :; do :; done".as_slice()
+        });
         let timed = execute_with_timeout(
             &timeout_req,
             Priority::High,
@@ -3733,7 +4178,7 @@ mod tests {
         write_custom_folder(
             &env,
             "CUSTOM-CLI",
-            "c.sh",
+            TOOL,
             &pass_tool("cli"),
             serde_json::json!({"expectedSha256": null}),
         );
@@ -3852,9 +4297,8 @@ mod tests {
             write_custom_folder(
                 &env,
                 id,
-                "c.sh",
-                format!("#!/bin/sh\nprintf '{{\"status\":\"{status}\",\"summary\":\"s\"}}'\n")
-                    .as_bytes(),
+                TOOL,
+                &status_tool(status, "s"),
                 serde_json::json!({}),
             );
         }
@@ -3871,8 +4315,8 @@ mod tests {
         write_custom_folder(
             &env,
             "CUSTOM-C",
-            "c.sh",
-            b"#!/bin/sh\nprintf '{\"status\":\"FAIL\",\"summary\":\"s\"}'\n",
+            TOOL,
+            &status_tool("FAIL", "s"),
             serde_json::json!({}),
         );
         let mut catalog = super::catalog().unwrap();

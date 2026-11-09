@@ -1,6 +1,9 @@
 //! BaradWatchU Tray Companion: system tray icon, native notifications and the local consent
 //! window. It only talks to the locally installed agent; it never audits by itself and
 //! closing it does not stop the agent or the dashboard.
+// Windows: GUI subsystem, so starting the tray (Start menu, login) opens no console window.
+// Command-line output is handled by `platform::attach_parent_console`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 mod agent;
 mod app;
 mod icon;
@@ -46,6 +49,11 @@ fn autostart(action: &str) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
+    // Command-line mode only: the running tray stays detached from any terminal.
+    #[cfg(windows)]
+    if std::env::args_os().len() > 1 {
+        platform::attach_parent_console();
+    }
     let args: Vec<String> = match std::env::args_os()
         .skip(1)
         .map(|arg| arg.into_string())
