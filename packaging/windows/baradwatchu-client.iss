@@ -77,6 +77,9 @@ Source: "{#StageDir}\share\*"; DestDir: "{app}\share"; Flags: ignoreversion recu
 [InstallDelete]
 ; Hashed Angular bundles change name between versions: replace the web folder as a whole.
 Type: filesandordirs; Name: "{app}\share\baradwatchu-client\web"
+; Every audit reports files that the agent's embedded manifest does not list: replace the
+; built-in check folders as a whole so an upgrade never leaves an old check file behind.
+Type: filesandordirs; Name: "{app}\share\baradwatchu-client\catalog\checks-windows"
 
 [Icons]
 Name: "{group}\{cm:Dashboard}"; Filename: "{app}\bin\baradwatchu-agent.exe"; Parameters: "dashboard"; WorkingDir: "{app}\bin"; Comment: "{cm:DashboardComment}"

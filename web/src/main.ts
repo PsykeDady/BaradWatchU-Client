@@ -9,13 +9,16 @@ type Integrity = 'VERIFIED' | 'MISMATCH' | 'UNKNOWN';
 type View = 'overview' | 'custom' | 'notifications' | 'settings';
 type StatusFilter = 'ALL' | 'FAIL' | 'WARN' | 'ERROR' | 'PASS' | 'PENDING';
 interface Provenance { toolId: string; toolVersion?: number; origin: 'BUILTIN' | 'CUSTOM'; toolPath?: string; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; integrityScope: string; isOverride: boolean; overrideBuiltinId?: string; builtinToolPath?: string; builtinExpectedSha256?: string; }
-interface Requirement { id: string; name: string; description: string; enabled: boolean; priority: Priority; parameters: Record<string, unknown>; arguments: string[]; timeoutSeconds: number; tools: Record<string, string>; configurationError?: string; origin: 'BUILTIN' | 'CUSTOM'; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; replacesBuiltin?: string; customToolId?: string; customToolVersion?: number; }
+interface Requirement { id: string; name: string; description: string; enabled: boolean; priority: Priority; parameters: Record<string, unknown>; arguments: string[]; timeoutSeconds: number; tools: Record<string, string>; configurationError?: string; origin: 'BUILTIN' | 'CUSTOM'; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; replacesBuiltin?: string; customToolId?: string; customToolVersion?: number; configurationOverride?: boolean; }
 interface AuditResult { id: string; name: string; description?: string; priority: Priority; status: ResultStatus; complianceStatus?: ResultStatus; summary: string; details: string[]; completedAtUnixMs: number; provenance?: Provenance; }
 interface PdfArtifact { status: 'GENERATED' | 'FAILED'; path?: string; error?: string; warning?: string; }
-interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; }
+interface ProviderResult { requirementId: string; providerId: string; name?: string; origin: 'BUILTIN' | 'CUSTOM'; required: boolean; status: ResultStatus; summary: string; details: string[]; }
+interface InstalledFile { requirementId: string; path: string; expectedSha256?: string; actualSha256?: string; state: 'VERIFIED' | 'MODIFIED' | 'MISSING' | 'UNEXPECTED' | 'UNSAFE'; }
+interface InstallationIntegrity { status: Integrity; platform: string; manifestSha256: string; verifiedFiles: number; files: InstalledFile[]; }
+interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; extensions?: { providers?: ProviderResult[] }; installation?: InstallationIntegrity; }
 interface ReportThemeOption { id: string; name: string; logoPath: string | null; primaryColor: string; secondaryColor: string; accentColor: string; }
 interface ReportThemeCatalog { schemaVersion: string; selectedThemeId: string; themes: ReportThemeOption[]; }
-interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; }
+interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; obsoleteSettingsFile?: string | null; }
 interface HistoryUsage { audits: number; files: number; bytes: number; }
 interface HistoryRemoval { removedAudits: number; removedFiles: number; freedBytes: number; usage: HistoryUsage; }
 interface HistoryEntry { completedAtUnixMs: number; overallStatus: ResultStatus; pass: number; fail: number; warn: number; error: number; other: number; }
@@ -90,6 +93,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           </div>
           <div class="settings-row report-meta" *ngIf="visibleReport as report">
             <span>{{ t('ui.pdf.client') }} {{ report.client?.version || 'legacy' }} · SHA-256 <code>{{ report.client?.sha256 || report.client?.sha256Error || t('ui.value.unavailable') }}</code></span>
+            <span *ngIf="report.installation as installation" [class.integrity-warning]="installation.status !== 'VERIFIED'" [attr.title]="installationProblems(installation)">{{ installationText(installation) }}</span>
             <a class="button secondary small" *ngIf="report.pdf?.status === 'GENERATED'" href="#" (click)="openPdf(report, $event)">{{ t('ui.pdf.open') }}</a>
             <span class="hint" *ngIf="report.pdf?.status === 'GENERATED'">{{ t('ui.pdf.saved') }} <code>{{ report.pdf?.path }}</code></span>
             <span class="hint" *ngIf="report.pdf?.warning">{{ t('ui.pdf.warning') }} {{ report.pdf?.warning }}</span>
@@ -117,7 +121,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <div class="requirement-head">
                 <span class="status-dot" [attr.data-status]="statusOf(item)" aria-hidden="true"></span>
                 <div class="requirement-title">
-                  <div class="tags"><span class="requirement-id">{{ item.id }}</span><span class="priority" [attr.data-priority]="item.priority">{{ priorityText(item.priority) }}</span><span class="tag custom" *ngIf="item.origin === 'CUSTOM' && !item.replacesBuiltin">{{ t('ui.tag.custom') }}</span><span class="tag override" *ngIf="item.replacesBuiltin">{{ t('ui.tag.replaced_by') }} {{ item.customToolId }}</span><span class="tag danger" *ngIf="item.configurationError">{{ t('ui.tag.invalid') }}</span><span class="tag danger" *ngIf="!item.configurationError && item.integrityStatus === 'MISMATCH'">{{ t('ui.tag.modified') }}</span><span class="tag muted" *ngIf="!item.enabled">{{ t('ui.tag.disabled') }}</span></div>
+                  <div class="tags"><span class="requirement-id">{{ item.id }}</span><span class="priority" [attr.data-priority]="item.priority">{{ priorityText(item.priority) }}</span><span class="tag custom" *ngIf="item.origin === 'CUSTOM' && !item.replacesBuiltin">{{ t('ui.tag.custom') }}</span><span class="tag override" *ngIf="item.replacesBuiltin">{{ item.configurationOverride ? t('ui.tag.configured_by') : t('ui.tag.replaced_by') }} {{ item.customToolId }}</span><span class="tag danger" *ngIf="item.configurationError">{{ t('ui.tag.invalid') }}</span><span class="tag danger" *ngIf="!item.configurationError && item.integrityStatus === 'MISMATCH'">{{ t('ui.tag.modified') }}</span><span class="tag muted" *ngIf="!item.enabled">{{ t('ui.tag.disabled') }}</span></div>
                   <h3>{{ item.name }}</h3>
                 </div>
                 <span *ngIf="resultFor(item.id) as result" class="status-badge" [attr.data-status]="result.status">{{ statusLabel(result.status) }}</span>
@@ -132,15 +136,20 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
                   <div *ngIf="resultFor(item.id) as result" class="result-detail-block">
                     <h4>{{ t('ui.requirement.result_date') }} {{ formatDate(result.completedAtUnixMs) }}</h4>
                     <ul *ngIf="result.details.length" class="evidence"><li *ngFor="let detail of result.details">{{ detail }}</li></ul>
+                    <div *ngIf="providersFor(item.id).length" class="providers">
+                      <h4>{{ t('ui.providers.title') }}</h4>
+                      <ul class="evidence"><li *ngFor="let provider of providersFor(item.id)"><strong>{{ provider.name || provider.providerId }}</strong> · {{ provider.status }} · {{ provider.required ? t('ui.providers.required') : t('ui.providers.optional') }} — {{ provider.summary }}<ul *ngIf="provider.details.length"><li *ngFor="let detail of provider.details">{{ detail }}</li></ul></li></ul>
+                    </div>
                   </div>
                   <p *ngIf="!resultFor(item.id)" class="no-result">{{ viewingHistory && historyLoading ? t('ui.history.loading') : t('ui.details.no_result') }}</p>
                   <p *ngIf="viewingHistory" class="history-config-note">{{ t('ui.details.current_settings') }}</p>
                   <div class="settings-row">
                     <label class="toggle"><input type="checkbox" [checked]="item.enabled" [disabled]="busy || saving || viewingHistory" (change)="setEnabled(item, $event)"><span>{{ item.enabled ? t('ui.requirement.enabled') : t('ui.requirement.disabled') }}</span></label>
-                    <label class="priority-label">{{ t('ui.custom.priority') }}<select [value]="item.priority" [disabled]="saving || viewingHistory" (change)="setPriority(item, $event)"><option *ngFor="let p of priorities" [value]="p">{{ priorityText(p) }}</option></select></label>
+                    <label class="priority-label">{{ t('ui.custom.priority') }}<select [disabled]="saving || viewingHistory" (change)="setPriority(item, $event)"><option *ngFor="let p of priorities" [value]="p" [selected]="p === item.priority">{{ priorityText(p) }}</option></select></label>
                     <button *ngIf="!viewingHistory" class="button secondary" type="button" [disabled]="busy || saving || !item.enabled" (click)="check(item)">{{ t('ui.check.now') }}</button>
                     <button *ngIf="item.origin === 'CUSTOM'" class="text-button" type="button" (click)="go('custom')">{{ t('ui.requirement.manage_custom') }}</button>
                   </div>
+                  <p class="hint" *ngIf="item.origin === 'BUILTIN' && !viewingHistory">{{ t('ui.requirement.override_hint').replace('{id}', 'CUSTOM-' + item.id) }}</p>
                   <details class="technical">
                     <summary>{{ t('ui.requirement.advanced') }}</summary>
                     <p class="hint">{{ t('ui.requirement.parameters_hint') }} <code>{{ '{"requirementId":…,"parameters":{…}}' }}</code>.</p>
@@ -225,6 +234,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <section aria-labelledby="custom-list-title">
             <div class="section-heading"><div><p class="eyebrow">{{ t('ui.custom.installed') }}</p><h2 id="custom-list-title">{{ t('ui.custom.mine') }}</h2></div><span class="section-count">{{ customs.length }}</span></div>
             <div *ngIf="ignoredFolders.length" class="notice warn"><span class="notice-icon">!</span><span>{{ t('ui.custom.ignored_prefix') }} {{ ignoredFolders.join(', ') }}.</span></div>
+            <div *ngIf="obsoleteSettingsFile" class="problem">{{ t('ui.custom.obsolete_settings') }} <code>{{ obsoleteSettingsFile }}</code></div>
             <div *ngIf="customs.length === 0" class="empty-card column">
               <strong>{{ t('ui.custom.none') }}</strong>
               <span>{{ t('ui.custom.create_hint') }} <code>{{ customChecksDir || '~/.config/baradwatchu/custom-checks' }}</code> {{ t('ui.custom.create_hint_end') }}</span>
@@ -246,11 +256,12 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
                 <dt>{{ t('ui.custom.tool') }}</dt><dd><code>{{ toolPath(item) }}</code></dd>
                 <dt>{{ t('ui.custom.integrity') }}</dt><dd><span class="integrity" [attr.data-integrity]="item.integrityStatus">{{ integrityText(item.integrityStatus) }}</span></dd>
                 <dt>SHA-256</dt><dd><code>{{ item.expectedSha256 }}</code></dd>
+                <ng-container *ngIf="item.configurationOverride"><dt>{{ t('ui.custom.local_values') }}</dt><dd>{{ t('ui.custom.configuration_only') }} <code>{{ parametersJson(item) }}</code></dd></ng-container>
               </dl>
               <div class="custom-actions">
                 <button class="button secondary small" type="button" *ngIf="!item.configurationError" [disabled]="busy || saving || !item.enabled || item.integrityStatus !== 'VERIFIED'" (click)="check(item)">{{ t('ui.custom.check_now') }}</button>
-                <button class="button secondary small" type="button" *ngIf="canAccept(item)" [disabled]="saving" (click)="acceptCustom(item)">{{ t('ui.custom.accept') }}</button>
-                <label class="button secondary small file-button" *ngIf="!item.configurationError">{{ t('ui.custom.upload') }}<input type="file" (change)="updateCustom(item, $event)" [disabled]="saving"></label>
+                <button class="button secondary small" type="button" *ngIf="canAccept(item) && !item.configurationOverride" [disabled]="saving" (click)="acceptCustom(item)">{{ t('ui.custom.accept') }}</button>
+                <label class="button secondary small file-button" *ngIf="!item.configurationError && !item.configurationOverride">{{ t('ui.custom.upload') }}<input type="file" (change)="updateCustom(item, $event)" [disabled]="saving"></label>
                 <button class="button secondary small" type="button" *ngIf="item.replacesBuiltin" [disabled]="saving" (click)="restoreBuiltin(item)">{{ t('ui.custom.restore') }} {{ item.replacesBuiltin }}</button>
                 <span class="spacer"></span>
                 <button class="button danger small" type="button" [disabled]="saving" (click)="removeCustom(item)">{{ t('ui.custom.delete') }}</button>
@@ -395,6 +406,7 @@ class AppComponent implements OnInit {
   view: View = 'overview';
   requirements: Requirement[] = [];
   customChecksDir = '';
+  obsoleteSettingsFile: string | null = null;
   ignoredFolders: string[] = [];
   currentReport: AuditReport | null = null;
   history: HistoryEntry[] = [];
@@ -425,6 +437,7 @@ class AppComponent implements OnInit {
   t(key: string): string { return this.uiMessages?.messages[key] ?? key; }
   get visibleReport(): AuditReport | null { return this.viewingHistory ? this.historicalReport : this.currentReport; }
   get counts(): SummaryCounts { return this.visibleReport ? this.countsFor(this.visibleReport) : { pass: 0, fail: 0, warn: 0, error: 0, other: 0 }; }
+  parametersJson(item: Requirement): string { return JSON.stringify(item.parameters ?? {}); }
   get customs(): Requirement[] { return this.requirements.filter(item => item.origin === 'CUSTOM'); }
   get pendingConsents(): number { return this.notifications?.consents.filter(item => item.state === 'PENDING').length ?? 0; }
   get trayText(): string { const running = this.notifications?.trayRunning; return this.t(running === true ? 'ui.settings.tray_active' : running === false ? 'ui.settings.tray_inactive' : 'ui.settings.tray_unknown'); }
@@ -569,6 +582,12 @@ class AppComponent implements OnInit {
 
   showCurrent(): void { this.selectedHistoryStamp = null; this.historicalReport = null; }
   resultFor(id: string): AuditResult | undefined { return this.visibleReport?.results.find(result => result.id === id); }
+  providersFor(id: string): ProviderResult[] { return (this.visibleReport?.extensions?.providers ?? []).filter(provider => provider.requirementId === id); }
+  installationText(installation: InstallationIntegrity): string {
+    return this.t(installation.status === 'VERIFIED' ? 'ui.installation.verified' : 'ui.installation.mismatch')
+      .replace('{verified}', String(installation.verifiedFiles)).replace('{files}', String(installation.files.length));
+  }
+  installationProblems(installation: InstallationIntegrity): string { return installation.files.filter(file => file.state !== 'VERIFIED').map(file => `${file.path}: ${file.state}`).join('\n'); }
   statusOf(item: Requirement): string { return this.resultFor(item.id)?.status ?? 'PENDING'; }
   trackById(_: number, item: Requirement): string { return item.id; }
   overallStatus(report: AuditReport): ResultStatus {
@@ -761,6 +780,7 @@ class AppComponent implements OnInit {
   private setData(data: DashboardData): void {
     this.requirements = data.requirements.map(item => ({ ...item, parameters: item.parameters ?? {}, arguments: item.arguments ?? [] }));
     this.customChecksDir = data.customChecksDir ?? '';
+    this.obsoleteSettingsFile = data.obsoleteSettingsFile ?? null;
     this.ignoredFolders = data.ignoredFolders ?? [];
     this.parameterText = Object.fromEntries(this.requirements.map(item => [item.id, JSON.stringify(item.parameters, null, 2)]));
   }

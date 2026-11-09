@@ -17,6 +17,12 @@ struct Fixture {
     root: PathBuf,
 }
 
+/// Tests run in parallel threads: a process forked while another thread still has a script
+/// open for writing inherits that descriptor, and exec of the script then fails with ETXTBSY
+/// ("Text file busy"). Writing executables and spawning share this lock, so no fork happens
+/// while an executable is being written.
+static EXEC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Fixture {
     fn new(label: &str) -> Self {
         let nonce = SystemTime::now()
@@ -43,6 +49,9 @@ impl Fixture {
     }
 
     fn executable(&self, relative: &str, content: &str) {
+        let _guard = EXEC_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.write(relative, content);
         fs::set_permissions(self.path(relative), fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -69,7 +78,12 @@ impl Fixture {
         for (key, value) in env {
             command.env(key, value);
         }
-        let mut child = command.spawn().unwrap();
+        let mut child = {
+            let _guard = EXEC_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            command.spawn().unwrap()
+        };
         let mut stdin = child.stdin.take().unwrap();
         if let Some(parameters) = parameters {
             let input = serde_json::json!({"requirementId": "REQ", "parameters": parameters});
@@ -318,7 +332,7 @@ fn antivirus_fixture() -> Fixture {
     fixture.install(
         &[(
             "check.sh",
-            include_str!("../../../catalog/checks/REQ-002/check.sh"),
+            include_str!("../../../catalog/checks/REQ-002/providers/clamav.sh"),
         )],
         &replacements,
     );
@@ -470,4 +484,163 @@ fn encryption_accepts_luks_ecryptfs_home_or_cryfs_and_fails_without_any() {
     fs::remove_file(fixture.path("bin/lsblk")).unwrap();
     let unknown = fixture.run(&[], None);
     assert_eq!(unknown["status"], "WARN");
+}
+
+// ------------------------------------------- REQ-002 provider Bitdefender GravityZone (Linux)
+
+/// GravityZone provider with stub `systemctl` and a fake BEST install. Stub knobs: UNITS
+/// ("unit:state" list), ACTIVE / FAILED unit lists, SYSTEMD=unknown, AM (on-access value),
+/// AGE (days since last update), BDOUT=garbage (unrecognised output).
+fn gravityzone_fixture() -> Fixture {
+    let fixture = Fixture::new("req002-gz");
+    let systemctl = bin(&fixture, "systemctl");
+    fixture.install(
+        &[(
+            "check.sh",
+            include_str!("../../../catalog/checks/REQ-002/providers/bitdefender-gravityzone.sh"),
+        )],
+        &[
+            (systemctl.0.as_str(), systemctl.1.clone()),
+            (
+                "/opt/BitDefender/bin/bduitool",
+                fixture.path("missing/bduitool"),
+            ),
+        ],
+    );
+    fixture.executable(
+        "bin/systemctl",
+        r#"#!/usr/bin/bash
+case $1 in
+  list-unit-files)
+    if [[ ${SYSTEMD:-ok} == unknown ]]; then echo 'Failed to connect to bus'; exit 1; fi
+    for unit in ${UNITS-bdsec.service:enabled bdsec-daemon.service:enabled bdsec-minidump.service:static}; do
+      echo "${unit%%:*} ${unit##*:} enabled"
+    done ;;
+  is-active)
+    case " ${ACTIVE-bdsec.service bdsec-daemon.service} " in *" $2 "*) echo active; exit 0;; esac
+    case " ${FAILED:-} " in *" $2 "*) echo failed; exit 3;; esac
+    echo inactive; exit 3 ;;
+esac
+"#,
+    );
+    fixture.executable(
+        "gz/bin/bduitool",
+        r#"#!/usr/bin/bash
+[[ $1 == get && $2 == ps ]] || exit 2
+if [[ ${BDOUT:-} == garbage ]]; then echo 'unexpected output'; exit 0; fi
+echo "Product version: 7.9.1"
+echo "Antimalware status: ${AM:-On}"
+echo "Last update: $(/usr/bin/date -d "-${AGE:-0} days" '+%Y-%m-%d %H:%M:%S')"
+echo "Company: abc123"
+"#,
+    );
+    fs::create_dir_all(fixture.path("gz/var/log")).unwrap();
+    fixture.write("gz/etc/manifest.json", r#"{"version":"7.9.1"}"#);
+    fixture
+}
+
+fn gz_parameters(fixture: &Fixture, extra: Value) -> Option<Value> {
+    let mut parameters = serde_json::json!({
+        "installDir": fixture.path("gz").to_string_lossy(),
+        "maxSignatureAgeDays": 3,
+        "expectedCompanyId": ""
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        parameters[key] = value.clone();
+    }
+    Some(parameters)
+}
+
+#[test]
+fn gravityzone_provider_requires_services_on_access_and_fresh_signatures() {
+    let fixture = gravityzone_fixture();
+    let run = |env: &[(&str, &str)], extra: Value| fixture.run(env, gz_parameters(&fixture, extra));
+    let none = serde_json::json!({});
+
+    let compliant = run(&[], none.clone());
+    assert_eq!(compliant["status"], "PASS", "{compliant}");
+    assert!(compliant["details"].to_string().contains("7.9.1"));
+
+    let absent = fixture.run(
+        &[],
+        Some(serde_json::json!({"installDir": "/nonexistent-bitdefender"})),
+    );
+    assert_eq!(absent["status"], "FAIL", "{absent}");
+    assert!(summary(&absent).contains("non risulta installato"));
+
+    let main_off = run(&[("ACTIVE", "bdsec-daemon.service")], none.clone());
+    assert_eq!(main_off["status"], "FAIL", "{main_off}");
+    assert!(summary(&main_off).contains("bdsec.service"));
+
+    let disabled = run(&[("UNITS", "bdsec.service:disabled")], none.clone());
+    assert_eq!(disabled["status"], "FAIL", "{disabled}");
+
+    let all_off = run(&[("ACTIVE", "")], none.clone());
+    assert_eq!(all_off["status"], "FAIL");
+    assert!(summary(&all_off).contains("nessun servizio bdsec* attivo"));
+
+    let no_units = run(&[("UNITS", "")], none.clone());
+    assert_eq!(no_units["status"], "FAIL");
+
+    let crashed = run(
+        &[
+            ("FAILED", "bdsec-epagng.service"),
+            (
+                "UNITS",
+                "bdsec.service:enabled bdsec-epagng.service:enabled",
+            ),
+        ],
+        none.clone(),
+    );
+    assert_eq!(crashed["status"], "FAIL", "{crashed}");
+    assert!(summary(&crashed).contains("in errore"));
+
+    let on_access_off = run(&[("AM", "Off")], none.clone());
+    assert_eq!(on_access_off["status"], "FAIL");
+    assert!(summary(&on_access_off).contains("on-access"));
+
+    let stale = run(&[("AGE", "10")], none.clone());
+    assert_eq!(stale["status"], "FAIL");
+    assert!(summary(&stale).contains("10 giorni"));
+    assert_eq!(
+        run(
+            &[("AGE", "10")],
+            serde_json::json!({"maxSignatureAgeDays": 30})
+        )["status"],
+        "PASS"
+    );
+}
+
+#[test]
+fn gravityzone_provider_never_passes_what_it_cannot_observe() {
+    let fixture = gravityzone_fixture();
+    let run = |env: &[(&str, &str)], extra: Value| fixture.run(env, gz_parameters(&fixture, extra));
+    let none = serde_json::json!({});
+
+    let systemd = run(&[("SYSTEMD", "unknown")], none.clone());
+    assert_eq!(systemd["status"], "WARN", "{systemd}");
+
+    let garbage = run(&[("BDOUT", "garbage")], none.clone());
+    assert_eq!(garbage["status"], "WARN", "{garbage}");
+
+    // Matching company found in the product status; an unknown one is not verifiable.
+    assert_eq!(
+        run(&[], serde_json::json!({"expectedCompanyId": "abc123"}))["status"],
+        "PASS"
+    );
+    let other = run(&[], serde_json::json!({"expectedCompanyId": "zzz999"}));
+    assert_eq!(other["status"], "WARN");
+    assert!(summary(&other).contains("zzz999"));
+
+    let invalid = run(&[], serde_json::json!({"maxSignatureAgeDays": -1}));
+    assert_eq!(invalid["status"], "ERROR");
+
+    // bduitool needs root (it writes its own log): without a writable log folder the product
+    // status is not read and the result is at most WARN.
+    fs::remove_dir_all(fixture.path("gz/var/log")).unwrap();
+    let unprivileged = run(&[], none.clone());
+    assert_eq!(unprivileged["status"], "WARN", "{unprivileged}");
+    assert!(summary(&unprivileged).contains("root"));
+    let unprivileged_off = run(&[("ACTIVE", "")], none);
+    assert_eq!(unprivileged_off["status"], "FAIL");
 }

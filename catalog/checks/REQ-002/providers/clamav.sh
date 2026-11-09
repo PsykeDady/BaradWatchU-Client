@@ -1,5 +1,7 @@
 #!/usr/bin/bash
 set -u -o pipefail
+# REQ-002 provider "clamav": ClamAV (clamd + freshclam + clamonacc). Output contract: builtin
+# JSON {id, status, summary, details}; the agent combines providers via acceptedProviders.
 id=REQ-002
 if ! /usr/bin/pacman -Q clamav >/dev/null 2>&1; then
   printf '{"id":"%s","status":"FAIL","summary":"ClamAV non risulta installato","details":["pacman -Q clamav non ha trovato il pacchetto"]}' "$id"

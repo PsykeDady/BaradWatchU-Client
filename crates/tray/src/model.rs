@@ -270,17 +270,7 @@ pub fn summary_in(
                 .replace("{error}", error),
         );
     } else {
-        lines.push(
-            baradwatchu_messages::message(
-                if language.effective() == baradwatchu_messages::Language::Italian {
-                    "tray.no_audit"
-                } else {
-                    "tray.no_audit"
-                },
-                language,
-            )
-            .to_owned(),
-        );
+        lines.push(baradwatchu_messages::message("tray.no_audit", language).to_owned());
     }
     lines.push(
         baradwatchu_messages::message("tray.summary.pending", language)
@@ -504,7 +494,13 @@ mod tests {
         let notes = notifier.on_snapshot(&snapshot(6, events, Preferences::default()));
         assert_eq!(notes.len(), MAX_NOTES_PER_POLL + 1);
         assert_eq!(notes[0].title, "e6");
-        assert!(notes.last().unwrap().body.contains("Altri 3"));
+        // The text follows the configured language: compare with the catalog, not a literal.
+        let expected = baradwatchu_messages::message(
+            "tray.notice.more_body",
+            baradwatchu_messages::configured_language(),
+        )
+        .replace("{count}", "3");
+        assert_eq!(notes.last().unwrap().body, expected);
     }
 
     #[test]

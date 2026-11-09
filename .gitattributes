@@ -1,3 +1,7 @@
 # Windows builtin checks are hashed byte for byte (catalog/builtin-tools.sha256): keep them
 # CRLF (and their UTF-8 BOM, which Windows PowerShell 5.1 needs) on every checkout.
 *.ps1 text eol=crlf
+# Every other built-in check file is hashed too: pin LF so Windows (autocrlf) and Linux
+# checkouts have the same bytes as the manifest.
+catalog/checks/** text eol=lf
+catalog/checks-windows/**/*.json text eol=lf

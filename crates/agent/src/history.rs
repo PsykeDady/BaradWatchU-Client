@@ -403,7 +403,7 @@ mod tests {
         assert_eq!(audits[0].overall_status, None);
         assert_eq!((audits[0].files, audits[0].bytes), (2, 5));
         let out = run(&["history".into(), "x".into()][1..]).unwrap_err();
-        assert!(out.0.starts_with("Usage: history"));
+        assert!(out.0.starts_with("Uso: history"), "{}", out.0);
         assert!(
             run(&[OsString::from("clear")]).is_err(),
             "clear needs --yes"

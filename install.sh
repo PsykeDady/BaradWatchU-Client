@@ -383,19 +383,14 @@ validate_build() {
     echo "Validated build $BUILD_DIR ($platform, $VERSION)"
 }
 validate_requirement_assets() {
+    # The trusted manifest lists every file of every built-in check folder (one line per file).
+    # Each listed file must be installed with that hash, nothing unlisted may sit in the check
+    # folders, and every check configuration must reference only listed files.
     python3 -c '
 import hashlib, json, os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 base = "share/baradwatchu-client/"
 checks_relative = base + "catalog/checks"
-required_helpers = [
-    "catalog/checks/REQ-003/ufw.sh", "catalog/checks/REQ-003/firewalld.sh",
-    "catalog/checks/REQ-003/nftables.sh",
-    "catalog/checks/REQ-004/dnsmasq.sh", "catalog/checks/REQ-004/hosts.sh",
-    "catalog/checks/REQ-005/cato.sh", "catalog/checks/REQ-005/wireguard.sh",
-    "catalog/checks/REQ-006/luks.sh", "catalog/checks/REQ-006/ecryptfs.sh",
-    "catalog/checks/REQ-006/cryfs.sh",
-]
 try:
     def safe_file(relative, executable=False):
         parts = pathlib.Path(relative).parts
@@ -403,6 +398,9 @@ try:
             return False
         path = root / relative
         return path.is_file() and (not executable or os.access(path, os.X_OK))
+    def safe_relative(value):
+        path = pathlib.PurePosixPath(value)
+        return bool(value) and not path.is_absolute() and all(part not in ("..", "") for part in path.parts)
     checks_dir = root / checks_relative
     if checks_dir.is_symlink() or not checks_dir.is_dir():
         raise ValueError("check folders missing or symlink")
@@ -411,42 +409,55 @@ try:
     digest_path = root / "share/baradwatchu-client/catalog/builtin-tools.sha256"
     if not safe_file("share/baradwatchu-client/catalog/builtin-tools.sha256"):
         raise ValueError("builtin hash manifest missing or symlink")
-    hashes = {}
+    entries, ids = {}, set()
     for line in digest_path.read_text(encoding="ascii").splitlines():
-        ident, platform, tool, digest = line.split()
+        ident, platform, path, digest = line.split()
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("invalid builtin hash entry")
-        hashes[(ident, platform)] = (tool, digest)
+        if platform != "linux":
+            continue
+        if not path.startswith(f"catalog/checks/{ident}/") or not safe_relative(path) or path in entries:
+            raise ValueError("invalid builtin hash path")
+        entries[path] = digest
+        ids.add(ident)
+    for path, digest in entries.items():
+        if not safe_file(base + path, executable=path.endswith(".sh")):
+            raise ValueError("builtin check file missing, non-executable, or symlink")
+        if hashlib.sha256((root / base / path).read_bytes()).hexdigest() != digest:
+            raise ValueError("builtin hash manifest mismatch")
+    installed = set()
+    for path in checks_dir.rglob("*"):
+        if path.is_symlink():
+            raise ValueError("symlink in check folders")
+        if path.is_file():
+            installed.add(path.relative_to(root / base).as_posix())
+    if installed != set(entries):
+        raise ValueError("check folders contain unlisted files or miss listed ones")
     discovered = set()
     for folder in checks_dir.iterdir():
         if folder.is_symlink() or not folder.is_dir():
             raise ValueError("unsafe check folder")
         ident = folder.name
-        config_relative = f"{checks_relative}/{ident}/configuration.json"
-        if not safe_file(config_relative):
-            raise ValueError("check configuration missing or symlink")
-        config = json.loads((root / config_relative).read_text(encoding="utf-8"))
+        prefix = f"catalog/checks/{ident}/"
+        config = json.loads((folder / "configuration.json").read_text(encoding="utf-8"))
         if config.get("id") != ident or config.get("schemaVersion") != "baradwatchu.custom-checks.v1":
             raise ValueError("invalid check configuration identity")
-        tool_path = pathlib.Path(config.get("toolPath", ""))
-        if tool_path.is_absolute() or any(part in ("..", "") for part in tool_path.parts):
-            raise ValueError("unsafe relative tool path")
-        relative = f"{checks_relative}/{ident}/{tool_path}"
-        if not safe_file(relative, executable=True):
-            raise ValueError("tool missing, non-executable, or symlink")
-        digest = hashlib.sha256((root / relative).read_bytes()).hexdigest()
-        entry = hashes.get((ident, "linux"))
-        asset_relative = relative.removeprefix(base)
-        if entry != (asset_relative, digest) or config.get("expectedSha256") != digest:
-            raise ValueError("builtin tool hash manifest mismatch")
-        if ident in discovered:
-            raise ValueError("duplicate check ID")
+        tool_path = config.get("toolPath")
+        providers = config.get("providers") or {}
+        if tool_path and not providers:
+            tool = str(pathlib.PurePosixPath(prefix) / tool_path)
+            if not safe_relative(tool_path) or entries.get(tool) != config.get("expectedSha256"):
+                raise ValueError("builtin tool hash manifest mismatch")
+        elif providers and not tool_path and "expectedSha256" not in config:
+            for provider in providers.values():
+                tool = str(pathlib.PurePosixPath(prefix) / provider["toolPath"])
+                if not safe_relative(provider["toolPath"]) or tool not in entries:
+                    raise ValueError("provider tool not in builtin hash manifest")
+        else:
+            raise ValueError("check configuration needs toolPath or providers")
         discovered.add(ident)
-    if not discovered or {ident for ident, platform in hashes if platform == "linux"} != discovered:
+    if not discovered or discovered != ids:
         raise ValueError("builtin hash manifest does not match discovered folders")
-    for relative in required_helpers:
-        if not safe_file("share/baradwatchu-client/" + relative, executable=True):
-            raise ValueError("method tool missing, non-executable, or symlink")
 except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
 ' "$1"

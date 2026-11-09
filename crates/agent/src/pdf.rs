@@ -120,7 +120,10 @@ fn theme_catalog() -> Result<ThemeCatalog, String> {
             for entry in entries {
                 let entry = entry.map_err(|error| format!("elenco temi non leggibile: {error}"))?;
                 let path = entry.path();
-                if path.extension().is_none_or(|extension| extension != "json") {
+                if path
+                    .extension()
+                    .map_or(true, |extension| extension != "json")
+                {
                     continue;
                 }
                 let metadata = fs::symlink_metadata(&path)
@@ -1008,6 +1011,27 @@ fn draw_summary(
             .replace("{mismatches}", &integrity.1.to_string())
             .replace("{unknown}", &integrity.2.to_string()),
     ));
+    if let Some(installation) = &report.installation {
+        bottom -= 11.0;
+        let verified = installation.status == crate::requirements::IntegrityStatus::Verified;
+        ops.push(text_op(
+            MARGIN,
+            bottom,
+            7.6,
+            !verified,
+            if verified { muted } else { accent },
+            &baradwatchu_messages::message(
+                if verified {
+                    "pdf.installation_verified"
+                } else {
+                    "pdf.installation_mismatch"
+                },
+                language,
+            )
+            .replace("{verified}", &installation.verified_files.to_string())
+            .replace("{files}", &installation.files.len().to_string()),
+        ));
+    }
     ops.push(format!(
         "{} RG 0.8 w {} {} m 557 {} l S",
         rgb(accent),
@@ -2202,10 +2226,12 @@ mod tests {
     #[test]
     fn dashboard_lists_default_theme_and_stores_selection_in_user_configuration() {
         let _env = req::TestEnv::new("pdf-theme");
-        let initial: ThemeCatalog = serde_json::from_str(&dashboard_theme_json().unwrap()).unwrap();
-        assert_eq!(initial.selected_theme_id, DEFAULT_THEME_ID);
-        assert_eq!(initial.themes.len(), 1);
-        assert_eq!(initial.themes[0].accent_color, "#B3262D");
+        // ThemeCatalog is serialize-only: read the API JSON as a value.
+        let initial: serde_json::Value =
+            serde_json::from_str(&dashboard_theme_json().unwrap()).unwrap();
+        assert_eq!(initial["selectedThemeId"], DEFAULT_THEME_ID);
+        assert_eq!(initial["themes"].as_array().unwrap().len(), 1);
+        assert_eq!(initial["themes"][0]["accentColor"], "#B3262D");
         let themes = themes_dir().unwrap();
         fs::create_dir_all(&themes).unwrap();
         let custom = serde_json::json!({
@@ -2213,10 +2239,10 @@ mod tests {
             "logoPath": null, "primaryColor": "#202020", "secondaryColor": "#FAFAFA", "accentColor": "#B3262D"
         });
         fs::write(themes.join("custom-test.json"), custom.to_string()).unwrap();
-        let saved: ThemeCatalog =
+        let saved: serde_json::Value =
             serde_json::from_str(&dashboard_update_theme(r#"{"theme":"custom-test"}"#).unwrap())
                 .unwrap();
-        assert_eq!(saved.selected_theme_id, "custom-test");
+        assert_eq!(saved["selectedThemeId"], "custom-test");
         assert_eq!(selected_theme().unwrap().primary_color, "#202020");
         assert!(theme_path().unwrap().is_file());
     }
@@ -2240,6 +2266,7 @@ mod tests {
     #[test]
     fn renderer_emits_valid_pdf_objects_and_summary_data() {
         let report = AuditReport {
+            installation: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: 1_784_000_000_000,
             results: vec![],

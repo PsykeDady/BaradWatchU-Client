@@ -180,7 +180,7 @@ fn locale_catalog(language: Language) -> &'static LocaleCatalog {
 
 /// Shared locale data is embedded from one readable JSON file per locale. If a file
 /// cannot be parsed or a key is missing, the stable key itself is shown as the label.
-pub fn message<'a>(key: &'a str, language: Language) -> &'a str {
+pub fn message(key: &str, language: Language) -> &str {
     locale_catalog(language)
         .messages
         .get(key)
@@ -188,7 +188,7 @@ pub fn message<'a>(key: &'a str, language: Language) -> &'a str {
         .unwrap_or(key)
 }
 
-fn diagnostic_template<'a>(key: &'a str, language: Language) -> &'a str {
+fn diagnostic_template(key: &str, language: Language) -> &str {
     locale_catalog(language)
         .diagnostic_templates
         .get(key)
@@ -595,6 +595,16 @@ pub fn dashboard_catalog(
         "ui.pdf.warning",
         "ui.pdf.failed",
         "ui.pdf.client",
+        "ui.providers.title",
+        "ui.providers.required",
+        "ui.providers.optional",
+        "ui.installation.verified",
+        "ui.installation.mismatch",
+        "ui.tag.configured_by",
+        "ui.requirement.override_hint",
+        "ui.custom.local_values",
+        "ui.custom.configuration_only",
+        "ui.custom.obsolete_settings",
         "ui.custom.name_placeholder",
         "ui.custom.check_now",
         "ui.custom.tool",

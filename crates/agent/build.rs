@@ -52,6 +52,14 @@ fn main() {
     for prefix in [profile.parent().unwrap(), profile] {
         let target = prefix.join("share/baradwatchu-client");
         let staged_catalog = target.join("catalog");
+        // Rebuild the staged check folders from scratch: a file removed from the source tree
+        // must not linger, since every audit reports files the manifest does not list.
+        let staged_checks = staged_catalog.join(own_checks);
+        if fs::symlink_metadata(&staged_checks)
+            .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        {
+            fs::remove_dir_all(&staged_checks).expect("Remove stale staged checks");
+        }
         fs::create_dir_all(&staged_catalog).expect("Create staged catalog directory");
         for entry in fs::read_dir(&catalog).expect("Read catalog directory") {
             let entry = entry.expect("Read catalog entry");

@@ -249,40 +249,68 @@ function Test-WebVersion {
     return ($packageVersion -eq $ProductVersion -and $lockVersion -eq $ProductVersion -and $appVersion -eq $ProductVersion)
 }
 
-# Built-in Windows checks: every folder has a valid configuration whose entrypoint hash
-# equals both the trusted manifest (platform "windows") and expectedSha256.
+# Built-in Windows checks: the trusted manifest (platform "windows") lists every file of every
+# check folder. Each listed file must be installed with that hash, nothing unlisted may sit in
+# the check folders, and each configuration references only listed files (toolPath with a
+# matching expectedSha256, or providers without expectedSha256).
 function Test-RequirementAssets([string]$ShareRoot) {
     $catalog = Join-Path $ShareRoot 'catalog'
     $checks = Join-Path $catalog 'checks-windows'
     $digest = Join-Path $catalog 'builtin-tools.sha256'
     if (-not (Test-Path -LiteralPath $checks -PathType Container)) { return 'check folders missing' }
     if (-not (Test-Path -LiteralPath $digest -PathType Leaf)) { return 'builtin hash manifest missing' }
-    $hashes = @{}
+    $entries = @{}
+    $ids = @{}
     foreach ($line in [IO.File]::ReadAllLines($digest)) {
         if (-not $line.Trim()) { continue }
         $fields = $line.Trim() -split '\s+'
         if ($fields.Count -ne 4 -or $fields[3] -notmatch '^[0-9a-f]{64}$') { return 'invalid builtin hash entry' }
-        if ($fields[1] -eq 'windows') { $hashes[$fields[0]] = @($fields[2], $fields[3]) }
+        if ($fields[1] -ne 'windows') { continue }
+        $path = $fields[2]
+        if (-not $path.StartsWith("catalog/checks-windows/$($fields[0])/") -or $path -match '(^|/)\.\.(/|$)' -or $entries.ContainsKey($path)) { return "invalid builtin hash path: $path" }
+        $entries[$path] = $fields[3]
+        $ids[$fields[0]] = $true
+    }
+    foreach ($path in $entries.Keys) {
+        $file = Join-Path $ShareRoot ($path -replace '/', '\')
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { return "builtin check file missing: $path" }
+        if ((Get-Item -LiteralPath $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { return "builtin check file is a link: $path" }
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant() -ne $entries[$path]) { return "builtin hash manifest mismatch: $path" }
+    }
+    $prefixLength = (Resolve-Path -LiteralPath $ShareRoot).ProviderPath.TrimEnd('\').Length + 1
+    foreach ($item in Get-ChildItem -LiteralPath $checks -Recurse -Force) {
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return "link in check folders: $($item.Name)" }
+        if ($item.PSIsContainer) { continue }
+        $relative = $item.FullName.Substring($prefixLength) -replace '\\', '/'
+        if (-not $entries.ContainsKey($relative)) { return "unlisted file in check folders: $relative" }
     }
     $found = @{}
     foreach ($folder in Get-ChildItem -LiteralPath $checks -Force) {
-        if (-not $folder.PSIsContainer -or ($folder.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return "unsafe check folder: $($folder.Name)" }
+        if (-not $folder.PSIsContainer) { return "unexpected file in check folders: $($folder.Name)" }
         $configPath = Join-Path $folder.FullName 'configuration.json'
         if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) { return "configuration missing: $($folder.Name)" }
         $config = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
         if ($config.id -ne $folder.Name -or $config.schemaVersion -ne 'baradwatchu.custom-checks.v1') { return "invalid check configuration identity: $($folder.Name)" }
-        $tool = "$($config.toolPath)"
-        if (-not $tool -or [IO.Path]::IsPathRooted($tool) -or $tool -match '(^|[\\/])\.\.([\\/]|$)') { return "unsafe relative tool path: $($folder.Name)" }
-        $toolPath = Join-Path $folder.FullName ($tool -replace '^\./', '')
-        if (-not (Test-Path -LiteralPath $toolPath -PathType Leaf)) { return "tool missing: $($folder.Name)" }
-        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $toolPath).Hash.ToLowerInvariant()
-        $expected = "catalog/checks-windows/$($folder.Name)/" + ($tool -replace '^\./', '')
-        if (-not $hashes.ContainsKey($folder.Name) -or $hashes[$folder.Name][0] -ne $expected -or $hashes[$folder.Name][1] -ne $hash -or $config.expectedSha256 -ne $hash) {
-            return "builtin tool hash manifest mismatch: $($folder.Name)"
+        $prefix = "catalog/checks-windows/$($folder.Name)/"
+        $tool = if ($config.PSObject.Properties['toolPath']) { "$($config.toolPath)" } else { '' }
+        $providers = if ($config.PSObject.Properties['providers'] -and $config.providers) { @($config.providers.PSObject.Properties) } else { @() }
+        if ($tool -and $providers.Count -eq 0) {
+            if ([IO.Path]::IsPathRooted($tool) -or $tool -match '(^|[\\/])\.\.([\\/]|$)') { return "unsafe relative tool path: $($folder.Name)" }
+            $expected = $prefix + ($tool -replace '^\./', '')
+            if (-not $entries.ContainsKey($expected) -or $config.expectedSha256 -ne $entries[$expected]) { return "builtin tool hash manifest mismatch: $($folder.Name)" }
+        } elseif (-not $tool -and $providers.Count -gt 0 -and -not $config.PSObject.Properties['expectedSha256']) {
+            foreach ($provider in $providers) {
+                $path = "$($provider.Value.toolPath)"
+                if (-not $path -or [IO.Path]::IsPathRooted($path) -or $path -match '(^|[\\/])\.\.([\\/]|$)') { return "unsafe provider path: $($folder.Name)" }
+                if (-not $entries.ContainsKey($prefix + ($path -replace '^\./', ''))) { return "provider not in builtin hash manifest: $($folder.Name)/$($provider.Name)" }
+            }
+        } else {
+            return "check configuration needs toolPath or providers: $($folder.Name)"
         }
         $found[$folder.Name] = $true
     }
-    if ($found.Count -eq 0 -or $found.Count -ne $hashes.Count) { return 'builtin hash manifest does not match discovered folders' }
+    if ($found.Count -eq 0 -or $found.Count -ne $ids.Count) { return 'builtin hash manifest does not match discovered folders' }
+    foreach ($id in $ids.Keys) { if (-not $found.ContainsKey($id)) { return "builtin check folder missing: $id" } }
     return $null
 }
 

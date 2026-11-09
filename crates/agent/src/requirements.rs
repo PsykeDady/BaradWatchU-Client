@@ -29,6 +29,15 @@ const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-windo
 const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks";
 /// Summary of a result blocked by the SHA-256 gate (also used to classify events).
 pub(crate) const INTEGRITY_GATE_SUMMARY: &str = "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito";
+/// Summary of a built-in control blocked because its installed folder differs from the
+/// trusted manifest embedded in the agent (also used to classify events).
+pub(crate) const INTEGRITY_FOLDER_SUMMARY: &str = "Integrità non verificata: i file installati del controllo non corrispondono al manifest dell'agente; il controllo non è stato eseguito";
+/// Installed data root, relative to the installation root; manifest paths are relative to it.
+const SHARE_DIR: &str = "share/baradwatchu-client";
+/// Trusted hash of every built-in check file (`<ID> <platform> <catalog path> <sha256>`),
+/// embedded at build time: editing the installed copy of the manifest changes nothing.
+const BUILTIN_MANIFEST: &str = include_str!("../../../catalog/builtin-tools.sha256");
+const MAX_PROVIDERS: usize = 16;
 
 fn default_timeout_seconds() -> u64 {
     DEFAULT_TIMEOUT_SECONDS
@@ -115,6 +124,41 @@ pub struct Requirement {
     pub actual_sha256: Option<String>,
     #[serde(default)]
     pub integrity_status: IntegrityStatus,
+    /// Interchangeable implementations of a built-in requirement (provider model). Empty for
+    /// single-tool controls. Combined according to the `acceptedProviders` parameter.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderSpec>,
+    /// Built-in control whose enabled/priority/parameters come from a configuration-only
+    /// CUSTOM override folder: shown as custom, but the official files still run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub configuration_override: bool,
+}
+
+impl Requirement {
+    /// Which code runs: configuration-only overrides execute the official (manifest-checked)
+    /// built-in files with the built-in contract, from the installation.
+    fn execution_origin(&self) -> ControlOrigin {
+        if self.configuration_override {
+            ControlOrigin::Builtin
+        } else {
+            self.origin
+        }
+    }
+}
+
+/// One provider of a built-in requirement, resolved from its `configuration.json`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderSpec {
+    pub id: String,
+    pub name: String,
+    /// Relative to the installation root, like `Requirement::tools`.
+    pub tool_path: String,
+    #[serde(default = "empty_parameters")]
+    pub parameters: serde_json::Value,
+    pub timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -149,6 +193,9 @@ pub struct ControlProvenance {
     pub override_builtin_id: Option<String>,
     pub builtin_tool_path: Option<String>,
     pub builtin_expected_sha256: Option<String>,
+    /// The override changes only enabled/priority/parameters; the official files ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub configuration_override: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -183,10 +230,13 @@ struct CustomEntry {
     description: String,
     priority: Priority,
     enabled: bool,
-    tool_path: String,
+    /// None for a configuration-only override of a built-in (no script of its own).
+    #[serde(default)]
+    tool_path: Option<String>,
     #[serde(default)]
     arguments: Vec<String>,
-    expected_sha256: String,
+    #[serde(default)]
+    expected_sha256: Option<String>,
     version: u64,
     #[serde(default)]
     parameters: serde_json::Value,
@@ -327,8 +377,61 @@ pub struct AuditReport {
     pub pdf: Option<PdfArtifact>,
     #[serde(default)]
     pub extensions: AuditExtensions,
+    /// Hash of every installed built-in check file compared with the manifest embedded in the
+    /// agent, computed at audit time (for the Server's installation check). Older reports omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installation: Option<InstallationIntegrity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallationIntegrity {
+    /// VERIFIED when every listed file matches; MISMATCH otherwise.
+    pub status: IntegrityStatus,
+    pub platform: String,
+    /// SHA-256 of the manifest embedded in the running agent.
+    pub manifest_sha256: String,
+    pub verified_files: usize,
+    pub files: Vec<InstalledFile>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledFile {
+    pub requirement_id: String,
+    /// Relative to the installed data root, e.g. `catalog/checks/REQ-002/providers/clamav.sh`.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_sha256: Option<String>,
+    pub state: FileState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FileState {
+    Verified,
+    Modified,
+    Missing,
+    /// Present in a built-in check folder but not in the manifest.
+    Unexpected,
+    /// Symbolic link, special file or oversized file where a regular file is expected.
+    Unsafe,
+}
+
+impl FileState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "verificato",
+            Self::Modified => "modificato",
+            Self::Missing => "mancante",
+            Self::Unexpected => "non previsto",
+            Self::Unsafe => "non sicuro",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -359,7 +462,7 @@ pub struct AuditExtensions {
     /// Future per-machine exceptions; current DISABLED results remain represented in results.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_requirements: Vec<DisabledRequirement>,
-    /// Future provider model; empty until provider execution is implemented.
+    /// Per-provider results of provider-based requirements (`required` = listed in acceptedProviders).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderResult>,
 }
@@ -384,6 +487,8 @@ pub struct DisabledRequirement {
 pub struct ProviderResult {
     pub requirement_id: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub origin: ControlOrigin,
     pub required: bool,
     pub status: ResultStatus,
@@ -440,6 +545,8 @@ fn broken_requirement(broken: BrokenCustom) -> Requirement {
         builtin_tool_path: None,
         actual_sha256: None,
         integrity_status: IntegrityStatus::Unknown,
+        providers: Vec::new(),
+        configuration_override: false,
     }
 }
 
@@ -496,16 +603,29 @@ fn catalog_with_registry() -> Result<(Catalog, CustomRegistry), CliError> {
                 .find(|r| r.id == target)
                 .expect("override target was checked against builtin IDs");
             builtin.builtin_tool_path = builtin.tools.get(platform_key()).cloned();
-            builtin.tools.insert(platform_key().into(), entry.tool_path);
-            builtin.expected_sha256 = Some(entry.expected_sha256);
-            builtin.arguments = entry.arguments;
-            builtin.timeout_seconds = entry.timeout_seconds.unwrap_or(builtin.timeout_seconds);
+            // Every local change to a built-in lives in its override folder (no settings.json):
+            // enabled, priority and parameters always come from the CUSTOM configuration.
+            builtin.enabled = entry.enabled;
+            builtin.priority = entry.priority;
+            builtin.parameters = entry.parameters;
             builtin.origin = ControlOrigin::Custom;
             builtin.replaces_builtin = Some(target);
             builtin.custom_tool_id = Some(entry.id);
             builtin.custom_tool_version = Some(entry.version);
-            builtin.enabled = entry.enabled;
-        } else {
+            match (entry.tool_path, entry.expected_sha256) {
+                (Some(tool_path), Some(expected)) => {
+                    builtin.tools.insert(platform_key().into(), tool_path);
+                    builtin.expected_sha256 = Some(expected);
+                    builtin.arguments = entry.arguments;
+                    builtin.timeout_seconds =
+                        entry.timeout_seconds.unwrap_or(builtin.timeout_seconds);
+                    // The custom tool replaces the whole built-in control, providers included.
+                    builtin.providers.clear();
+                }
+                // Configuration-only: official tool/providers, hashes and timeouts stay.
+                _ => builtin.configuration_override = true,
+            }
+        } else if let (Some(tool_path), Some(expected)) = (entry.tool_path, entry.expected_sha256) {
             value.requirements.push(Requirement {
                 id: entry.id.clone(),
                 name: entry.name,
@@ -515,16 +635,18 @@ fn catalog_with_registry() -> Result<(Catalog, CustomRegistry), CliError> {
                 parameters: entry.parameters,
                 arguments: entry.arguments,
                 timeout_seconds: entry.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS),
-                tools: BTreeMap::from([(platform_key().into(), entry.tool_path)]),
+                tools: BTreeMap::from([(platform_key().into(), tool_path)]),
                 configuration_error: None,
                 origin: ControlOrigin::Custom,
-                expected_sha256: Some(entry.expected_sha256),
+                expected_sha256: Some(expected),
                 replaces_builtin: None,
                 custom_tool_id: Some(entry.id),
                 custom_tool_version: Some(entry.version),
                 builtin_tool_path: None,
                 actual_sha256: None,
                 integrity_status: IntegrityStatus::Unknown,
+                providers: Vec::new(),
+                configuration_override: false,
             });
         }
     }
@@ -562,7 +684,11 @@ struct CheckConfiguration {
     description: String,
     priority: Priority,
     enabled: bool,
-    tool_path: String,
+    /// Single entry point; built-in controls may declare `providers` instead.
+    #[serde(default)]
+    tool_path: Option<String>,
+    #[serde(default)]
+    providers: BTreeMap<String, ProviderConfiguration>,
     #[serde(default)]
     arguments: Vec<String>,
     #[serde(default = "empty_parameters")]
@@ -575,6 +701,73 @@ struct CheckConfiguration {
     override_builtin_id: Option<String>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderConfiguration {
+    name: String,
+    tool_path: String,
+    #[serde(default = "empty_parameters")]
+    parameters: serde_json::Value,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+fn valid_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
+        })
+}
+
+/// `acceptedProviders` (mandatory providers) from requirement parameters: missing or empty
+/// means "any one provider is enough". `providerParameters` may override provider defaults.
+fn accepted_providers(
+    parameters: &serde_json::Value,
+    known: &[&str],
+) -> Result<Vec<String>, String> {
+    let accepted = match parameters.get("acceptedProviders") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut accepted = Vec::new();
+            for item in items {
+                let Some(id) = item.as_str() else {
+                    return Err("acceptedProviders deve essere un elenco di ID provider".into());
+                };
+                if !known.contains(&id) {
+                    return Err(format!(
+                        "acceptedProviders contiene un provider sconosciuto: {id}"
+                    ));
+                }
+                if !accepted.iter().any(|value| value == id) {
+                    accepted.push(id.to_owned());
+                }
+            }
+            accepted
+        }
+        Some(_) => return Err("acceptedProviders deve essere un elenco di ID provider".into()),
+    };
+    match parameters.get("providerParameters") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Object(map)) => {
+            for (id, value) in map {
+                if !known.contains(&id.as_str()) {
+                    return Err(format!(
+                        "providerParameters contiene un provider sconosciuto: {id}"
+                    ));
+                }
+                if !value.is_object() {
+                    return Err(format!(
+                        "providerParameters.{id} deve essere un oggetto JSON"
+                    ));
+                }
+            }
+        }
+        Some(_) => return Err("providerParameters deve essere un oggetto JSON".into()),
+    }
+    Ok(accepted)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -604,11 +797,66 @@ fn validate_configuration(folder: &str, config: &CheckConfiguration) -> Result<(
     if config.arguments.len() > 64 || config.arguments.iter().any(|arg| arg.len() > 4096) {
         return Err("arguments ammette al massimo 64 stringhe di 4096 caratteri".into());
     }
-    if !safe_relative_path(&config.tool_path) {
-        return Err(
-            "toolPath deve essere un percorso relativo alla cartella del controllo (es. ./check.sh)"
-                .into(),
-        );
+    match (&config.tool_path, config.providers.is_empty()) {
+        (Some(path), true) if safe_relative_path(path) => {}
+        (Some(_), true) => {
+            return Err(
+                "toolPath deve essere un percorso relativo alla cartella del controllo (es. ./check.sh)"
+                    .into(),
+            )
+        }
+        // Configuration-only override: reuses the official files of the built-in it replaces.
+        (None, true) if config.override_builtin_id.is_some() => {
+            if config.expected_sha256.is_some() || !config.arguments.is_empty() {
+                return Err(
+                    "un override di sola configurazione non dichiara expectedSha256 né arguments"
+                        .into(),
+                );
+            }
+        }
+        (None, true) => {
+            return Err(
+                "toolPath è obbligatorio (oppure overrideBuiltinId per un override di sola configurazione)"
+                    .into(),
+            )
+        }
+        (Some(_), false) => return Err("toolPath e providers sono alternativi".into()),
+        (None, false) => {
+            if config.providers.len() > MAX_PROVIDERS {
+                return Err(format!("providers ammette al massimo {MAX_PROVIDERS} voci"));
+            }
+            if config.expected_sha256.is_some() {
+                return Err("un controllo con providers non dichiara expectedSha256".into());
+            }
+            for (id, provider) in &config.providers {
+                if !valid_provider_id(id) {
+                    return Err(format!(
+                        "ID provider non valido: {id} (minuscole, cifre e trattini)"
+                    ));
+                }
+                if provider.name.trim().is_empty() || provider.name.len() > 160 {
+                    return Err(format!("providers.{id}.name è obbligatorio (massimo 160 caratteri)"));
+                }
+                if !safe_relative_path(&provider.tool_path) {
+                    return Err(format!(
+                        "providers.{id}.toolPath deve essere un percorso relativo alla cartella del controllo"
+                    ));
+                }
+                if !provider.parameters.is_object() {
+                    return Err(format!("providers.{id}.parameters deve essere un oggetto JSON"));
+                }
+                if provider
+                    .timeout_seconds
+                    .is_some_and(|value| value == 0 || value > MAX_TIMEOUT_SECONDS)
+                {
+                    return Err(format!(
+                        "timeoutSeconds deve essere compreso tra 1 e {MAX_TIMEOUT_SECONDS}"
+                    ));
+                }
+            }
+            let known = config.providers.keys().map(String::as_str).collect::<Vec<_>>();
+            accepted_providers(&config.parameters, &known)?;
+        }
     }
     if config
         .timeout_seconds
@@ -674,6 +922,27 @@ fn discover_check_folders(parent: &Path) -> Result<Vec<DiscoveredFolder>, CliErr
     Ok(discovered)
 }
 
+/// Installed file inside the installation root, as a `/`-separated relative path.
+fn installed_relative(
+    root: &Path,
+    folder: &Path,
+    relative: &str,
+    id: &str,
+) -> Result<String, CliError> {
+    let path = folder
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| CliError(format!("Tool missing for {id}")))?;
+    if !path.starts_with(root) || !path.is_file() {
+        return Err(CliError(format!("Unsafe tool path for {id}")));
+    }
+    Ok(path
+        .strip_prefix(root)
+        .expect("tool is inside the installation root")
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
 fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError> {
     let parent = install.join(BUILTIN_CATALOG_DIR);
     let root = install
@@ -685,25 +954,44 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
         let config = parsed.map_err(|reason| {
             CliError(format!("Invalid check configuration for {name}: {reason}"))
         })?;
-        let trusted_hash = builtin_hash(&config.id, platform_key());
-        if config.expected_sha256.as_deref() != trusted_hash.as_deref() {
-            return Err(CliError(format!(
+        let timeout_seconds = config.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+        let mismatch = || {
+            CliError(format!(
                 "Trusted hash mismatch in configuration for {}",
                 config.id
+            ))
+        };
+        let (relative, trusted_hash, providers) = if let Some(tool_path) = &config.tool_path {
+            let relative = installed_relative(&root, &folder, tool_path, &config.id)?;
+            let trusted = builtin_file_hash(&relative);
+            if trusted.is_none() || config.expected_sha256 != trusted {
+                return Err(mismatch());
+            }
+            (relative, trusted, Vec::new())
+        } else if config.providers.is_empty() {
+            return Err(CliError(format!(
+                "Invalid check configuration for {}: toolPath è obbligatorio",
+                config.id
             )));
-        }
-        let tool = folder
-            .join(&config.tool_path)
-            .canonicalize()
-            .map_err(|_| CliError(format!("Tool missing for {}", config.id)))?;
-        if !tool.starts_with(&root) || !tool.is_file() {
-            return Err(CliError(format!("Unsafe tool path for {}", config.id)));
-        }
-        let relative = tool
-            .strip_prefix(&root)
-            .expect("tool is inside the installation root")
-            .to_string_lossy()
-            .replace('\\', "/");
+        } else {
+            // Provider-based: the configuration itself is the control's identity file.
+            let relative = installed_relative(&root, &folder, "configuration.json", &config.id)?;
+            let trusted = builtin_file_hash(&relative).ok_or_else(mismatch)?;
+            let mut providers = Vec::new();
+            for (id, provider) in &config.providers {
+                let tool = installed_relative(&root, &folder, &provider.tool_path, &config.id)?;
+                let expected = builtin_file_hash(&tool).ok_or_else(mismatch)?;
+                providers.push(ProviderSpec {
+                    id: id.clone(),
+                    name: provider.name.clone(),
+                    tool_path: tool,
+                    parameters: provider.parameters.clone(),
+                    timeout_seconds: provider.timeout_seconds.unwrap_or(timeout_seconds),
+                    expected_sha256: Some(expected),
+                });
+            }
+            (relative, Some(trusted), providers)
+        };
         let (display_name, display_description) = baradwatchu_messages::requirement_metadata(
             &config.id,
             baradwatchu_messages::configured_language(),
@@ -717,7 +1005,7 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             priority: config.priority,
             parameters: config.parameters,
             arguments: config.arguments,
-            timeout_seconds: config.timeout_seconds.unwrap_or(DEFAULT_TIMEOUT_SECONDS),
+            timeout_seconds,
             tools: BTreeMap::from([(platform_key().into(), relative)]),
             configuration_error: None,
             origin: ControlOrigin::Builtin,
@@ -728,7 +1016,34 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             builtin_tool_path: None,
             actual_sha256: None,
             integrity_status: IntegrityStatus::Unknown,
+            providers,
+            configuration_override: false,
         });
+    }
+    // A built-in listed in the trusted manifest must never silently disappear: a deleted
+    // folder or configuration becomes an ERROR control of its own.
+    let mut expected_ids = builtin_manifest()
+        .filter(|entry| entry.platform == platform_key())
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    expected_ids.dedup();
+    for id in expected_ids {
+        if requirements.iter().any(|requirement| requirement.id == id) {
+            continue;
+        }
+        let language = baradwatchu_messages::configured_language();
+        let (name, description) =
+            baradwatchu_messages::requirement_metadata(id, language).unwrap_or((id, ""));
+        let mut missing = broken_requirement(BrokenCustom {
+            id: id.to_owned(),
+            name: Some(name.to_owned()),
+            priority: Some(Priority::Highest),
+            reason: "cartella o configuration.json del controllo integrato mancante: reinstalla BaradWatchU Client".into(),
+        });
+        missing.description = description.to_owned();
+        missing.origin = ControlOrigin::Builtin;
+        missing.custom_tool_id = None;
+        requirements.push(missing);
     }
     Ok(requirements)
 }
@@ -784,6 +1099,33 @@ fn load_custom_registry() -> Result<CustomRegistry, CliError> {
                 continue;
             }
         };
+        if !config.providers.is_empty() {
+            registry.broken.push(BrokenCustom {
+                reason: "providers è disponibile solo per i controlli integrati: un controllo personalizzato dichiara toolPath".into(),
+                id: name,
+                name: Some(config.name),
+                priority: Some(config.priority),
+            });
+            continue;
+        }
+        if config.tool_path.is_none() {
+            // Configuration-only override (validated: overrideBuiltinId present, no hash).
+            registry.checks.push(CustomEntry {
+                tool_path: None,
+                id: name,
+                name: config.name,
+                description: config.description,
+                priority: config.priority,
+                enabled: config.enabled,
+                arguments: Vec::new(),
+                expected_sha256: None,
+                version: config.version.unwrap_or(1),
+                parameters: config.parameters,
+                override_builtin_id: config.override_builtin_id,
+                timeout_seconds: None,
+            });
+            continue;
+        }
         let Some(expected_sha256) = config.expected_sha256.clone() else {
             registry.broken.push(BrokenCustom {
                 reason: format!(
@@ -795,19 +1137,17 @@ fn load_custom_registry() -> Result<CustomRegistry, CliError> {
             });
             continue;
         };
-        let local_tool = config
-            .tool_path
-            .strip_prefix("./")
-            .unwrap_or(&config.tool_path);
+        let tool_path = config.tool_path.as_deref().unwrap_or_default();
+        let local_tool = tool_path.strip_prefix("./").unwrap_or(tool_path);
         registry.checks.push(CustomEntry {
-            tool_path: format!("{CUSTOM_DIR}/{name}/{local_tool}"),
+            tool_path: Some(format!("{CUSTOM_DIR}/{name}/{local_tool}")),
             id: name,
             name: config.name,
             description: config.description,
             priority: config.priority,
             enabled: config.enabled,
             arguments: config.arguments,
-            expected_sha256,
+            expected_sha256: Some(expected_sha256),
             version: config.version.unwrap_or(1),
             parameters: config.parameters,
             override_builtin_id: config.override_builtin_id,
@@ -882,8 +1222,11 @@ struct ConfigurationFile<'a> {
     description: &'a str,
     priority: Priority,
     enabled: bool,
-    tool_path: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_path: Option<&'a str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
     arguments: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
     expected_sha256: Option<&'a str>,
     version: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -922,14 +1265,18 @@ fn local_tool_path(entry: &CustomEntry) -> Result<&str, CliError> {
     let prefix = format!("{CUSTOM_DIR}/{}/", entry.id);
     entry
         .tool_path
-        .strip_prefix(&prefix)
+        .as_deref()
+        .and_then(|path| path.strip_prefix(&prefix))
         .filter(|local| safe_relative_path(local))
         .ok_or_else(|| CliError("Invalid custom tool path".into()))
 }
 
 fn save_custom_entry(entry: &CustomEntry) -> Result<(), CliError> {
     let folder = prepare_custom_folder(&entry.id)?;
-    let tool_path = format!("./{}", local_tool_path(entry)?);
+    let tool_path = match entry.tool_path {
+        Some(_) => Some(format!("./{}", local_tool_path(entry)?)),
+        None => None,
+    };
     let config = ConfigurationFile {
         schema_version: CHECK_SCHEMA,
         id: &entry.id,
@@ -937,9 +1284,9 @@ fn save_custom_entry(entry: &CustomEntry) -> Result<(), CliError> {
         description: &entry.description,
         priority: entry.priority,
         enabled: entry.enabled,
-        tool_path: &tool_path,
+        tool_path: tool_path.as_deref(),
         arguments: &entry.arguments,
-        expected_sha256: Some(&entry.expected_sha256),
+        expected_sha256: entry.expected_sha256.as_deref(),
         version: entry.version,
         timeout_seconds: entry.timeout_seconds,
         parameters: &entry.parameters,
@@ -1051,8 +1398,8 @@ pub(crate) fn dashboard_import_custom(text: &str) -> Result<String, CliError> {
         description: request.description,
         priority: request.priority,
         enabled: request.enabled.unwrap_or(true),
-        tool_path,
-        expected_sha256,
+        tool_path: Some(tool_path),
+        expected_sha256: Some(expected_sha256),
         version: 1,
         arguments: request.arguments,
         parameters: serde_json::json!({}),
@@ -1072,9 +1419,7 @@ fn remove_custom(id: &str) -> Result<(), CliError> {
         Ok(_) => return Err(CliError("Custom check folder is unsafe".into())),
         Err(_) => return Err(CliError("Custom check not found".into())),
     }
-    fs::remove_dir_all(&folder)
-        .map_err(|_| CliError("Cannot remove custom check folder".into()))?;
-    remove_local_requirement_setting(id)
+    fs::remove_dir_all(&folder).map_err(|_| CliError("Cannot remove custom check folder".into()))
 }
 
 pub(crate) fn dashboard_remove_custom(id: &str) -> Result<String, CliError> {
@@ -1098,12 +1443,19 @@ fn accept_custom(id: &str) -> Result<(String, u64), CliError> {
     let config: CheckConfiguration = serde_json::from_slice(&bytes)
         .map_err(|error| CliError(format!("configuration.json non valido: {error}")))?;
     validate_configuration(id, &config).map_err(CliError)?;
+    let tool_path = config
+        .tool_path
+        .as_deref()
+        .filter(|_| config.providers.is_empty())
+        .ok_or_else(|| {
+            CliError("Nessun tool da fissare: è un override di sola configurazione o un controllo con providers".into())
+        })?;
     let root = folder
         .canonicalize()
         .map_err(|_| CliError("Cannot locate custom check folder".into()))?;
-    let tool = folder.join(&config.tool_path);
+    let tool = folder.join(tool_path);
     let tool_metadata = fs::symlink_metadata(&tool)
-        .map_err(|_| CliError(format!("Tool {} non trovato", config.tool_path)))?;
+        .map_err(|_| CliError(format!("Tool {tool_path} non trovato")))?;
     if !tool_metadata.is_file()
         || tool_metadata.file_type().is_symlink()
         || tool_metadata.len() > 4 * 1024 * 1024
@@ -1127,7 +1479,7 @@ fn accept_custom(id: &str) -> Result<(String, u64), CliError> {
         description: &config.description,
         priority: config.priority,
         enabled: config.enabled,
-        tool_path: &config.tool_path,
+        tool_path: Some(tool_path),
         arguments: &config.arguments,
         expected_sha256: Some(&hash),
         version,
@@ -1151,8 +1503,13 @@ pub(crate) fn dashboard_restore_builtin(id: &str) -> Result<String, CliError> {
         .iter_mut()
         .find(|c| c.override_builtin_id.as_deref() == Some(id))
         .ok_or_else(|| CliError("No override exists for this built-in requirement".into()))?;
-    entry.override_builtin_id = None;
-    save_custom_entry(entry)?;
+    if entry.tool_path.is_none() {
+        // A configuration-only override has nothing left once detached: delete it.
+        remove_custom(&entry.id.clone())?;
+    } else {
+        entry.override_builtin_id = None;
+        save_custom_entry(entry)?;
+    }
     dashboard_data_json()
 }
 
@@ -1178,29 +1535,174 @@ pub(crate) fn dashboard_update_custom(id: &str, text: &str) -> Result<String, Cl
     // Replace the configured entrypoint in place so hand-made folders keep their layout.
     let local = local_tool_path(entry)?.to_owned();
     let (path, hash) = store_custom_tool(id, &local, &bytes)?;
-    entry.tool_path = path;
-    if !entry.expected_sha256.eq_ignore_ascii_case(&hash) {
+    entry.tool_path = Some(path);
+    if !entry
+        .expected_sha256
+        .as_deref()
+        .is_some_and(|previous| previous.eq_ignore_ascii_case(&hash))
+    {
         entry.version = entry.version.saturating_add(1);
     }
-    entry.expected_sha256 = hash;
+    entry.expected_sha256 = Some(hash);
     save_custom_entry(entry)?;
     dashboard_data_json()
 }
 
-fn builtin_hash(id: &str, platform: &str) -> Option<String> {
-    include_str!("../../../catalog/builtin-tools.sha256")
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-                fields.next()?,
-            ))
-        })
-        .find(|(entry_id, entry_platform, _, _)| *entry_id == id && *entry_platform == platform)
-        .map(|(_, _, _, hash)| hash.to_owned())
+struct ManifestEntry {
+    id: &'static str,
+    platform: &'static str,
+    path: &'static str,
+    sha256: &'static str,
+}
+
+fn builtin_manifest() -> impl Iterator<Item = ManifestEntry> {
+    BUILTIN_MANIFEST.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let entry = ManifestEntry {
+            id: fields.next()?,
+            platform: fields.next()?,
+            path: fields.next()?,
+            sha256: fields.next()?,
+        };
+        fields.next().is_none().then_some(entry)
+    })
+}
+
+/// Trusted hash of an installed built-in file, from its `/`-separated path relative to the
+/// installation root (e.g. `share/baradwatchu-client/catalog/checks/REQ-001/check.sh`).
+fn builtin_file_hash(install_relative: &str) -> Option<String> {
+    let path = install_relative
+        .strip_prefix(SHARE_DIR)?
+        .strip_prefix('/')?;
+    builtin_manifest()
+        .find(|entry| entry.platform == platform_key() && entry.path == path)
+        .map(|entry| entry.sha256.to_owned())
+}
+
+/// Hash every installed built-in check file of this platform against the embedded manifest,
+/// and list files the manifest does not know. Runs at every audit: it does not trust any
+/// installed copy of the manifest, only the one compiled into this agent.
+pub(crate) fn installation_integrity() -> InstallationIntegrity {
+    installation_integrity_at(
+        install_root()
+            .ok()
+            .and_then(|root| root.canonicalize().ok())
+            .map(|root| root.join(SHARE_DIR)),
+    )
+}
+
+/// [`installation_integrity`] for an explicit installed data root (`<prefix>/share/baradwatchu-client`).
+fn installation_integrity_at(share: Option<PathBuf>) -> InstallationIntegrity {
+    let expected = builtin_manifest()
+        .filter(|entry| entry.platform == platform_key())
+        .map(|entry| (entry.path, (entry.id, entry.sha256)))
+        .collect::<BTreeMap<_, _>>();
+    let mut files = Vec::new();
+    for (path, (id, sha256)) in &expected {
+        let (state, actual_sha256) = match &share {
+            Some(share) => hash_installed_file(&share.join(path), Some(sha256)),
+            None => (FileState::Missing, None),
+        };
+        files.push(InstalledFile {
+            requirement_id: (*id).to_owned(),
+            path: (*path).to_owned(),
+            expected_sha256: Some((*sha256).to_owned()),
+            actual_sha256,
+            state,
+        });
+    }
+    if let Some(share) = &share {
+        let checks = BUILTIN_CATALOG_DIR
+            .strip_prefix(SHARE_DIR)
+            .and_then(|value| value.strip_prefix('/'))
+            .expect("built-in catalog lives under the data root");
+        collect_unexpected(&share.join(checks), checks, &expected, &mut files, 0);
+    }
+    let verified_files = files
+        .iter()
+        .filter(|file| file.state == FileState::Verified)
+        .count();
+    InstallationIntegrity {
+        status: if verified_files == files.len() && !files.is_empty() {
+            IntegrityStatus::Verified
+        } else {
+            IntegrityStatus::Mismatch
+        },
+        platform: platform_key().into(),
+        manifest_sha256: format!("{:x}", Sha256::digest(BUILTIN_MANIFEST.as_bytes())),
+        verified_files,
+        files,
+    }
+}
+
+fn hash_installed_file(path: &Path, expected: Option<&str>) -> (FileState, Option<String>) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (FileState::Missing, None),
+        Err(_) => return (FileState::Unsafe, None),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 4 * 1024 * 1024
+    {
+        return (FileState::Unsafe, None);
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return (FileState::Unsafe, None);
+    };
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let state = match expected {
+        Some(expected) if expected.eq_ignore_ascii_case(&actual) => FileState::Verified,
+        Some(_) => FileState::Modified,
+        None => FileState::Unexpected,
+    };
+    (state, Some(actual))
+}
+
+fn collect_unexpected(
+    directory: &Path,
+    relative: &str,
+    expected: &BTreeMap<&str, (&str, &str)>,
+    files: &mut Vec<InstalledFile>,
+    depth: usize,
+) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if files.len() >= 2048 {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child = format!("{relative}/{name}");
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() && depth < 8 {
+            collect_unexpected(&path, &child, expected, files, depth + 1);
+            continue;
+        }
+        if expected.contains_key(child.as_str()) {
+            continue;
+        }
+        let (state, actual_sha256) = hash_installed_file(&path, None);
+        files.push(InstalledFile {
+            // `catalog/checks/<ID>/...`: the folder right below the checks directory.
+            requirement_id: child
+                .split('/')
+                .nth(2)
+                .filter(|_| child.split('/').count() > 3)
+                .unwrap_or_default()
+                .to_owned(),
+            path: child,
+            expected_sha256: None,
+            actual_sha256,
+            state: if state == FileState::Unsafe {
+                FileState::Unsafe
+            } else {
+                FileState::Unexpected
+            },
+        });
+    }
 }
 
 fn sha256_bytes(bytes: &[u8]) -> Option<String> {
@@ -1231,7 +1733,7 @@ fn current_client_identity() -> ClientIdentity {
 }
 
 fn control_provenance(requirement: &Requirement) -> ControlProvenance {
-    let root = if requirement.origin == ControlOrigin::Builtin {
+    let root = if requirement.execution_origin() == ControlOrigin::Builtin {
         install_root().ok()
     } else {
         state_dir().ok()
@@ -1283,14 +1785,20 @@ fn control_provenance(requirement: &Requirement) -> ControlProvenance {
         expected_sha256: requirement.expected_sha256.clone(),
         actual_sha256,
         integrity_status,
-        integrity_scope: "ENTRYPOINT_FILE_ONLY".into(),
+        // Built-ins: the gate re-hashes every file of the check folder at each run.
+        integrity_scope: if requirement.execution_origin() == ControlOrigin::Builtin {
+            "CHECK_FOLDER".into()
+        } else {
+            "ENTRYPOINT_FILE_ONLY".into()
+        },
         is_override: requirement.replaces_builtin.is_some(),
         override_builtin_id: requirement.replaces_builtin.clone(),
         builtin_tool_path,
         builtin_expected_sha256: requirement
-            .replaces_builtin
+            .builtin_tool_path
             .as_deref()
-            .and_then(|id| builtin_hash(id, platform_key())),
+            .and_then(builtin_file_hash),
+        configuration_override: requirement.configuration_override,
     }
 }
 
@@ -1401,76 +1909,92 @@ fn initial_settings(catalog: &Catalog) -> Settings {
     }
 }
 
+/// Effective per-control values. Since 2026-11-09 they come only from the catalog, where
+/// CUSTOM override folders are already applied: `settings.json` is no longer read, so no
+/// local change can stay invisible (see `obsolete_settings_file`).
 fn load_settings(catalog: &Catalog) -> Result<Settings, CliError> {
-    let path = state_dir()?.join("settings.json");
-    if !path.exists() {
-        return Ok(initial_settings(catalog));
-    }
-    let metadata = fs::symlink_metadata(&path)
-        .map_err(|_| CliError("Cannot inspect local settings".into()))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 64 * 1024 {
-        return Err(CliError(
-            "Local settings file is unsafe or too large".into(),
-        ));
-    }
-    let text =
-        fs::read_to_string(path).map_err(|_| CliError("Cannot read local settings".into()))?;
-    let mut settings: Settings = serde_json::from_str(&text)
-        .map_err(|_| CliError("Local settings JSON is invalid".into()))?;
-    if settings.schema_version != "baradwatchu.settings.v1"
-        || settings
-            .requirements
-            .values()
-            .any(|item| !item.parameters.is_object())
-    {
-        return Err(CliError(
-            "Local settings do not match this Client catalog".into(),
-        ));
-    }
-    // Folder discovery can add or remove controls independently of settings. Ignore
-    // settings for folders that no longer exist so a forced refresh can recover.
-    settings.requirements.retain(|id, _| {
-        catalog
-            .requirements
-            .iter()
-            .any(|requirement| &requirement.id == id)
-    });
-    for requirement in &catalog.requirements {
-        settings
-            .requirements
-            .entry(requirement.id.clone())
-            .or_insert_with(|| RequirementSettings {
-                enabled: requirement.enabled,
-                priority: requirement.priority,
-                parameters: requirement.parameters.clone(),
-            });
-    }
-    Ok(settings)
+    Ok(initial_settings(catalog))
 }
 
-fn save_settings(settings: &Settings) -> Result<(), CliError> {
-    let directory = state_dir()?;
-    fs::create_dir_all(&directory)
-        .map_err(|_| CliError("Cannot create local settings directory".into()))?;
-    secure_dir(&directory)?;
-    let path = directory.join("settings.json");
-    atomic_json(&path, settings)
+/// The pre-2026-11-09 `settings.json`, if still present: ignored and reported.
+pub(crate) fn obsolete_settings_file() -> Option<PathBuf> {
+    let path = state_dir().ok()?.join("settings.json");
+    fs::symlink_metadata(&path).is_ok().then_some(path)
 }
 
-fn remove_local_requirement_setting(id: &str) -> Result<(), CliError> {
-    let path = state_dir()?.join("settings.json");
-    if !path.exists() {
+/// Change enabled/priority/parameters of a control. A custom control (override included) is
+/// edited in its own folder; an official one gets a configuration-only override folder
+/// `CUSTOM-<ID>`, deleted again as soon as its values equal the official ones.
+fn apply_local_change(
+    id: &str,
+    change: impl FnOnce(&mut bool, &mut Priority, &mut serde_json::Value),
+) -> Result<(), CliError> {
+    let (catalog, registry) = catalog_with_registry()?;
+    let requirement = catalog
+        .requirements
+        .iter()
+        .find(|requirement| requirement.id == id)
+        .ok_or_else(|| CliError(format!("Unknown requirement: {id}")))?;
+    if requirement.configuration_error.is_some() {
+        return Err(CliError(
+            "Configurazione del controllo non valida: correggila o elimina la cartella prima di modificarla".into(),
+        ));
+    }
+    let official = discover_builtin_checks(&install_root()?)?
+        .into_iter()
+        .find(|item| item.id == id && item.configuration_error.is_none());
+    let (mut enabled, mut priority, mut parameters) = (
+        requirement.enabled,
+        requirement.priority,
+        requirement.parameters.clone(),
+    );
+    change(&mut enabled, &mut priority, &mut parameters);
+    if !parameters.is_object() {
+        return Err(CliError("Parameters must be a JSON object".into()));
+    }
+    let matches_official = |item: &Requirement| {
+        item.enabled == enabled && item.priority == priority && item.parameters == parameters
+    };
+    if let Some(custom_id) = &requirement.custom_tool_id {
+        let mut entry = registry
+            .checks
+            .into_iter()
+            .find(|entry| &entry.id == custom_id)
+            .ok_or_else(|| CliError("Custom check not found".into()))?;
+        if entry.tool_path.is_none() && official.as_ref().is_some_and(matches_official) {
+            return remove_custom(&entry.id);
+        }
+        entry.enabled = enabled;
+        entry.priority = priority;
+        entry.parameters = parameters;
+        return save_custom_entry(&entry);
+    }
+    let official = official.ok_or_else(|| CliError(format!("Unknown requirement: {id}")))?;
+    if matches_official(&official) {
         return Ok(());
     }
-    let text =
-        fs::read_to_string(&path).map_err(|_| CliError("Cannot read local settings".into()))?;
-    let mut settings: Settings = serde_json::from_str(&text)
-        .map_err(|_| CliError("Local settings JSON is invalid".into()))?;
-    if settings.schema_version != "baradwatchu.settings.v1" {
-        return Err(CliError("Unsupported local settings".into()));
+    let override_id = format!("CUSTOM-{id}");
+    if fs::symlink_metadata(custom_folder(&override_id)?).is_ok() {
+        return Err(CliError(format!(
+            "La cartella {override_id} esiste già: modificala o eliminala dalla pagina dei controlli personalizzati"
+        )));
     }
-    settings.requirements.remove(id);
-    save_settings(&settings)
+    save_custom_entry(&CustomEntry {
+        id: override_id,
+        name: official.name.clone(),
+        description: format!(
+            "Override di configurazione di {id}: stessi file ufficiali, valori locali"
+        ),
+        priority,
+        enabled,
+        tool_path: None,
+        arguments: Vec::new(),
+        expected_sha256: None,
+        version: 1,
+        parameters,
+        override_builtin_id: Some(id.to_owned()),
+        timeout_seconds: None,
+    })
 }
 
 pub(crate) fn secure_dir(path: &Path) -> Result<(), CliError> {
@@ -1626,6 +2150,258 @@ fn execute(
         priority,
         parameters,
         Duration::from_secs(seconds),
+    )
+}
+
+/// Run one control as an audit does: built-ins first pass the installation gate (every file
+/// of their folder against the embedded manifest), then either their single tool runs or
+/// their providers run and are combined according to `acceptedProviders`.
+fn evaluate(
+    requirement: &Requirement,
+    priority: Priority,
+    parameters: &serde_json::Value,
+    installation: &InstallationIntegrity,
+) -> (ResultRecord, Vec<ProviderResult>) {
+    let (mut result, providers) = evaluate_control(requirement, priority, parameters, installation);
+    if requirement.configuration_override {
+        // Always state the local values next to the outcome, in every report form.
+        result.details.insert(
+            0,
+            format!(
+                "Configurazione locale {} al posto di quella ufficiale di {}: abilitato {}, priorità {}, parametri {}",
+                requirement.custom_tool_id.as_deref().unwrap_or("CUSTOM"),
+                requirement.replaces_builtin.as_deref().unwrap_or(&requirement.id),
+                requirement.enabled,
+                priority,
+                parameters
+            ),
+        );
+    }
+    (result, providers)
+}
+
+fn evaluate_control(
+    requirement: &Requirement,
+    priority: Priority,
+    parameters: &serde_json::Value,
+    installation: &InstallationIntegrity,
+) -> (ResultRecord, Vec<ProviderResult>) {
+    if let Some(blocked) = installation_gate(requirement, priority, installation) {
+        return (blocked, Vec::new());
+    }
+    if requirement.providers.is_empty() || requirement.configuration_error.is_some() {
+        return (execute(requirement, priority, parameters), Vec::new());
+    }
+    execute_providers(requirement, priority, parameters)
+}
+
+fn installation_gate(
+    requirement: &Requirement,
+    priority: Priority,
+    installation: &InstallationIntegrity,
+) -> Option<ResultRecord> {
+    if requirement.execution_origin() != ControlOrigin::Builtin
+        || requirement.configuration_error.is_some()
+    {
+        return None;
+    }
+    let mut details = installation
+        .files
+        .iter()
+        .filter(|file| file.requirement_id == requirement.id && file.state != FileState::Verified)
+        .map(|file| {
+            format!(
+                "{} ({}): {}",
+                file.path,
+                file.state.label(),
+                file.actual_sha256
+                    .as_deref()
+                    .unwrap_or("hash non disponibile")
+            )
+        })
+        .collect::<Vec<_>>();
+    if details.is_empty() {
+        return None;
+    }
+    details.push(integrity_hint(requirement));
+    let mut result = error_with_details(requirement, priority, INTEGRITY_FOLDER_SUMMARY, details);
+    let mut provenance = control_provenance(requirement);
+    provenance.integrity_status = IntegrityStatus::Mismatch;
+    result.provenance = Some(provenance);
+    Some(result)
+}
+
+fn status_rank(status: ResultStatus) -> u8 {
+    match status {
+        ResultStatus::Error => 4,
+        ResultStatus::Fail => 3,
+        ResultStatus::Warn => 2,
+        ResultStatus::Pass => 1,
+        ResultStatus::Disabled | ResultStatus::NotApplicable => 0,
+    }
+}
+
+/// Provider model: every provider of the control runs and is reported. With an empty
+/// `acceptedProviders` one PASS is enough; otherwise every listed provider must PASS and the
+/// worst of them (ERROR > FAIL > WARN) decides. Unlisted providers are informative only.
+fn execute_providers(
+    requirement: &Requirement,
+    priority: Priority,
+    parameters: &serde_json::Value,
+) -> (ResultRecord, Vec<ProviderResult>) {
+    let known = requirement
+        .providers
+        .iter()
+        .map(|provider| provider.id.as_str())
+        .collect::<Vec<_>>();
+    let accepted = match accepted_providers(parameters, &known) {
+        Ok(accepted) => accepted,
+        Err(reason) => {
+            return (
+                error_with_details(
+                    requirement,
+                    priority,
+                    "Configurazione dei provider non valida: nessun provider è stato eseguito",
+                    vec![
+                        reason,
+                        format!("Provider disponibili: {}", known.join(", ")),
+                    ],
+                ),
+                Vec::new(),
+            )
+        }
+    };
+    let overrides = parameters.get("providerParameters");
+    let mut results = Vec::with_capacity(requirement.providers.len());
+    for spec in &requirement.providers {
+        let mut merged = spec.parameters.as_object().cloned().unwrap_or_default();
+        if let Some(extra) = overrides
+            .and_then(|value| value.get(&spec.id))
+            .and_then(serde_json::Value::as_object)
+        {
+            merged.extend(extra.clone());
+        }
+        let merged = serde_json::Value::Object(merged);
+        let tool = Requirement {
+            tools: BTreeMap::from([(platform_key().into(), spec.tool_path.clone())]),
+            expected_sha256: spec.expected_sha256.clone(),
+            timeout_seconds: spec.timeout_seconds,
+            arguments: Vec::new(),
+            parameters: merged.clone(),
+            providers: Vec::new(),
+            ..requirement.clone()
+        };
+        let record = execute(&tool, priority, &merged);
+        results.push(ProviderResult {
+            requirement_id: requirement.id.clone(),
+            provider_id: spec.id.clone(),
+            name: Some(spec.name.clone()),
+            origin: ControlOrigin::Builtin,
+            required: accepted.contains(&spec.id),
+            status: record.status,
+            summary: record.summary,
+            details: record.details,
+        });
+    }
+    let label = |result: &ProviderResult| {
+        format!(
+            "{} ({})",
+            result.name.as_deref().unwrap_or(&result.provider_id),
+            result.status
+        )
+    };
+    let (status, summary) = if accepted.is_empty() {
+        let passing = results
+            .iter()
+            .filter(|result| result.status == ResultStatus::Pass)
+            .map(|result| {
+                result
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| result.provider_id.clone())
+            })
+            .collect::<Vec<_>>();
+        if !passing.is_empty() {
+            (
+                ResultStatus::Pass,
+                format!("Almeno un provider conforme: {}", passing.join(", ")),
+            )
+        } else {
+            let any = |status| results.iter().any(|result| result.status == status);
+            let status = if any(ResultStatus::Error) {
+                ResultStatus::Error
+            } else if any(ResultStatus::Warn) {
+                ResultStatus::Warn
+            } else {
+                ResultStatus::Fail
+            };
+            (
+                status,
+                format!(
+                    "Nessun provider conforme: {}",
+                    results.iter().map(label).collect::<Vec<_>>().join(", ")
+                ),
+            )
+        }
+    } else {
+        let required = results.iter().filter(|result| result.required);
+        let status = required
+            .clone()
+            .map(|result| result.status)
+            .max_by_key(|status| status_rank(*status))
+            .unwrap_or(ResultStatus::Error);
+        let failing = required
+            .filter(|result| result.status != ResultStatus::Pass)
+            .map(label)
+            .collect::<Vec<_>>();
+        if failing.is_empty() {
+            (
+                ResultStatus::Pass,
+                format!("Provider obbligatori conformi: {}", accepted.join(", ")),
+            )
+        } else {
+            (
+                status,
+                format!("Provider obbligatori non conformi: {}", failing.join(", ")),
+            )
+        }
+    };
+    let mut details = vec![if accepted.is_empty() {
+        "Regola: basta un provider conforme (acceptedProviders vuoto)".to_owned()
+    } else {
+        format!(
+            "Regola: tutti i provider obbligatori devono essere conformi (acceptedProviders: {})",
+            accepted.join(", ")
+        )
+    }];
+    details.extend(results.iter().map(|result| {
+        format!(
+            "[{}] {} ({}), {}: {}",
+            result.status,
+            result.name.as_deref().unwrap_or(&result.provider_id),
+            result.provider_id,
+            if result.required {
+                "obbligatorio"
+            } else {
+                "facoltativo"
+            },
+            result.summary
+        )
+    }));
+    (
+        ResultRecord {
+            id: requirement.id.clone(),
+            name: requirement.name.clone(),
+            description: requirement.description.clone(),
+            priority,
+            status,
+            compliance_status: None,
+            summary,
+            details,
+            completed_at_unix_ms: now_ms(),
+            provenance: None,
+        },
+        results,
     )
 }
 
@@ -1968,7 +2744,7 @@ fn stderr_excerpt(stderr: &[u8]) -> Option<String> {
 }
 
 fn integrity_hint(requirement: &Requirement) -> String {
-    match requirement.origin {
+    match requirement.execution_origin() {
         ControlOrigin::Custom => format!(
             "Se la modifica è voluta, fissa il nuovo hash con `baradwatchu-agent custom accept {}` oppure con «Accetta versione attuale» nella dashboard",
             requirement.custom_tool_id.as_deref().unwrap_or(&requirement.id)
@@ -2013,7 +2789,7 @@ fn execute_with_timeout(
     if !safe_relative_path(relative) {
         return error_result(requirement, priority, "Tool path is invalid");
     }
-    let root = match if requirement.origin == ControlOrigin::Builtin {
+    let root = match if requirement.execution_origin() == ControlOrigin::Builtin {
         install_root()
     } else {
         state_dir()
@@ -2025,7 +2801,7 @@ fn execute_with_timeout(
         Ok(root) => root,
         Err(_) => return error_result(requirement, priority, "Cannot locate Client installation"),
     };
-    if requirement.origin != ControlOrigin::Builtin {
+    if requirement.execution_origin() != ControlOrigin::Builtin {
         let managed_tools = root.join(CUSTOM_DIR);
         if fs::symlink_metadata(&managed_tools)
             .map(|m| !m.is_dir() || m.file_type().is_symlink())
@@ -2127,7 +2903,7 @@ fn execute_with_timeout(
     }
     // Custom tools run from a private snapshot of the exact bytes hashed (no swap between
     // hash and exec). Built-ins stay at their package-owned path so sibling helpers work.
-    let (execution_path, _snapshot) = if requirement.origin == ControlOrigin::Custom {
+    let (execution_path, _snapshot) = if requirement.execution_origin() == ControlOrigin::Custom {
         // Keep the extension: on Windows it selects how the tool is started.
         let extension = canonical_tool
             .extension()
@@ -2207,7 +2983,7 @@ fn execute_with_timeout(
         // Own process group: a timeout kills the tool and every helper it started.
         command.process_group(0);
     }
-    tool_environment(&mut command, requirement.origin);
+    tool_environment(&mut command, requirement.execution_origin());
     command
         .stdin(if parameter_input.is_some() {
             Stdio::piped()
@@ -2334,7 +3110,9 @@ fn execute_with_timeout(
             )
         }
     };
-    let (result_status, summary, mut details) = if requirement.origin == ControlOrigin::Custom {
+    let (result_status, summary, mut details) = if requirement.execution_origin()
+        == ControlOrigin::Custom
+    {
         let result: CustomToolResult = match serde_json::from_str(text) {
             Ok(result) => result,
             Err(error) => {
@@ -2441,7 +3219,7 @@ fn save_audit_at(
         if let Some(pdf) = &report.pdf {
             if let Some(path) = &pdf.path {
                 log.push_str(
-                    &baradwatchu_messages::message(
+                    baradwatchu_messages::message(
                         "cli.audit.pdf",
                         baradwatchu_messages::configured_language(),
                     )
@@ -2450,7 +3228,7 @@ fn save_audit_at(
                 );
                 if let Some(warning) = &pdf.warning {
                     log.push_str(
-                        &baradwatchu_messages::message(
+                        baradwatchu_messages::message(
                             "cli.pdf.theme_warning",
                             baradwatchu_messages::configured_language(),
                         )
@@ -2460,7 +3238,7 @@ fn save_audit_at(
                 }
             } else if let Some(error) = &pdf.error {
                 log.push_str(
-                    &baradwatchu_messages::message(
+                    baradwatchu_messages::message(
                         "cli.pdf.failed",
                         baradwatchu_messages::configured_language(),
                     )
@@ -2624,7 +3402,9 @@ fn human_result(result: &ResultRecord) -> String {
     let name = result
         .provenance
         .as_ref()
-        .is_none_or(|provenance| provenance.origin == ControlOrigin::Builtin)
+        .map_or(true, |provenance| {
+            provenance.origin == ControlOrigin::Builtin
+        })
         .then(|| baradwatchu_messages::requirement_metadata(&result.id, language))
         .flatten()
         .map_or(result.name.as_str(), |(name, _)| name);
@@ -2669,7 +3449,7 @@ fn human_result(result: &ResultRecord) -> String {
         }
         if let Some(id) = &provenance.override_builtin_id {
             text.push_str(
-                &baradwatchu_messages::message("cli.result.override", language)
+                baradwatchu_messages::message("cli.result.override", language)
                     .replace("{id}", id)
                     .as_str(),
             );
@@ -2787,7 +3567,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         _ => {}
     }
     let (catalog, registry) = catalog_with_registry()?;
-    let mut settings = load_settings(&catalog)?;
+    let settings = load_settings(&catalog)?;
     fn id_of(value: &OsString) -> &str {
         value.to_str().unwrap_or("")
     }
@@ -2831,6 +3611,12 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 text.push_str(
                     &baradwatchu_messages::message("cli.refresh.ignored", language)
                         .replace("{name}", name),
+                );
+            }
+            if let Some(path) = obsolete_settings_file() {
+                text.push_str(
+                    &baradwatchu_messages::message("cli.refresh.obsolete_settings", language)
+                        .replace("{path}", &path.display().to_string()),
                 );
             }
             Ok(CliOutput { text, code: 0 })
@@ -2943,20 +3729,8 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         [command, id] if (command == "enable" || command == "disable") => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) {
-                return Err(CliError(format!("Unknown requirement: {id}")));
-            }
-            let local = settings
-                .requirements
-                .entry(id.into())
-                .or_insert(RequirementSettings {
-                    enabled: true,
-                    priority: Priority::High,
-                    parameters: serde_json::json!({}),
-                });
-            local.enabled = command == "enable";
-            let enabled = local.enabled;
-            save_settings(&settings)?;
+            let enabled = command == "enable";
+            apply_local_change(id, |value, _, _| *value = enabled)?;
             let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
                 text: baradwatchu_messages::message(
@@ -2973,22 +3747,10 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         [command, id, priority] if command == "priority" => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) {
-                return Err(CliError(format!("Unknown requirement: {id}")));
-            }
             let priority = parse_priority(priority).ok_or_else(|| {
                 CliError("Priority must be HIGHEST, HIGH, MEDIUM, LOW or OPTIONAL".into())
             })?;
-            let local = settings
-                .requirements
-                .entry(id.into())
-                .or_insert(RequirementSettings {
-                    enabled: true,
-                    priority,
-                    parameters: serde_json::json!({}),
-                });
-            local.priority = priority;
-            save_settings(&settings)?;
+            apply_local_change(id, |_, value, _| *value = priority)?;
             let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
                 text: baradwatchu_messages::message("cli.priority.saved", language)
@@ -2999,9 +3761,6 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         [command, id, value] if command == "configure" => {
             let id = id_of(id);
-            if !catalog.requirements.iter().any(|r| r.id == id) {
-                return Err(CliError(format!("Unknown requirement: {id}")));
-            }
             if value.to_string_lossy().len() > 16 * 1024 {
                 return Err(CliError("Parameters JSON exceeds 16 KiB".into()));
             }
@@ -3013,16 +3772,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             if !parameters.is_object() {
                 return Err(CliError("Parameters must be a JSON object".into()));
             }
-            let local = settings
-                .requirements
-                .entry(id.into())
-                .or_insert(RequirementSettings {
-                    enabled: true,
-                    priority: Priority::High,
-                    parameters: serde_json::json!({}),
-                });
-            local.parameters = parameters;
-            save_settings(&settings)?;
+            apply_local_change(id, |_, _, value| *value = parameters)?;
             let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
                 text: baradwatchu_messages::message("cli.parameters.saved", language)
@@ -3125,6 +3875,8 @@ fn run_check(
         .ok_or_else(|| CliError(format!("Unknown requirement: {id}")))?;
     let local = settings.requirements.get(&requirement.id);
     let priority = local.map_or(requirement.priority, |value| value.priority);
+    let installation = installation_integrity();
+    let mut providers = Vec::new();
     let mut result = if local.is_some_and(|value| !value.enabled) {
         ResultRecord {
             id: requirement.id.clone(),
@@ -3139,11 +3891,14 @@ fn run_check(
             provenance: None,
         }
     } else {
-        execute(
+        let (result, provider_results) = evaluate(
             requirement,
             priority,
             local.map_or(&requirement.parameters, |value| &value.parameters),
-        )
+            &installation,
+        );
+        providers = provider_results;
+        result
     };
     attach_provenance(&mut result, requirement);
     let mut report = AuditReport {
@@ -3152,14 +3907,18 @@ fn run_check(
         results: vec![result.clone()],
         client: current_client_identity(),
         pdf: None,
-        extensions: AuditExtensions::default(),
+        extensions: AuditExtensions {
+            disabled_requirements: Vec::new(),
+            providers,
+        },
+        installation: Some(installation),
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
     let mut text = human_result(&result);
     if let Some(path) = log_path {
         text.push_str(
-            &baradwatchu_messages::message(
+            baradwatchu_messages::message(
                 "cli.audit.log",
                 baradwatchu_messages::configured_language(),
             )
@@ -3182,16 +3941,22 @@ fn run_audit(
 ) -> Result<CliOutput, CliError> {
     let mut results = Vec::with_capacity(catalog.requirements.len());
     let mut disabled_requirements = Vec::new();
+    let mut providers = Vec::new();
+    // Hashed once per audit, before any tool runs; disabled controls are covered too.
+    let installation = installation_integrity();
     for requirement in &catalog.requirements {
         let local = settings.requirements.get(&requirement.id);
         let enabled = local.map_or(requirement.enabled, |v| v.enabled);
         let priority = local.map_or(requirement.priority, |v| v.priority);
         let mut result = if enabled {
-            execute(
+            let (result, provider_results) = evaluate(
                 requirement,
                 priority,
                 local.map_or(&requirement.parameters, |v| &v.parameters),
-            )
+                &installation,
+            );
+            providers.extend(provider_results);
+            result
         } else {
             disabled_requirements.push(DisabledRequirement {
                 id: requirement.id.clone(),
@@ -3225,8 +3990,9 @@ fn run_audit(
         pdf: None,
         extensions: AuditExtensions {
             disabled_requirements,
-            providers: Vec::new(),
+            providers,
         },
+        installation: Some(installation),
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
@@ -3282,7 +4048,7 @@ fn run_audit(
         text.push_str(&report.results.iter().map(human_result).collect::<String>());
         if let Some(path) = log_path {
             text.push_str(
-                &baradwatchu_messages::message(
+                baradwatchu_messages::message(
                     "cli.audit.log",
                     baradwatchu_messages::configured_language(),
                 )
@@ -3310,7 +4076,7 @@ fn run_audit(
                 );
                 if let Some(warning) = &artifact.warning {
                     text.push_str(
-                        &baradwatchu_messages::message(
+                        baradwatchu_messages::message(
                             "cli.pdf.theme_warning",
                             baradwatchu_messages::configured_language(),
                         )
@@ -3321,7 +4087,7 @@ fn run_audit(
             }
             Some(artifact) => {
                 text.push_str(
-                    &baradwatchu_messages::message(
+                    baradwatchu_messages::message(
                         "cli.pdf.failed",
                         baradwatchu_messages::configured_language(),
                     )
@@ -3339,7 +4105,7 @@ fn run_audit(
                 );
             }
             None => text.push_str(
-                &baradwatchu_messages::message(
+                baradwatchu_messages::message(
                     "cli.pdf.failed",
                     baradwatchu_messages::configured_language(),
                 )
@@ -3381,7 +4147,7 @@ fn audit_summary_text(report: &AuditReport) -> String {
             .unwrap_or("NON DISPONIBILE")
     });
     let language = baradwatchu_messages::configured_language();
-    baradwatchu_messages::message("cli.audit.summary", language)
+    let mut text = baradwatchu_messages::message("cli.audit.summary", language)
         .replace("{date}", &report.completed_at_unix_ms.to_string())
         .replace("{version}", &report.client.version)
         .replace("{sha}", sha)
@@ -3389,12 +4155,36 @@ fn audit_summary_text(report: &AuditReport) -> String {
         .replace("{fail}", &fail.to_string())
         .replace("{warn}", &warn.to_string())
         .replace("{error}", &error.to_string())
-        .replace("{other}", &other.to_string())
+        .replace("{other}", &other.to_string());
+    if let Some(installation) = &report.installation {
+        text.truncate(text.trim_end_matches('\n').len());
+        text.push('\n');
+        let key = if installation.status == IntegrityStatus::Verified {
+            "cli.audit.installation_verified"
+        } else {
+            "cli.audit.installation_mismatch"
+        };
+        text.push_str(
+            &baradwatchu_messages::message(key, language)
+                .replace("{verified}", &installation.verified_files.to_string())
+                .replace("{files}", &installation.files.len().to_string()),
+        );
+        for file in installation
+            .files
+            .iter()
+            .filter(|file| file.state != FileState::Verified)
+        {
+            text.push_str(&format!("    ! {} ({})\n", file.path, file.state.label()));
+        }
+        text.push('\n');
+    }
+    text
 }
 
 pub(crate) fn dashboard_data_json() -> Result<String, CliError> {
     let (catalog, registry) = catalog_with_registry()?;
     let settings = load_settings(&catalog)?;
+    let installation = installation_integrity();
     let requirements = catalog
         .requirements
         .iter()
@@ -3406,13 +4196,28 @@ pub(crate) fn dashboard_data_json() -> Result<String, CliError> {
                 item.parameters = local.parameters.clone();
             }
             populate_current_integrity(&mut item);
+            // Built-ins: any file of the folder off the manifest marks the control as altered.
+            if item.execution_origin() == ControlOrigin::Builtin
+                && installation
+                    .files
+                    .iter()
+                    .any(|file| file.requirement_id == item.id && file.state != FileState::Verified)
+            {
+                item.integrity_status = IntegrityStatus::Mismatch;
+            }
             item
         })
         .collect::<Vec<_>>();
     output_json(&serde_json::json!({
         "schemaVersion":"baradwatchu.dashboard.v1",
         "requirements":requirements,
+        "installation":{
+            "status":installation.status,
+            "verifiedFiles":installation.verified_files,
+            "files":installation.files.len(),
+        },
         "customChecksDir":custom_root()?.display().to_string(),
+        "obsoleteSettingsFile":obsolete_settings_file().map(|path| path.display().to_string()),
         "ignoredFolders":registry.ignored,
     }))
 }
@@ -3426,7 +4231,7 @@ fn populate_current_integrity(item: &mut Requirement) {
     let evidence = control_provenance(item);
     item.actual_sha256 = evidence.actual_sha256;
     item.integrity_status = evidence.integrity_status;
-    let root = if item.origin == ControlOrigin::Builtin {
+    let root = if item.execution_origin() == ControlOrigin::Builtin {
         install_root().ok()
     } else {
         state_dir().ok()
@@ -3438,6 +4243,8 @@ fn populate_current_integrity(item: &mut Requirement) {
     }
 }
 
+/// Dashboard "save settings": every changed control is written as a CUSTOM override
+/// (see `apply_local_change`); nothing is stored in a hidden settings file.
 pub(crate) fn update_dashboard_settings(text: &str) -> Result<String, CliError> {
     if text.len() > 64 * 1024 {
         return Err(CliError("Settings request is too large".into()));
@@ -3446,7 +4253,6 @@ pub(crate) fn update_dashboard_settings(text: &str) -> Result<String, CliError> 
     let settings: Settings =
         serde_json::from_str(text).map_err(|_| CliError("Settings JSON is invalid".into()))?;
     if settings.schema_version != "baradwatchu.settings.v1"
-        || settings.requirements.len() != catalog.requirements.len()
         || settings
             .requirements
             .keys()
@@ -3460,7 +4266,23 @@ pub(crate) fn update_dashboard_settings(text: &str) -> Result<String, CliError> 
             "Settings must contain exactly the known requirement IDs".into(),
         ));
     }
-    save_settings(&settings)?;
+    for (id, wanted) in settings.requirements {
+        let Some(current) = catalog.requirements.iter().find(|r| r.id == id) else {
+            continue;
+        };
+        if current.configuration_error.is_some()
+            || (current.enabled == wanted.enabled
+                && current.priority == wanted.priority
+                && current.parameters == wanted.parameters)
+        {
+            continue;
+        }
+        apply_local_change(&id, |enabled, priority, parameters| {
+            *enabled = wanted.enabled;
+            *priority = wanted.priority;
+            *parameters = wanted.parameters;
+        })?;
+    }
     dashboard_data_json()
 }
 
@@ -3481,6 +4303,8 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
         .ok_or_else(|| CliError(format!("Unknown requirement: {id}")))?;
     let local = settings.requirements.get(&requirement.id);
     let priority = local.map_or(requirement.priority, |v| v.priority);
+    let installation = installation_integrity();
+    let mut providers = Vec::new();
     let mut result = if local.is_some_and(|v| !v.enabled) {
         ResultRecord {
             id: requirement.id.clone(),
@@ -3495,11 +4319,14 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
             provenance: None,
         }
     } else {
-        execute(
+        let (result, provider_results) = evaluate(
             requirement,
             priority,
             local.map_or(&requirement.parameters, |v| &v.parameters),
-        )
+            &installation,
+        );
+        providers = provider_results;
+        result
     };
     attach_provenance(&mut result, requirement);
     let mut report = AuditReport {
@@ -3508,7 +4335,11 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
         results: vec![result],
         client: current_client_identity(),
         pdf: None,
-        extensions: AuditExtensions::default(),
+        extensions: AuditExtensions {
+            disabled_requirements: Vec::new(),
+            providers,
+        },
+        installation: Some(installation),
         log_file: None,
     };
     save_audit(&mut report, false)?;
@@ -3628,6 +4459,14 @@ impl TestEnv {
         env.set("XDG_STATE_HOME", root.join("state"));
         env.set("XDG_CACHE_HOME", root.join("cache"));
         env.set("XDG_RUNTIME_DIR", root.join("run"));
+        // Pin the interface language: expectations must not depend on the host locale.
+        let config = root.join("config/baradwatchu");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("language.json"),
+            r#"{"schemaVersion":"baradwatchu.language.v1","language":"italian"}"#,
+        )
+        .unwrap();
         env
     }
 
@@ -3770,6 +4609,315 @@ mod tests {
         status_tool("PASS", summary)
     }
 
+    /// Provider-based control over custom-folder tools (same runner, no installed catalog).
+    fn provider_requirement(env: &TestEnv, tools: &[(&str, Vec<u8>)]) -> Requirement {
+        let folder = env.custom_dir().join("CUSTOM-PROV");
+        fs::create_dir_all(&folder).unwrap();
+        let providers = tools
+            .iter()
+            .map(|(id, bytes)| {
+                let name = format!("{id}.{}", if cfg!(windows) { "ps1" } else { "sh" });
+                fs::write(folder.join(&name), bytes).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(folder.join(&name), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                ProviderSpec {
+                    id: (*id).into(),
+                    name: format!("Provider {id}"),
+                    tool_path: format!("{CUSTOM_DIR}/CUSTOM-PROV/{name}"),
+                    parameters: serde_json::json!({"fromDefault": "d"}),
+                    timeout_seconds: 20,
+                    expected_sha256: sha256_bytes(bytes),
+                }
+            })
+            .collect();
+        Requirement {
+            id: "CUSTOM-PROV".into(),
+            name: "Provider test".into(),
+            description: String::new(),
+            enabled: true,
+            priority: Priority::High,
+            parameters: serde_json::json!({}),
+            arguments: vec![],
+            timeout_seconds: 20,
+            tools: BTreeMap::from([(platform_key().into(), format!("{CUSTOM_DIR}/CUSTOM-PROV/x"))]),
+            configuration_error: None,
+            origin: ControlOrigin::Custom,
+            expected_sha256: None,
+            replaces_builtin: None,
+            custom_tool_id: Some("CUSTOM-PROV".into()),
+            custom_tool_version: Some(1),
+            builtin_tool_path: None,
+            actual_sha256: None,
+            integrity_status: IntegrityStatus::Unknown,
+            providers,
+            configuration_override: false,
+        }
+    }
+
+    #[test]
+    fn empty_accepted_providers_needs_one_pass_and_listed_ones_are_all_mandatory() {
+        let env = TestEnv::new("providers");
+        let requirement = provider_requirement(
+            &env,
+            &[
+                ("alpha", pass_tool("alpha ok")),
+                ("bravo", status_tool("FAIL", "bravo assente")),
+                ("charlie", status_tool("WARNING", "charlie incerto")),
+            ],
+        );
+        let run = |parameters: serde_json::Value| {
+            execute_providers(&requirement, Priority::High, &parameters)
+        };
+
+        // Empty list: one PASS is enough, every provider still runs and is reported.
+        let (result, providers) = run(serde_json::json!({"acceptedProviders": []}));
+        assert_eq!(result.status, ResultStatus::Pass, "{result:?}");
+        assert_eq!(providers.len(), 3);
+        assert!(providers.iter().all(|provider| !provider.required));
+        assert_eq!(run(serde_json::json!({})).0.status, ResultStatus::Pass);
+
+        // A listed provider that fails makes the requirement fail even if another passes.
+        let (result, providers) = run(serde_json::json!({"acceptedProviders": ["bravo"]}));
+        assert_eq!(result.status, ResultStatus::Fail);
+        assert!(
+            result.summary.contains("Provider bravo (FAIL)"),
+            "{}",
+            result.summary
+        );
+        assert!(
+            providers
+                .iter()
+                .find(|p| p.provider_id == "bravo")
+                .unwrap()
+                .required
+        );
+        assert!(
+            !providers
+                .iter()
+                .find(|p| p.provider_id == "alpha")
+                .unwrap()
+                .required
+        );
+
+        // All listed must pass; the worst listed status wins (FAIL over WARN).
+        assert_eq!(
+            run(serde_json::json!({"acceptedProviders": ["alpha"]}))
+                .0
+                .status,
+            ResultStatus::Pass
+        );
+        assert_eq!(
+            run(serde_json::json!({"acceptedProviders": ["alpha", "charlie"]}))
+                .0
+                .status,
+            ResultStatus::Warn
+        );
+        assert_eq!(
+            run(serde_json::json!({"acceptedProviders": ["charlie", "bravo"]}))
+                .0
+                .status,
+            ResultStatus::Fail
+        );
+
+        // Unknown or malformed lists never run anything and are an ERROR.
+        for bad in [
+            serde_json::json!({"acceptedProviders": ["delta"]}),
+            serde_json::json!({"acceptedProviders": "alpha"}),
+            serde_json::json!({"providerParameters": {"delta": {}}}),
+        ] {
+            let (result, providers) = run(bad);
+            assert_eq!(result.status, ResultStatus::Error);
+            assert!(providers.is_empty());
+        }
+    }
+
+    #[test]
+    fn without_a_passing_provider_the_most_informative_status_is_reported() {
+        let env = TestEnv::new("providers-none");
+        let failing = provider_requirement(
+            &env,
+            &[
+                ("alpha", status_tool("FAIL", "a")),
+                ("bravo", status_tool("FAIL", "b")),
+            ],
+        );
+        let (result, _) = execute_providers(&failing, Priority::High, &serde_json::json!({}));
+        assert_eq!(result.status, ResultStatus::Fail);
+        assert!(result.summary.starts_with("Nessun provider conforme"));
+        let uncertain = provider_requirement(
+            &env,
+            &[
+                ("alpha", status_tool("FAIL", "a")),
+                ("bravo", status_tool("WARNING", "b")),
+            ],
+        );
+        assert_eq!(
+            execute_providers(&uncertain, Priority::High, &serde_json::json!({}))
+                .0
+                .status,
+            ResultStatus::Warn
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_parameters_merge_defaults_with_local_overrides() {
+        let env = TestEnv::new("providers-params");
+        // Echo the received parameters back as the summary.
+        let echo = b"#!/bin/sh\nin=$(cat)\nprintf '{\"status\":\"PASS\",\"summary\":\"%s\"}' \"$(printf '%s' \"$in\" | tr -d '\"')\"\n".to_vec();
+        let requirement = provider_requirement(&env, &[("alpha", echo)]);
+        let (_, providers) = execute_providers(
+            &requirement,
+            Priority::High,
+            &serde_json::json!({"providerParameters": {"alpha": {"local": 7}}}),
+        );
+        let summary = &providers[0].summary;
+        assert!(
+            summary.contains("fromDefault:d") && summary.contains("local:7"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn shipped_antivirus_requirement_is_provider_based_with_empty_accepted_list() {
+        let _env = TestEnv::new("req002-providers");
+        let requirement = find(&catalog().unwrap(), "REQ-002");
+        let ids = requirement
+            .providers
+            .iter()
+            .map(|provider| provider.id.as_str())
+            .collect::<Vec<_>>();
+        if cfg!(windows) {
+            assert_eq!(
+                ids,
+                ["bitdefender-gravityzone", "defender", "security-center"]
+            );
+        } else {
+            assert_eq!(ids, ["bitdefender-gravityzone", "clamav"]);
+        }
+        assert_eq!(
+            requirement.parameters["acceptedProviders"],
+            serde_json::json!([])
+        );
+        assert!(requirement.providers.iter().all(|provider| provider
+            .expected_sha256
+            .as_ref()
+            .is_some_and(|hash| hash.len() == 64)));
+        // Every manifest line names a file of this checkout with the recorded bytes.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for entry in builtin_manifest() {
+            let bytes = fs::read(root.join(entry.path)).unwrap();
+            assert_eq!(
+                sha256_bytes(&bytes).unwrap(),
+                entry.sha256,
+                "{}",
+                entry.path
+            );
+        }
+    }
+
+    #[test]
+    fn installation_integrity_detects_modified_missing_and_unexpected_files() {
+        let env = TestEnv::new("installation");
+        let share = env.root.join("share");
+        let checks = BUILTIN_CATALOG_DIR
+            .strip_prefix(SHARE_DIR)
+            .unwrap()
+            .trim_start_matches('/');
+        // Rebuild the installed layout from the manifest's own source files.
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for entry in builtin_manifest().filter(|entry| entry.platform == platform_key()) {
+            let target = share.join(entry.path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::copy(source.join(entry.path), &target).unwrap();
+        }
+        let clean = installation_integrity_at(Some(share.clone()));
+        assert_eq!(clean.status, IntegrityStatus::Verified);
+        assert_eq!(clean.verified_files, clean.files.len());
+
+        let folder = share.join(checks).join("REQ-003");
+        let config = folder.join("configuration.json");
+        fs::write(&config, b"{}").unwrap();
+        let helper = fs::read_dir(&folder)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.file_name().unwrap() != "configuration.json")
+            .unwrap();
+        fs::remove_file(&helper).unwrap();
+        fs::write(share.join(checks).join("REQ-001/extra.sh"), b"#!/bin/sh\n").unwrap();
+        let altered = installation_integrity_at(Some(share));
+        assert_eq!(altered.status, IntegrityStatus::Mismatch);
+        let state = |path: &str| {
+            altered
+                .files
+                .iter()
+                .find(|file| file.path.ends_with(path))
+                .map(|file| (file.requirement_id.clone(), file.state))
+        };
+        assert_eq!(
+            state("REQ-003/configuration.json"),
+            Some(("REQ-003".into(), FileState::Modified))
+        );
+        let missing = format!("REQ-003/{}", helper.file_name().unwrap().to_string_lossy());
+        assert_eq!(
+            state(&missing),
+            Some(("REQ-003".into(), FileState::Missing))
+        );
+        assert_eq!(
+            state("REQ-001/extra.sh"),
+            Some(("REQ-001".into(), FileState::Unexpected))
+        );
+        assert_eq!(altered.verified_files, altered.files.len() - 3);
+
+        // The gate blocks exactly the altered controls; others run normally.
+        let catalog = catalog().unwrap();
+        for (id, blocked) in [("REQ-001", true), ("REQ-003", true), ("REQ-005", false)] {
+            let requirement = find(&catalog, id);
+            let gate = installation_gate(&requirement, requirement.priority, &altered);
+            assert_eq!(gate.is_some(), blocked, "{id}");
+            if let Some(result) = gate {
+                assert_eq!(result.status, ResultStatus::Error);
+                assert_eq!(result.summary, INTEGRITY_FOLDER_SUMMARY);
+                assert_eq!(
+                    result.provenance.unwrap().integrity_status,
+                    IntegrityStatus::Mismatch
+                );
+            }
+        }
+        drop(env);
+    }
+
+    #[test]
+    fn real_installation_is_verified_and_reported_in_every_audit() {
+        let _env = TestEnv::new("installation-audit");
+        let installation = installation_integrity();
+        assert_eq!(
+            installation.status,
+            IntegrityStatus::Verified,
+            "{:?}",
+            installation.files
+        );
+        let mut catalog = catalog().unwrap();
+        catalog
+            .requirements
+            .retain(|requirement| requirement.id == "REQ-009");
+        let settings = load_settings(&catalog).unwrap();
+        let output = run_audit(&catalog, &settings, true, false, false).unwrap();
+        let report: AuditReport = serde_json::from_str(&output.text).unwrap();
+        let reported = report.installation.unwrap();
+        assert_eq!(reported.status, IntegrityStatus::Verified);
+        assert_eq!(reported.files.len(), installation.files.len());
+        assert!(reported
+            .files
+            .iter()
+            .all(|file| file.actual_sha256.is_some()));
+    }
+
     #[test]
     fn audit_persists_json_then_generates_pdf_from_it_and_reports_client_hash() {
         let _env = TestEnv::new("automatic-pdf");
@@ -3845,10 +4993,14 @@ mod tests {
         assert_eq!(output.code, 0, "PDF failure must not change audit status");
         let artifact = report.pdf.unwrap();
         assert_eq!(artifact.status, "FAILED");
-        assert!(artifact
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("tema")));
+        assert!(
+            artifact
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("report-theme.json")),
+            "{:?}",
+            artifact.error
+        );
     }
 
     #[test]
@@ -4399,7 +5551,7 @@ mod tests {
         assert_eq!(found.len(), 1);
         let config = found[0].2.as_ref().unwrap();
         assert_eq!(config.arguments, vec!["one value", "two"]);
-        assert_eq!(config.tool_path, "./check.sh");
+        assert_eq!(config.tool_path.as_deref(), Some("./check.sh"));
         let check = find(&catalog().unwrap(), "CUSTOM-ARG");
         assert_eq!(
             execute(&check, check.priority, &check.parameters).summary,
@@ -4445,18 +5597,192 @@ mod tests {
     }
 
     #[test]
-    fn settings_for_removed_folders_do_not_block_discovery_refresh() {
-        let _env = TestEnv::new("stale-settings");
+    fn obsolete_settings_file_is_ignored_and_reported() {
+        let _env = TestEnv::new("obsolete-settings");
         let directory = state_dir().unwrap();
         fs::create_dir_all(&directory).unwrap();
         let settings = serde_json::json!({
             "schema_version":"baradwatchu.settings.v1",
-            "requirements":{"CUSTOM-REMOVED":{"enabled":false,"priority":"LOW","parameters":{}}}
+            "requirements":{"REQ-007":{"enabled":false,"priority":"LOW","parameters":{"x":1}}}
         });
         fs::write(directory.join("settings.json"), settings.to_string()).unwrap();
         let current = catalog().unwrap();
         let loaded = load_settings(&current).unwrap();
-        assert!(!loaded.requirements.contains_key("CUSTOM-REMOVED"));
+        let req007 = &loaded.requirements["REQ-007"];
+        assert!(
+            req007.enabled,
+            "settings.json must not change a control any more"
+        );
+        assert_eq!(req007.priority, find(&current, "REQ-007").priority);
+        assert!(obsolete_settings_file().is_some());
+        let data: serde_json::Value =
+            serde_json::from_str(&dashboard_data_json().unwrap()).unwrap();
+        assert!(data["obsoleteSettingsFile"]
+            .as_str()
+            .unwrap()
+            .ends_with("settings.json"));
+        let refresh = run(&[OsString::from("refresh")]).unwrap();
+        assert!(refresh.text.contains("settings.json"), "{}", refresh.text);
+    }
+
+    #[test]
+    fn local_changes_to_builtins_become_visible_configuration_overrides() {
+        let _env = TestEnv::new("config-override");
+        let folder = custom_root().unwrap().join("CUSTOM-REQ-002");
+
+        // configure ⇒ configuration-only CUSTOM folder; the control shows as replaced.
+        let accepted = r#"{"acceptedProviders":["bitdefender-gravityzone"]}"#;
+        run(&["configure".into(), "REQ-002".into(), accepted.into()]).unwrap();
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(folder.join("configuration.json")).unwrap()).unwrap();
+        assert_eq!(config["overrideBuiltinId"], "REQ-002");
+        assert!(config.get("toolPath").is_none() && config.get("expectedSha256").is_none());
+        assert_eq!(
+            fs::read_dir(&folder).unwrap().count(),
+            1,
+            "only configuration.json"
+        );
+        let requirement = find(&catalog().unwrap(), "REQ-002");
+        assert_eq!(requirement.origin, ControlOrigin::Custom);
+        assert!(requirement.configuration_override);
+        assert_eq!(requirement.replaces_builtin.as_deref(), Some("REQ-002"));
+        assert_eq!(
+            requirement.custom_tool_id.as_deref(),
+            Some("CUSTOM-REQ-002")
+        );
+        assert_eq!(
+            requirement.parameters["acceptedProviders"][0],
+            "bitdefender-gravityzone"
+        );
+        assert_eq!(
+            requirement.providers.len(),
+            if cfg!(windows) { 3 } else { 2 }
+        );
+        // The official files still run and stay under the manifest check.
+        let evidence = control_provenance(&requirement);
+        assert_eq!(evidence.origin, ControlOrigin::Custom);
+        assert!(evidence.is_override && evidence.configuration_override);
+        assert_eq!(evidence.integrity_status, IntegrityStatus::Verified);
+        assert_eq!(evidence.integrity_scope, "CHECK_FOLDER");
+        let data: serde_json::Value =
+            serde_json::from_str(&dashboard_data_json().unwrap()).unwrap();
+        let shown = data["requirements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "REQ-002")
+            .unwrap();
+        assert_eq!(shown["configurationOverride"], true);
+        assert_eq!(shown["customToolId"], "CUSTOM-REQ-002");
+        // Back to the official values ⇒ the override folder disappears.
+        run(&[
+            "configure".into(),
+            "REQ-002".into(),
+            r#"{"acceptedProviders":[]}"#.into(),
+        ])
+        .unwrap();
+        assert!(!folder.exists());
+        assert_eq!(
+            find(&catalog().unwrap(), "REQ-002").origin,
+            ControlOrigin::Builtin
+        );
+
+        // disable/enable and priority use the same mechanism.
+        run(&["disable".into(), "REQ-009".into()]).unwrap();
+        let report: AuditReport =
+            serde_json::from_str(&dashboard_check_json("REQ-009").unwrap()).unwrap();
+        assert_eq!(report.results[0].status, ResultStatus::Disabled);
+        assert_eq!(
+            report.results[0]
+                .provenance
+                .as_ref()
+                .unwrap()
+                .override_builtin_id
+                .as_deref(),
+            Some("REQ-009")
+        );
+        run(&["enable".into(), "REQ-009".into()]).unwrap();
+        assert!(!custom_root().unwrap().join("CUSTOM-REQ-009").exists());
+
+        run(&["priority".into(), "REQ-009".into(), "LOW".into()]).unwrap();
+        let report: AuditReport =
+            serde_json::from_str(&dashboard_check_json("REQ-009").unwrap()).unwrap();
+        let result = &report.results[0];
+        assert_eq!(result.priority, Priority::Low);
+        assert!(
+            result.details[0].starts_with("Configurazione locale CUSTOM-REQ-009"),
+            "{:?}",
+            result.details
+        );
+        assert!(
+            result
+                .details
+                .iter()
+                .any(|detail| detail.starts_with("Tool eseguito:")
+                    && detail.contains("baradwatchu-client")),
+            "the official tool must run: {:?}",
+            result.details
+        );
+        let provenance = result.provenance.as_ref().unwrap();
+        assert!(provenance.configuration_override);
+        assert_eq!(provenance.integrity_status, IntegrityStatus::Verified);
+        // Restore deletes a configuration-only override.
+        dashboard_restore_builtin("REQ-009").unwrap();
+        assert!(!custom_root().unwrap().join("CUSTOM-REQ-009").exists());
+
+        // Dashboard saves go through the same override folders.
+        let mut settings = initial_settings(&catalog().unwrap());
+        settings.requirements.get_mut("REQ-007").unwrap().enabled = false;
+        update_dashboard_settings(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(custom_root()
+            .unwrap()
+            .join("CUSTOM-REQ-007/configuration.json")
+            .is_file());
+        assert!(!find(&catalog().unwrap(), "REQ-007").enabled);
+        assert!(
+            obsolete_settings_file().is_none(),
+            "nothing is written to settings.json"
+        );
+    }
+
+    #[test]
+    fn invalid_configuration_only_folders_are_isolated() {
+        let env = TestEnv::new("config-override-invalid");
+        let base = |id: &str, extra: serde_json::Value| {
+            let folder = env.custom_dir().join(id);
+            fs::create_dir_all(&folder).unwrap();
+            let mut config = serde_json::json!({
+                "schemaVersion": CHECK_SCHEMA, "id": id, "name": id, "description": "",
+                "priority": "HIGH", "enabled": true, "parameters": {}
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                config[key] = value.clone();
+            }
+            fs::write(folder.join("configuration.json"), config.to_string()).unwrap();
+        };
+        base("CUSTOM-NOTOOL", serde_json::json!({}));
+        base(
+            "CUSTOM-HASHED",
+            serde_json::json!({"overrideBuiltinId": "REQ-001", "expectedSha256": "a".repeat(64)}),
+        );
+        base(
+            "CUSTOM-ARGS",
+            serde_json::json!({"overrideBuiltinId": "REQ-001", "arguments": ["x"]}),
+        );
+        base(
+            "CUSTOM-PROVIDERS",
+            serde_json::json!({"overrideBuiltinId": "REQ-001", "providers": {"x": {"name": "x", "toolPath": "./x.sh"}}}),
+        );
+        let catalog = catalog().unwrap();
+        for id in [
+            "CUSTOM-NOTOOL",
+            "CUSTOM-HASHED",
+            "CUSTOM-ARGS",
+            "CUSTOM-PROVIDERS",
+        ] {
+            assert!(find(&catalog, id).configuration_error.is_some(), "{id}");
+        }
+        assert_eq!(find(&catalog, "REQ-001").origin, ControlOrigin::Builtin);
     }
 
     #[test]
@@ -4515,14 +5841,7 @@ mod tests {
             "custom configuration accepted a BUILTIN origin"
         );
         fs::write(&config_path, original_config).unwrap();
-        let current_catalog = catalog().unwrap();
-        let mut local_settings = load_settings(&current_catalog).unwrap();
-        local_settings
-            .requirements
-            .get_mut("CUSTOM-001")
-            .unwrap()
-            .enabled = false;
-        save_settings(&local_settings).unwrap();
+        apply_local_change("CUSTOM-001", |enabled, _, _| *enabled = false).unwrap();
         let disabled: AuditReport =
             serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
         assert_eq!(disabled.results[0].status, ResultStatus::Disabled);
@@ -4534,12 +5853,7 @@ mod tests {
                 .integrity_status,
             IntegrityStatus::Verified
         );
-        local_settings
-            .requirements
-            .get_mut("CUSTOM-001")
-            .unwrap()
-            .enabled = true;
-        save_settings(&local_settings).unwrap();
+        apply_local_change("CUSTOM-001", |enabled, _, _| *enabled = true).unwrap();
         thread::sleep(Duration::from_millis(3));
         let mut report: AuditReport =
             serde_json::from_str(&dashboard_check_json("CUSTOM-001").unwrap()).unwrap();
@@ -4808,6 +6122,7 @@ mod tests {
 
     #[test]
     fn audit_log_is_plain_text_and_includes_command_diagnostics() {
+        let _env = TestEnv::new("log-text");
         let result = ResultRecord {
             id: "REQ-009".into(),
             name: "Sicurezza di avvio".into(),
@@ -4825,7 +6140,7 @@ mod tests {
             provenance: None,
         };
         let log = human_result(&result);
-        assert!(log.starts_with("REQ-009  WARN"));
+        assert!(log.starts_with("REQ-009  Avviso"), "{log}");
         assert!(log.contains("Comando: /usr/bin/od"));
         assert!(log.contains("Codice uscita: 1"));
         assert!(!log.trim_start().starts_with('{'));
@@ -4842,6 +6157,7 @@ mod tests {
             client: current_client_identity(),
             pdf: None,
             extensions: AuditExtensions::default(),
+            installation: None,
             log_file: None,
         };
         let log_path = save_audit_at(&directory, &mut report, false).unwrap();
@@ -4939,6 +6255,7 @@ mod tests {
                 client: current_client_identity(),
                 pdf: None,
                 extensions: AuditExtensions::default(),
+                installation: None,
                 log_file: None,
             };
             fs::write(

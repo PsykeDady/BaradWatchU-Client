@@ -8,6 +8,14 @@ fn legacy_commands_and_options_are_rejected() {
     std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
     std::env::set_var("XDG_STATE_HOME", root.join("state"));
     std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
+    // Pin the language so the usage text does not depend on the host locale.
+    let config = root.join("config/baradwatchu");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("language.json"),
+        r#"{"schemaVersion":"baradwatchu.language.v1","language":"english"}"#,
+    )
+    .unwrap();
     for command in [
         vec!["workstation", "list"],
         vec!["workstation", "audit"],
@@ -19,6 +27,10 @@ fn legacy_commands_and_options_are_rejected() {
         let args = command.iter().map(OsString::from).collect::<Vec<_>>();
         let error = cli::run(&args).expect_err("legacy command must be removed");
         assert_eq!(error.code, 2, "command: {command:?}");
-        assert!(error.message.contains("Usage"), "command: {command:?}");
+        assert!(
+            error.message.contains("Usage"),
+            "command: {command:?}: {}",
+            error.message
+        );
     }
 }

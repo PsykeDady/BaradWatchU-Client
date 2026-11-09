@@ -107,7 +107,7 @@ impl App {
             events: item("events", &tr("tray.notifications"), true),
             autostart: CheckMenuItem::with_id(
                 "autostart",
-                &tr("tray.start_login"),
+                tr("tray.start_login"),
                 true,
                 platform::autostart_enabled(),
                 None,

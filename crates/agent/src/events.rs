@@ -5,7 +5,7 @@
 //! shows the history. Nothing here talks to the network or depends on the tray running.
 use crate::requirements::{
     self as req, AuditReport, CliError, CliOutput, IntegrityStatus, ResultStatus,
-    INTEGRITY_GATE_SUMMARY,
+    INTEGRITY_FOLDER_SUMMARY, INTEGRITY_GATE_SUMMARY,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -260,9 +260,19 @@ pub(crate) fn digest(report: &AuditReport) -> AuditDigest {
         other: entry.other,
         ..AuditDigest::default()
     };
+    // Built-in check files that differ from the manifest embedded in the agent, even for
+    // controls that did not run (disabled or replaced by a custom check).
+    if report
+        .installation
+        .as_ref()
+        .is_some_and(|installation| installation.status == IntegrityStatus::Mismatch)
+    {
+        digest.integrity_issues.push("CATALOG".into());
+    }
     for result in &report.results {
         let integrity_blocked = result.status == ResultStatus::Error
             && (result.summary == INTEGRITY_GATE_SUMMARY
+                || result.summary == INTEGRITY_FOLDER_SUMMARY
                 || result
                     .provenance
                     .as_ref()
@@ -627,6 +637,7 @@ mod tests {
 
     fn report(stamp: u64, results: Vec<ResultRecord>) -> AuditReport {
         AuditReport {
+            installation: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: stamp,
             results,
