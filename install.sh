@@ -8,7 +8,9 @@ VERSION=$(awk '/^[[:space:]]*\[workspace[.]package\]/{f=1;next} /^[[:space:]]*\[
 PREFIX=/usr/local BUILD_DIR=${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/baradwatchu/$BIN-$VERSION
 LOCAL=0 UNINSTALL=0 DRY=0 NO_BUILD=0 BUILD_ONLY=0 MISSING=0 PREFIX_SET=0 BUILD_SET=0 REEXEC=0
 # Tray companion (baradwatchu-tray): built and installed unless --without-tray.
-WITH_TRAY=1 TRAY_AUTOSTART=0 TRAY_SET=0
+# Start at login: enabled by default on a first installation (FRESH: no manifest yet); a
+# reinstall keeps the user's choice; --tray-autostart forces it, --no-tray-autostart skips it.
+WITH_TRAY=1 TRAY_AUTOSTART=0 NO_TRAY_AUTOSTART=0 TRAY_SET=0 FRESH=0
 STAGE_DIR='' WEB_BUILD_DIR=''
 cleanup() {
     local path
@@ -33,8 +35,11 @@ Usage: ./install.sh [OPTIONS]
       --prefix=DIR     Install prefix (default /usr/local)
   -U, --uninstall      Remove unchanged files listed in source manifest
       --without-tray   Do not build/install the baradwatchu-tray companion
-      --tray-autostart After installing, start the tray at login for the
-                       invoking user (XDG autostart; no root needed)
+      --tray-autostart Start the tray at login for the invoking user (XDG
+                       autostart; no root needed), also on a reinstall
+      --no-tray-autostart  Do not enable it on a first installation. By
+                       default a first installation enables start at login and
+                       a reinstall keeps the user's choice (tray menu: Avvia al login)
 User-local installation is a limited development copy, not a system-wide agent.
 Run as a normal user: build without root, then use sudo only to copy files into
 a protected system prefix. Failed sudo authentication leaves the build cache
@@ -319,7 +324,7 @@ print_options() { # every run starts with the effective plan
         fi
         option 'binary' "$PREFIX/bin/$BIN"
         if ((UNINSTALL)); then option 'tray' "removed if installed; your autostart entry is removed when it points to $PREFIX/bin/$TRAY_BIN"
-        elif ((WITH_TRAY)); then option 'tray' "$PREFIX/bin/$TRAY_BIN + menu entry; start at login: $( ((TRAY_AUTOSTART)) && echo 'enabled for the invoking user' || echo 'unchanged (tray menu or: baradwatchu-tray autostart enable)')"
+        elif ((WITH_TRAY)); then option 'tray' "$PREFIX/bin/$TRAY_BIN + menu entry; start at login: $(if ((TRAY_AUTOSTART)); then echo 'enabled for the invoking user'; elif ((NO_TRAY_AUTOSTART)); then echo 'not enabled; a reinstall keeps the current choice'; else echo 'enabled on first install for the invoking user; a reinstall keeps the current choice'; fi)"
         else option 'tray' 'not installed (--without-tray)'; fi
         option 'manifest' "$manifest"
         ((BUILD_ONLY)) || option 'privileges' "$privileges"
@@ -506,9 +511,11 @@ remove_user_autostart() {
 }
 post_install_user() {
     ((WITH_TRAY)) || return 0
-    if ((TRAY_AUTOSTART)); then
+    if ((TRAY_AUTOSTART || (FRESH && ! NO_TRAY_AUTOSTART))); then
         if ((EUID == 0)); then echo "Tray autostart not changed for root; as your user run: $PREFIX/bin/$TRAY_BIN autostart enable"
-        else "$PREFIX/bin/$TRAY_BIN" autostart enable; fi
+        else "$PREFIX/bin/$TRAY_BIN" autostart enable || echo 'Warning: tray autostart could not be enabled' >&2; fi
+    elif ((EUID != 0)); then
+        echo "$("$PREFIX/bin/$TRAY_BIN" autostart status 2>/dev/null || true) (unchanged; change it from the tray menu: Avvia al login)"
     fi
     echo "Tray companion: start it with $PREFIX/bin/$TRAY_BIN (or the application menu); closing it does not stop the agent."
 }
@@ -566,6 +573,8 @@ install_source() {
     local app=share/baradwatchu-client/web path rel dest parent o h line tmp i manifest_parent manifest_owner
     local -A old=(); local -a files=() rels=()
     [[ ! -e "$PREFIX" || -d "$PREFIX" ]] || fail 'prefix exists and is not a directory'
+    # Decided before any change (and before a sudo re-exec): no manifest = first installation.
+    if [[ -e "$manifest" || -L "$manifest" ]]; then FRESH=0; else FRESH=1; fi
     if ((NO_BUILD)); then
         ((REEXEC)) || deps runtime || fail 'required runtime dependencies are missing (see the [REQUIRED] items above); nothing was installed'
         validate_build
@@ -637,7 +646,7 @@ install_source() {
 while (($#)); do
     case "$1" in
         -h|--help) usage; exit 0;; -V|--version) echo "BaradWatchU Client $VERSION"; exit 0;;
-        --without-tray) WITH_TRAY=0; TRAY_SET=1;; --tray-autostart) TRAY_AUTOSTART=1; TRAY_SET=1;;
+        --without-tray) WITH_TRAY=0; TRAY_SET=1;; --tray-autostart) TRAY_AUTOSTART=1; TRAY_SET=1;; --no-tray-autostart) NO_TRAY_AUTOSTART=1; TRAY_SET=1;;
         --missing-deps) MISSING=1;; --reexec) REEXEC=1;; --dry-run) DRY=1;; --no-build) NO_BUILD=1;; --build-only) BUILD_ONLY=1;; --local) LOCAL=1;; -U|--uninstall) UNINSTALL=1;;
         --prefix=*) PREFIX=${1#*=}; PREFIX_SET=1;; --prefix) shift; (($#))||badarg '--prefix requires DIR'; PREFIX=$1; PREFIX_SET=1;;
         --build-dir=*) BUILD_DIR=${1#*=}; BUILD_SET=1;; --build-dir) shift; (($#))||badarg '--build-dir requires DIR'; BUILD_DIR=$1; BUILD_SET=1;;
@@ -649,7 +658,8 @@ if ((MISSING)); then ((DRY+NO_BUILD+BUILD_ONLY+LOCAL+UNINSTALL+PREFIX_SET+BUILD_
 ((BUILD_ONLY==0||DRY==0&&NO_BUILD==0&&LOCAL==0&&UNINSTALL==0&&PREFIX_SET==0))||badarg '--build-only conflicts with install options'
 ((BUILD_ONLY==0||BUILD_SET==1))||badarg '--build-only requires explicit --build-dir=DIR'
 ((LOCAL==0||PREFIX_SET==0))||badarg '--local conflicts with --prefix'
-((WITH_TRAY==1||TRAY_AUTOSTART==0))||badarg '--tray-autostart conflicts with --without-tray'
+((WITH_TRAY==1||TRAY_AUTOSTART==0&&NO_TRAY_AUTOSTART==0))||badarg 'tray autostart options conflict with --without-tray'
+((TRAY_AUTOSTART==0||NO_TRAY_AUTOSTART==0))||badarg '--tray-autostart conflicts with --no-tray-autostart'
 ((UNINSTALL==0||TRAY_SET==0))||badarg '--uninstall removes the tray when installed; tray options do not apply'
 ((UNINSTALL==0||NO_BUILD==0&&BUILD_SET==0))||badarg '--uninstall conflicts with build options'
 if ((LOCAL)); then [[ "$EUID" != 0 && -n "${HOME:-}" ]]||fail '--local requires a non-root user with HOME'; PREFIX="$HOME/.local"; fi

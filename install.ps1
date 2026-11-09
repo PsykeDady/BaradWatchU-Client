@@ -15,6 +15,7 @@ param(
     [Alias('U')][switch]$Uninstall,
     [switch]$WithoutTray,
     [switch]$TrayAutostart,
+    [switch]$NoTrayAutostart,
     [switch]$Package,
     [string]$OutputDir = ''
 )
@@ -50,7 +51,10 @@ Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [OPTION
   -Prefix DIR        Installation folder (default %LOCALAPPDATA%\Programs\BaradWatchU)
   -Uninstall, -U     Remove unchanged files listed in the installation manifest
   -WithoutTray       Do not build/install the baradwatchu-tray companion
-  -TrayAutostart     After installing, start the tray at login (HKCU Run key)
+  -TrayAutostart     Enable start of the tray at login (HKCU Run key), also on a reinstall
+  -NoTrayAutostart   Do not enable it on a first installation. By default a first
+                     installation enables start at login and a reinstall keeps the
+                     user's choice (tray menu: Avvia al login)
   -Package           Build a per-user setup.exe with Inno Setup 6 instead of
                      installing (with -OutputDir DIR, default BUILDDIR\dist)
 Everything runs as the current user: files go to a per-user folder and Start
@@ -577,10 +581,15 @@ function Remove-TrayAutostart {
 function Invoke-PostInstall {
     if ($WithoutTray) { return }
     $tray = Join-Path $Prefix "bin\$TrayBin"
-    if ($TrayAutostart) {
+    # Start at login: on by default for a first installation; a reinstall keeps the user's
+    # choice (tray menu "Avvia al login"); -TrayAutostart forces it, -NoTrayAutostart skips it.
+    if ($TrayAutostart -or ($script:FreshInstall -and -not $NoTrayAutostart)) {
         $result = Invoke-Tray $tray @('autostart', 'enable')
         if ($result.Text) { Write-Host $result.Text }
         if ($result.Code -ne 0) { Write-Host 'Warning: tray autostart could not be enabled' -ForegroundColor Yellow }
+    } else {
+        $result = Invoke-Tray $tray @('autostart', 'status')
+        if ($result.Text) { Write-Host "$($result.Text) (unchanged; change it from the tray menu: Avvia al login)" }
     }
     Write-Host "Tray companion: start it with $tray (or the Start menu); closing it does not stop the agent."
 }
@@ -632,6 +641,8 @@ function Invoke-Install {
     } else {
         Invoke-Build
     }
+    # First installation = no manifest yet; it decides the start-at-login default.
+    $script:FreshInstall = -not (Test-Path -LiteralPath (Get-ManifestPath))
     $stage = Join-Path $BuildDir ('stage-' + [Guid]::NewGuid().ToString('N'))
     try {
         New-Stage $stage
@@ -724,7 +735,8 @@ function Show-Options([string]$Action) {
     if ($Action -eq 'package') { Write-Host ('  {0,-18} {1}' -f 'output', $OutputDir) }
     if ($Action -ne 'uninstall') {
         Write-Host ('  {0,-18} {1}' -f 'tray', $(if ($WithoutTray) { 'not built' } else { 'built and installed' }))
-        Write-Host ('  {0,-18} {1}' -f 'tray autostart', $(if ($TrayAutostart) { 'enabled after install' } else { 'unchanged' }))
+        $autostart = if ($WithoutTray) { 'not applicable' } elseif ($TrayAutostart) { 'enabled after install' } elseif ($NoTrayAutostart) { 'not enabled (a reinstall keeps the current choice)' } else { 'enabled on first install; a reinstall keeps the current choice' }
+        Write-Host ('  {0,-18} {1}' -f 'tray autostart', $autostart)
         Write-Host ('  {0,-18} {1}' -f 'reuse build', $(if ($NoBuild) { 'yes (-NoBuild)' } else { 'no' }))
     }
     Write-Host ('  {0,-18} {1}' -f 'dry run', $(if ($DryRun) { 'yes' } else { 'no' }))
@@ -734,7 +746,7 @@ function Show-Options([string]$Action) {
 
 if ($Help) { Show-Usage; exit 0 }
 if ($Version) { Write-Host "BaradWatchU Client $ProductVersion"; exit 0 }
-$installSet = $DryRun -or $NoBuild -or $BuildOnly -or $Uninstall -or $Package -or $Prefix -or $BuildDir -or $OutputDir -or $WithoutTray -or $TrayAutostart
+$installSet = $DryRun -or $NoBuild -or $BuildOnly -or $Uninstall -or $Package -or $Prefix -or $BuildDir -or $OutputDir -or $WithoutTray -or $TrayAutostart -or $NoTrayAutostart
 if ($MissingDeps) {
     if ($installSet) { BadArg '-MissingDeps conflicts with other options' }
     Show-Options 'dependency check'
@@ -742,10 +754,11 @@ if ($MissingDeps) {
 }
 if ($BuildOnly -and ($DryRun -or $NoBuild -or $Uninstall -or $Prefix -or $Package)) { BadArg '-BuildOnly conflicts with install options' }
 if ($BuildOnly -and -not $BuildDir) { BadArg '-BuildOnly requires an explicit -BuildDir DIR' }
-if ($WithoutTray -and $TrayAutostart) { BadArg '-TrayAutostart conflicts with -WithoutTray' }
-if ($Uninstall -and ($WithoutTray -or $TrayAutostart)) { BadArg '-Uninstall removes the tray when installed; tray options do not apply' }
+if ($WithoutTray -and ($TrayAutostart -or $NoTrayAutostart)) { BadArg 'tray autostart options conflict with -WithoutTray' }
+if ($TrayAutostart -and $NoTrayAutostart) { BadArg '-TrayAutostart conflicts with -NoTrayAutostart' }
+if ($Uninstall -and ($WithoutTray -or $TrayAutostart -or $NoTrayAutostart)) { BadArg '-Uninstall removes the tray when installed; tray options do not apply' }
 if ($Uninstall -and ($NoBuild -or $BuildDir -or $Package)) { BadArg '-Uninstall conflicts with build options' }
-if ($Package -and ($Prefix -or $TrayAutostart -or $DryRun)) { BadArg '-Package builds a setup; -Prefix, -TrayAutostart and -DryRun do not apply' }
+if ($Package -and ($Prefix -or $TrayAutostart -or $NoTrayAutostart -or $DryRun)) { BadArg '-Package builds a setup; -Prefix, tray autostart options and -DryRun do not apply' }
 if ($OutputDir -and -not $Package) { BadArg '-OutputDir requires -Package' }
 
 if (-not $Prefix) { $Prefix = Join-Path $env:LOCALAPPDATA 'Programs\BaradWatchU' }

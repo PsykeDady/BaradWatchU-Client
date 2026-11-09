@@ -62,7 +62,9 @@ en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Clo
 
 #if WithTray == "1"
 [Tasks]
-Name: "trayautostart"; Description: "{cm:TrayAutostart}"; Flags: unchecked
+; Selected by default, offered only on a first installation: an upgrade keeps the user's
+; choice (tray menu "Avvia al login"). Silent opt-out: /MERGETASKS="!trayautostart".
+Name: "trayautostart"; Description: "{cm:TrayAutostart}"; Check: IsFirstInstall
 #endif
 
 [Files]
@@ -92,6 +94,12 @@ Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart disable"; Fla
 #endif
 
 [Code]
+{ No uninstall entry for this AppId yet: first installation for the current user. }
+function IsFirstInstall(): Boolean;
+begin
+  Result := not RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}_is1');
+end;
+
 { Counts BaradWatchU programs running from Dir (WMI, current user's view). Never stops them. }
 function RunningFrom(const Dir: String): Integer;
 var
