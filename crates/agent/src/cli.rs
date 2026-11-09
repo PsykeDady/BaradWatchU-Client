@@ -40,6 +40,7 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
         Some("notifications") => Some(crate::events::run_notifications(&args[1..])),
         Some("events") => Some(crate::events::run_events(&args[1..])),
         Some("history") => Some(crate::history::run(&args[1..])),
+        Some("report-theme") => Some(crate::pdf::run_theme(&args[1..])),
         _ => None,
     };
     routed

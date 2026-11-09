@@ -14,6 +14,8 @@ use std::{
 };
 
 const THEME_SCHEMA: &str = "baradwatchu.report-theme.v1";
+const DEFAULT_THEME_ID: &str = "default";
+const THEME_SELECTION_SCHEMA: &str = "baradwatchu.report-theme-selection.v1";
 const TEMPLATE_VERSION: &str = "1.2.1";
 const PAGE_W: f32 = 595.28;
 const PAGE_H: f32 = 841.89;
@@ -38,6 +40,40 @@ pub(crate) struct ReportTheme {
     pub accent_color: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeFile {
+    id: String,
+    name: String,
+    #[serde(flatten)]
+    theme: ReportTheme,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeOption {
+    id: String,
+    name: String,
+    logo_path: Option<String>,
+    primary_color: String,
+    secondary_color: String,
+    accent_color: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemeCatalog {
+    schema_version: &'static str,
+    selected_theme_id: String,
+    themes: Vec<ThemeOption>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThemeSelection {
+    theme: String,
+}
+
 impl Default for ReportTheme {
     fn default() -> Self {
         Self {
@@ -50,43 +86,201 @@ impl Default for ReportTheme {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ThemeUpdate {
-    schema_version: String,
-    logo_path: Option<String>,
-    primary_color: String,
-    secondary_color: String,
-    accent_color: String,
-}
-
 fn theme_path() -> Result<PathBuf, CliError> {
     Ok(req::state_dir()?.join("report-theme.json"))
 }
 
-fn read_theme() -> Result<ReportTheme, String> {
-    let path = theme_path().map_err(|error| error.0)?;
-    if let Ok(metadata) = fs::symlink_metadata(&path) {
-        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 16 * 1024 {
-            return Err("file tema non sicuro o oltre 16 KiB".into());
-        }
-    }
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let theme = ReportTheme::default();
-            if let Some(parent) = path.parent() {
-                req::ensure_private_dir(parent).map_err(|error| error.0)?;
+fn themes_dir() -> Result<PathBuf, CliError> {
+    Ok(req::state_dir()?.join("themes"))
+}
+
+fn valid_theme_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != DEFAULT_THEME_ID
+        && id.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
+        })
+}
+
+fn theme_catalog() -> Result<ThemeCatalog, String> {
+    let mut themes = vec![ThemeOption {
+        id: DEFAULT_THEME_ID.into(),
+        name: "BaradWatchU".into(),
+        logo_path: None,
+        primary_color: "#111111".into(),
+        secondary_color: "#FFFFFF".into(),
+        accent_color: "#B3262D".into(),
+    }];
+    let directory = themes_dir().map_err(|error| error.0)?;
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            let entries = fs::read_dir(&directory)
+                .map_err(|error| format!("cartella temi non leggibile: {error}"))?;
+            for entry in entries {
+                let entry = entry.map_err(|error| format!("elenco temi non leggibile: {error}"))?;
+                let path = entry.path();
+                if path.extension().is_none_or(|extension| extension != "json") {
+                    continue;
+                }
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|error| format!("file tema non leggibile: {error}"))?;
+                if !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                    || metadata.len() > 16 * 1024
+                {
+                    continue;
+                }
+                let bytes =
+                    fs::read(&path).map_err(|error| format!("file tema non leggibile: {error}"))?;
+                let Ok(file) = serde_json::from_slice::<ThemeFile>(&bytes) else {
+                    continue;
+                };
+                let filename = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default();
+                if !valid_theme_id(&file.id)
+                    || file.id != filename
+                    || file.name.trim().is_empty()
+                    || file.name.len() > 128
+                    || validate_theme(&file.theme).is_err()
+                {
+                    continue;
+                }
+                themes.push(ThemeOption {
+                    id: file.id,
+                    name: file.name,
+                    logo_path: file.theme.logo_path,
+                    primary_color: file.theme.primary_color,
+                    secondary_color: file.theme.secondary_color,
+                    accent_color: file.theme.accent_color,
+                });
             }
-            req::atomic_json(&path, &theme).map_err(|error| error.0)?;
-            return Ok(theme);
         }
-        Err(error) => return Err(format!("configurazione tema non leggibile: {error}")),
+        Ok(_) => return Err("la cartella temi non è sicura".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cartella temi non leggibile: {error}")),
+    }
+    themes.sort_by(|left, right| left.id.cmp(&right.id));
+    themes.sort_by_key(|theme| theme.id != DEFAULT_THEME_ID);
+    let selection_path = theme_path().map_err(|error| error.0)?;
+    let selected_theme_id = match fs::symlink_metadata(&selection_path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 16 * 1024 =>
+        {
+            let bytes = fs::read(&selection_path)
+                .map_err(|error| format!("selezione tema non leggibile: {error}"))?;
+            let selection: ThemeSelection = serde_json::from_slice(&bytes)
+                .map_err(|_| "file report-theme.json non valido".to_owned())?;
+            if selection.theme != DEFAULT_THEME_ID && !valid_theme_id(&selection.theme) {
+                return Err("ID del tema selezionato non valido".into());
+            }
+            selection.theme
+        }
+        Ok(_) => return Err("file di selezione tema non sicuro o oltre 16 KiB".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => DEFAULT_THEME_ID.into(),
+        Err(error) => return Err(format!("selezione tema non leggibile: {error}")),
     };
-    let theme: ReportTheme = serde_json::from_slice(&bytes)
-        .map_err(|_| "configurazione tema non valida (report-theme.json)".to_owned())?;
-    validate_theme(&theme).map_err(|error| format!("configurazione tema non valida: {error}"))?;
-    Ok(theme)
+    Ok(ThemeCatalog {
+        schema_version: THEME_SELECTION_SCHEMA,
+        selected_theme_id,
+        themes,
+    })
+}
+
+fn selected_theme() -> Result<ReportTheme, String> {
+    let catalog = theme_catalog()?;
+    if catalog.selected_theme_id == DEFAULT_THEME_ID {
+        return Ok(ReportTheme::default());
+    }
+    let Some(option) = catalog
+        .themes
+        .iter()
+        .find(|theme| theme.id == catalog.selected_theme_id)
+    else {
+        return Err(format!(
+            "tema report selezionato non disponibile: {}",
+            catalog.selected_theme_id
+        ));
+    };
+    if option.id == DEFAULT_THEME_ID {
+        return Ok(ReportTheme::default());
+    }
+    let path = themes_dir()
+        .map_err(|error| error.0)?
+        .join(format!("{}.json", option.id));
+    let bytes = fs::read(&path).map_err(|_| {
+        format!(
+            "tema report selezionato non trovato: {}",
+            catalog.selected_theme_id
+        )
+    })?;
+    let file: ThemeFile = serde_json::from_slice(&bytes)
+        .map_err(|_| "file del tema selezionato non valido".to_owned())?;
+    validate_theme(&file.theme).map_err(|error| format!("tema selezionato non valido: {error}"))?;
+    Ok(file.theme)
+}
+
+pub(crate) fn run_theme(args: &[std::ffi::OsString]) -> Result<req::CliOutput, CliError> {
+    let words: Vec<_> = args
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .ok_or_else(|| CliError("argomento tema non valido".into()))
+        })
+        .collect::<Result<_, _>>()?;
+    match words.as_slice() {
+        ["list"] => {
+            let catalog = theme_catalog().map_err(CliError)?;
+            let output = catalog
+                .themes
+                .iter()
+                .map(|theme| {
+                    format!(
+                        "{}{} — {}",
+                        if theme.id == catalog.selected_theme_id {
+                            "* "
+                        } else {
+                            "  "
+                        },
+                        theme.id,
+                        theme.name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Ok(req::CliOutput {
+                text: format!("{output}\n"),
+                code: 0,
+            })
+        }
+        ["use", id] => {
+            let catalog = theme_catalog().map_err(CliError)?;
+            if !catalog.themes.iter().any(|theme| theme.id == *id) {
+                return Err(CliError(format!("tema non trovato: {id}")));
+            }
+            let path = theme_path()?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| CliError("percorso tema non valido".into()))?;
+            req::ensure_private_dir(parent)?;
+            req::atomic_json(&path, &serde_json::json!({"theme": id}))?;
+            Ok(req::CliOutput {
+                text: format!("Tema report selezionato: {id}\n"),
+                code: 0,
+            })
+        }
+        _ => Err(CliError(
+            "Uso: report-theme list | report-theme use ID".into(),
+        )),
+    }
+}
+
+fn read_theme() -> Result<ReportTheme, String> {
+    selected_theme()
 }
 
 fn parse_color(value: &str) -> Result<[u8; 3], String> {
@@ -179,41 +373,27 @@ fn theme_warning(theme: &ReportTheme) -> Result<Option<String>, String> {
 }
 
 pub(crate) fn dashboard_theme_json() -> Result<String, CliError> {
-    let theme = read_theme().map_err(CliError)?;
-    req::output_json(&theme)
+    let catalog = theme_catalog().map_err(CliError)?;
+    req::output_json(&catalog)
 }
 
 pub(crate) fn dashboard_update_theme(text: &str) -> Result<String, CliError> {
     if text.len() > 16 * 1024 {
         return Err(CliError("Configurazione tema troppo grande".into()));
     }
-    let update: ThemeUpdate = serde_json::from_str(text)
-        .map_err(|_| CliError("JSON configurazione tema non valido".into()))?;
-    let theme = ReportTheme {
-        schema_version: update.schema_version,
-        logo_path: update.logo_path,
-        primary_color: update.primary_color,
-        secondary_color: update.secondary_color,
-        accent_color: update.accent_color,
-    };
-    validate_theme(&theme).map_err(CliError)?;
-    if let Some(path) = &theme.logo_path {
-        let metadata =
-            fs::metadata(path).map_err(|error| CliError(format!("Logo non leggibile: {error}")))?;
-        if !metadata.is_file() || metadata.len() > MAX_LOGO_BYTES as u64 {
-            return Err(CliError(
-                "Il logo deve essere un file di massimo 2 MiB".into(),
-            ));
-        }
-        load_logo(path).map_err(CliError)?;
+    let update: ThemeSelection = serde_json::from_str(text)
+        .map_err(|_| CliError("JSON selezione tema non valido".into()))?;
+    let catalog = theme_catalog().map_err(CliError)?;
+    if !catalog.themes.iter().any(|theme| theme.id == update.theme) {
+        return Err(CliError(format!("tema non trovato: {}", update.theme)));
     }
     let path = theme_path()?;
     let parent = path
         .parent()
         .ok_or_else(|| CliError("Percorso tema non valido".into()))?;
     req::ensure_private_dir(parent)?;
-    req::atomic_json(&path, &theme)?;
-    req::output_json(&theme)
+    req::atomic_json(&path, &update)?;
+    dashboard_theme_json()
 }
 
 fn current_report_path(stamp: u64) -> Result<PathBuf, CliError> {
@@ -2020,23 +2200,24 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_theme_defaults_and_stores_edits_in_user_configuration() {
+    fn dashboard_lists_default_theme_and_stores_selection_in_user_configuration() {
         let _env = req::TestEnv::new("pdf-theme");
-        let initial: ReportTheme = serde_json::from_str(&dashboard_theme_json().unwrap()).unwrap();
-        assert_eq!(initial.primary_color, "#111111");
-        assert_eq!(initial.secondary_color, "#FFFFFF");
-        assert_eq!(initial.accent_color, "#B3262D");
-        let updated = serde_json::json!({
-            "schemaVersion": THEME_SCHEMA,
-            "logoPath": null,
-            "primaryColor": "#202020",
-            "secondaryColor": "#FAFAFA",
-            "accentColor": "#B3262D"
+        let initial: ThemeCatalog = serde_json::from_str(&dashboard_theme_json().unwrap()).unwrap();
+        assert_eq!(initial.selected_theme_id, DEFAULT_THEME_ID);
+        assert_eq!(initial.themes.len(), 1);
+        assert_eq!(initial.themes[0].accent_color, "#B3262D");
+        let themes = themes_dir().unwrap();
+        fs::create_dir_all(&themes).unwrap();
+        let custom = serde_json::json!({
+            "id": "custom-test", "name": "Test theme", "schemaVersion": THEME_SCHEMA,
+            "logoPath": null, "primaryColor": "#202020", "secondaryColor": "#FAFAFA", "accentColor": "#B3262D"
         });
-        let saved: ReportTheme =
-            serde_json::from_str(&dashboard_update_theme(&updated.to_string()).unwrap()).unwrap();
-        assert_eq!(saved.primary_color, "#202020");
-        assert_eq!(saved.secondary_color, "#FAFAFA");
+        fs::write(themes.join("custom-test.json"), custom.to_string()).unwrap();
+        let saved: ThemeCatalog =
+            serde_json::from_str(&dashboard_update_theme(r#"{"theme":"custom-test"}"#).unwrap())
+                .unwrap();
+        assert_eq!(saved.selected_theme_id, "custom-test");
+        assert_eq!(selected_theme().unwrap().primary_color, "#202020");
         assert!(theme_path().unwrap().is_file());
     }
 

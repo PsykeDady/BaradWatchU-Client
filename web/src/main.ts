@@ -13,7 +13,8 @@ interface Requirement { id: string; name: string; description: string; enabled: 
 interface AuditResult { id: string; name: string; description?: string; priority: Priority; status: ResultStatus; complianceStatus?: ResultStatus; summary: string; details: string[]; completedAtUnixMs: number; provenance?: Provenance; }
 interface PdfArtifact { status: 'GENERATED' | 'FAILED'; path?: string; error?: string; warning?: string; }
 interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; }
-interface ReportTheme { schemaVersion: string; logoPath: string | null; primaryColor: string; secondaryColor: string; accentColor: string; }
+interface ReportThemeOption { id: string; name: string; logoPath: string | null; primaryColor: string; secondaryColor: string; accentColor: string; }
+interface ReportThemeCatalog { schemaVersion: string; selectedThemeId: string; themes: ReportThemeOption[]; }
 interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; }
 interface HistoryUsage { audits: number; files: number; bytes: number; }
 interface HistoryRemoval { removedAudits: number; removedFiles: number; freedBytes: number; usage: HistoryUsage; }
@@ -341,17 +342,18 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <div class="form-head"><h2>{{ t('ui.settings.notifications') }}</h2></div>
               <p class="hint">{{ t('ui.settings.notifications_hint') }} <a href="#/notifiche" (click)="go('notifications', $event)">{{ t('ui.nav.notifications') }}</a>.</p>
             </div>
-            <div class="form-panel" *ngIf="reportTheme as theme">
-              <div class="form-head"><h2>{{ t('ui.settings.pdf_theme') }}</h2><button class="button secondary small" type="button" (click)="saveReportTheme()" [disabled]="saving">{{ t('ui.settings.save_theme') }}</button></div>
+            <div class="form-panel" *ngIf="reportTheme as catalog">
+              <div class="form-head"><h2>{{ t('ui.settings.pdf_theme') }}</h2></div>
               <p class="hint">{{ t('ui.settings.pdf_hint') }}</p>
-              <p class="hint">{{ t('ui.settings.configuration') }} <code>{{ config.paths.configuration }}/report-theme.json</code></p>
-              <div class="form-grid">
-                <label class="wide">{{ t('ui.settings.logo_path') }}<input [value]="theme.logoPath || ''" (input)="theme.logoPath = inputValue($event) || null" [placeholder]="t('ui.settings.logo_placeholder')"><small>{{ t('ui.settings.logo_help') }}</small></label>
-                <label>{{ t('ui.settings.text_color') }}<input type="color" [value]="theme.primaryColor" (input)="theme.primaryColor = inputValue($event)"></label>
-                <label>{{ t('ui.settings.background') }}<input type="color" [value]="theme.secondaryColor" (input)="theme.secondaryColor = inputValue($event)"></label>
-                <label>{{ t('ui.settings.accent') }}<input type="color" [value]="theme.accentColor" (input)="theme.accentColor = inputValue($event)"></label>
-              </div>
-              <p class="warning-box" *ngIf="reportThemeWarning">{{ reportThemeWarning }}</p>
+              <p class="hint">{{ t('ui.settings.themes_folder') }} <code>{{ config.paths.configuration }}/themes/</code></p>
+              <label class="wide">{{ t('ui.settings.pdf_theme') }}
+                <select [disabled]="saving" (change)="saveReportTheme($event)">
+                  <option *ngIf="!selectedReportTheme" [value]="catalog.selectedThemeId" [selected]="true" disabled>{{ t('ui.settings.theme_missing').replace('{id}', catalog.selectedThemeId) }}</option>
+                  <option *ngFor="let theme of catalog.themes" [value]="theme.id" [selected]="theme.id === catalog.selectedThemeId">{{ theme.name }} ({{ theme.id }})</option>
+                </select>
+              </label>
+              <p class="hint" *ngIf="selectedReportTheme as theme">{{ t('ui.settings.theme_accent') }} <code>{{ theme.accentColor }}</code> · {{ t('ui.settings.theme_logo') }} <code>{{ theme.logoPath || t('ui.settings.theme_default_logo') }}</code></p>
+              <p class="hint">{{ t('ui.settings.theme_cli') }} <code>baradwatchu-agent report-theme list</code> · <code>baradwatchu-agent report-theme use ID</code></p>
             </div>
             <div class="section-heading"><div><p class="eyebrow">{{ t('ui.settings.local_data') }}</p><h2 id="paths-title">{{ t('ui.settings.folders') }}</h2></div></div>
             <dl class="facts" aria-labelledby="paths-title">
@@ -414,7 +416,7 @@ class AppComponent implements OnInit {
   importFile: File | null = null;
   notifications: NotificationsView | null = null;
   configuration: ConfigurationView | null = null;
-  reportTheme: ReportTheme | null = null;
+  reportTheme: ReportThemeCatalog | null = null;
   uiMessages: UiMessages | null = null;
   private readonly token = sessionToken();
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
@@ -426,18 +428,7 @@ class AppComponent implements OnInit {
   get customs(): Requirement[] { return this.requirements.filter(item => item.origin === 'CUSTOM'); }
   get pendingConsents(): number { return this.notifications?.consents.filter(item => item.state === 'PENDING').length ?? 0; }
   get trayText(): string { const running = this.notifications?.trayRunning; return this.t(running === true ? 'ui.settings.tray_active' : running === false ? 'ui.settings.tray_inactive' : 'ui.settings.tray_unknown'); }
-  get reportThemeWarning(): string {
-    if (!this.reportTheme) return '';
-    const ratio = this.contrast(this.reportTheme.primaryColor, this.reportTheme.secondaryColor);
-    const accent = this.contrast(this.reportTheme.accentColor, this.reportTheme.secondaryColor);
-    const italian = this.uiMessages?.effectiveLanguage === 'it_IT';
-    const locale = italian ? 'it-IT' : 'en-GB';
-    const number = (value: number): string => value.toLocaleString(locale, { minimumFractionDigits: 1, maximumFractionDigits: 1 });
-    const warnings: string[] = [];
-    if (ratio < 4.5) warnings.push(this.t('pdf.warning.text_contrast').replace('{ratio}', number(ratio)).replace('{minimum}', italian ? '4,5' : '4.5'));
-    if (accent < 3) warnings.push(this.t('pdf.warning.accent_contrast').replace('{ratio}', number(accent)).replace('{minimum}', '3'));
-    return warnings.join('. ');
-  }
+  get selectedReportTheme(): ReportThemeOption | undefined { return this.reportTheme?.themes.find(theme => theme.id === this.reportTheme?.selectedThemeId); }
   get customProblems(): number { return this.customs.filter(item => item.configurationError || item.integrityStatus !== 'VERIFIED').length; }
   get overridableBuiltins(): Requirement[] { return this.requirements.filter(item => item.origin === 'BUILTIN'); }
   get canImport(): boolean { return !!this.importFile && this.validId(this.form.id) && this.form.name.trim().length > 0; }
@@ -781,25 +772,16 @@ class AppComponent implements OnInit {
     }
     finally { this.historyLoading = false; }
   }
-  private async loadReportTheme(): Promise<void> { this.reportTheme = await this.request<ReportTheme>('/api/report-theme'); }
-  async saveReportTheme(): Promise<void> {
+  private async loadReportTheme(): Promise<void> { this.reportTheme = await this.request<ReportThemeCatalog>('/api/report-theme'); }
+  async saveReportTheme(event: Event): Promise<void> {
     if (!this.reportTheme) return;
-    const value = { ...this.reportTheme, logoPath: this.reportTheme.logoPath?.trim() || null };
+    const value = { theme: this.inputValue(event) };
     this.saving = true; this.error = '';
     try {
-      this.reportTheme = await this.request<ReportTheme>('/api/report-theme', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+      this.reportTheme = await this.request<ReportThemeCatalog>('/api/report-theme', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
       this.flash(this.t('ui.save.pdf_theme'));
     } catch (error: unknown) { this.error = this.errorText(error); }
     finally { this.saving = false; }
-  }
-  private contrast(foreground: string, background: string): number {
-    const luminance = (color: string): number => {
-      const hex = color.replace('#', '');
-      const channels = [0, 2, 4].map(index => parseInt(hex.slice(index, index + 2), 16) / 255).map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
-      return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
-    };
-    const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
-    return (values[0] + 0.05) / (values[1] + 0.05);
   }
   async openPdf(report: AuditReport, event?: Event): Promise<void> {
     event?.preventDefault();
