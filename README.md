@@ -97,14 +97,14 @@ baradwatchu-agent audit [--json] [--notify] [--log]
 baradwatchu-agent status [--json]
 baradwatchu-agent custom accept CUSTOM-ID
 baradwatchu-agent custom remove CUSTOM-ID
-baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]
+baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications|settings]
 baradwatchu-agent notifications [--json]
 baradwatchu-agent notifications set enabled|informative on|off
 baradwatchu-agent events --json [--after ID]
 baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]
 baradwatchu-agent consent list [--json]
 baradwatchu-agent consent accept|reject REQUEST-ID
-baradwatchu-tray [--version | --help | autostart enable|disable|status]
+baradwatchu-tray [--version | --help | autostart enable|disable|status [--json]]
 ```
 
 During development use `cargo run -p baradwatchu-agent -- …`. Exit codes of `audit`/`check`: 0 all passed (or disabled/not applicable), 4 at least one `WARN`, 3 at least one `FAIL`, 1 at least one `ERROR`, 2 usage error. Every audit is saved as JSON under `~/.cache/baradwatchu/audit/reports/` for `status` and the dashboard history; `--log` also writes a plain-text `.log` with tools, exit codes and diagnostics in `~/.cache/baradwatchu/audit/`. This folder is disposable: deleting it only clears the history and the last result. History from `~/.local/state/baradwatchu/audits/` is moved there automatically once. `list --json` and the dashboard API use camelCase field names. `custom accept` and `custom remove` work even when the folder's configuration is invalid. The former `workstation`, `policy validate`, `audit --policy`, `audit --format` and `audit --local-config` commands are removed; the CLI rejects them before reading any local data. Every completed audit (CLI, dashboard or tray) also appends one event to `~/.local/state/baradwatchu/events.jsonl` (last 200 kept); `events --json` is the compact state the tray polls and `notifications` shows or changes the notification preferences (`~/.config/baradwatchu/notifications.json`).
@@ -116,6 +116,7 @@ During development use `cargo run -p baradwatchu-agent -- …`. Exit codes of `a
 - **Workstation status:** last audit summary (the counters filter the list), filters by outcome, search, requirements sorted by severity after an audit, per-requirement details, settings, parameters, and collapsed technical/integrity details. Historical audits can be opened from the side panel without changing the current state.
 - **Custom checks:** a separate section lists your checks with integrity state and last outcome, and offers **Check now**, **Accept current version**, **Upload new file**, **Restore built-in** (for overrides) and **Delete**. Invalid folders appear with their error and can be deleted. **New check** opens the import form: ID (next free `CUSTOM-NNN` suggested), name, description, priority, timeout, file, arguments and, under advanced options, copying metadata or overriding a built-in. The file keeps its name inside the new folder. The section also explains the folder layout and output contract.
 - **Notifications:** notification preferences (desktop notifications on/off, informative ones on/off), whether the tray is running, the local event history and the consent requests. **Simulate a request** creates a local 60-second test request; the dashboard never decides a request. `#/history` opens the status page at the audit history.
+- **Settings:** start of the tray at login (the same switch as **Start at login** in the tray menu; the agent runs the tray installed next to it with `autostart enable|disable|status --json`, fixed arguments, no shell, 10-second timeout), whether the tray is installed and running (Linux: live PID; Windows: the tray's exclusive lock on `tray.lock`), version, operating system, installation folder and the local data folders (settings, custom checks, events and consent, audit history, session files). Uninstalling never deletes those folders. `dashboard --open settings` or `#/impostazioni` opens it.
 
 Development build:
 

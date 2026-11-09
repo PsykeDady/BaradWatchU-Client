@@ -668,7 +668,7 @@ fn valid_custom_id(id: &str) -> bool {
 
 /// `$XDG_CONFIG_HOME/baradwatchu/custom-checks`, migrating the pre-release
 /// `custom-tools` folder in place (one rename, contents untouched) when needed.
-fn custom_root() -> Result<PathBuf, CliError> {
+pub(crate) fn custom_root() -> Result<PathBuf, CliError> {
     let base = state_dir()?;
     let current = base.join(CUSTOM_DIR);
     let legacy = base.join(LEGACY_CUSTOM_DIR);
@@ -1262,7 +1262,7 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<(), CliError> {
 /// `$XDG_CACHE_HOME/baradwatchu/audit`: audit reports and `--log` files. Disposable by
 /// design (operator choice): deleting it only clears the history and the last result.
 /// The previous `$XDG_STATE_HOME/baradwatchu/audits` folder is moved here once.
-fn history_dir() -> Result<PathBuf, CliError> {
+pub(crate) fn history_dir() -> Result<PathBuf, CliError> {
     let current = user_base("XDG_CACHE_HOME", "LOCALAPPDATA", "cache", ".cache")
         .ok_or_else(|| CliError("Cannot locate the user cache directory".into()))?
         .join("audit");
@@ -1452,7 +1452,7 @@ pub(crate) fn install_root() -> Result<PathBuf, CliError> {
         .ok_or_else(|| CliError("Cannot locate Client installation directory".into()))
 }
 
-fn platform_key() -> &'static str {
+pub(crate) fn platform_key() -> &'static str {
     if cfg!(target_os = "linux") {
         "linux"
     } else if cfg!(target_os = "windows") {

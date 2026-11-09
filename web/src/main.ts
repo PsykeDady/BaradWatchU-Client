@@ -6,7 +6,7 @@ import { APP_VERSION } from './app-version';
 type Priority = 'HIGHEST' | 'HIGH' | 'MEDIUM' | 'LOW' | 'OPTIONAL';
 type ResultStatus = 'PASS' | 'FAIL' | 'WARN' | 'ERROR' | 'DISABLED' | 'NOT_APPLICABLE';
 type Integrity = 'VERIFIED' | 'MISMATCH' | 'UNKNOWN';
-type View = 'overview' | 'custom' | 'notifications';
+type View = 'overview' | 'custom' | 'notifications' | 'settings';
 type StatusFilter = 'ALL' | 'FAIL' | 'WARN' | 'ERROR' | 'PASS' | 'PENDING';
 interface Provenance { toolId: string; toolVersion?: number; origin: 'BUILTIN' | 'CUSTOM'; toolPath?: string; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; integrityScope: string; isOverride: boolean; overrideBuiltinId?: string; builtinToolPath?: string; builtinExpectedSha256?: string; }
 interface Requirement { id: string; name: string; description: string; enabled: boolean; priority: Priority; parameters: Record<string, unknown>; arguments: string[]; timeoutSeconds: number; tools: Record<string, string>; configurationError?: string; origin: 'BUILTIN' | 'CUSTOM'; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; replacesBuiltin?: string; customToolId?: string; customToolVersion?: number; }
@@ -21,6 +21,7 @@ interface AppEvent { id: number; atUnixMs: number; kind: string; severity: Event
 interface NotificationPreferences { schemaVersion?: string; enabled: boolean; informative: boolean; }
 interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
 interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
+interface ConfigurationView { version: string; platform: string; installRoot: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
 
 const TOKEN_KEY = 'bwu-session-token';
 /** The agent opens the dashboard with ?k=<token>; keep it for this tab only and drop it from the address bar. */
@@ -47,6 +48,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <button type="button" role="tab" class="tab" [class.active]="view === 'overview'" [attr.aria-selected]="view === 'overview'" (click)="go('overview')">Stato postazione</button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'custom'" [attr.aria-selected]="view === 'custom'" (click)="go('custom')">Controlli personalizzati<span class="tab-count" *ngIf="customs.length">{{ customs.length }}</span><span class="tab-alert" *ngIf="customProblems > 0" [attr.aria-label]="customProblems + ' da sistemare'">!</span></button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'notifications'" [attr.aria-selected]="view === 'notifications'" (click)="go('notifications')">Notifiche<span class="tab-alert" *ngIf="pendingConsents > 0" [attr.aria-label]="pendingConsents + ' richieste in sospeso'">{{ pendingConsents }}</span></button>
+          <button type="button" role="tab" class="tab" [class.active]="view === 'settings'" [attr.aria-selected]="view === 'settings'" (click)="go('settings')">Impostazioni</button>
         </nav>
         <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? 'Audit in corso…' : 'Esegui audit' }}</button>
       </header>
@@ -289,6 +291,49 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
         </div>
       </ng-container>
 
+      <!-- ============================== IMPOSTAZIONI ============================== -->
+      <ng-container *ngIf="!loading && view === 'settings'">
+        <section class="intro">
+          <div><p class="eyebrow">CONFIGURAZIONE LOCALE</p><h1>Impostazioni</h1><p class="intro-copy">Impostazioni di questa postazione. Soglie e priorità dei singoli controlli si cambiano da «Dettagli e impostazioni» in Stato postazione.</p></div>
+          <div class="intro-actions"><button class="button secondary" type="button" (click)="loadConfiguration()" [disabled]="saving">Aggiorna</button></div>
+        </section>
+        <div *ngIf="!configuration" class="empty-card">Impostazioni non disponibili: premi «Aggiorna».</div>
+        <div class="custom-layout" *ngIf="configuration as config">
+          <section aria-labelledby="startup-title">
+            <div class="form-panel">
+              <div class="form-head"><h2 id="startup-title">Tray e avvio</h2><span class="tag" [class.muted]="config.tray.running !== true">{{ configTrayText }}</span></div>
+              <div class="settings-row">
+                <label class="toggle"><input type="checkbox" [checked]="config.tray.autostart === true" [disabled]="saving || !config.tray.installed || config.tray.autostart === null" (change)="setAutostart($event)"><span>Avvia BaradWatchU Tray all’accesso</span></label>
+              </div>
+              <p class="hint" *ngIf="!config.tray.installed">BaradWatchU Tray non è installata accanto all’agente (installazione senza tray).</p>
+              <p class="hint" *ngIf="config.tray.error">Stato non leggibile: {{ config.tray.error }}</p>
+              <p class="hint">È la stessa impostazione della voce «Avvia al login» nel menu della tray. Gli installer la attivano alla prima installazione e poi rispettano la tua scelta. Riguarda solo il tuo utente e non richiede privilegi di amministratore.</p>
+            </div>
+            <div class="form-panel">
+              <div class="form-head"><h2>Notifiche desktop</h2></div>
+              <p class="hint">Le preferenze delle notifiche e le richieste di consenso sono nella sezione <a href="#/notifiche" (click)="go('notifications', $event)">Notifiche</a>.</p>
+            </div>
+            <div class="section-heading"><div><p class="eyebrow">DATI LOCALI</p><h2 id="paths-title">Cartelle dei dati</h2></div></div>
+            <dl class="facts" aria-labelledby="paths-title">
+              <dt>Impostazioni</dt><dd><code>{{ config.paths.configuration }}</code></dd>
+              <dt>Controlli personalizzati</dt><dd><code>{{ config.paths.customChecks }}</code></dd>
+              <dt>Eventi e consenso</dt><dd><code>{{ config.paths.state }}</code></dd>
+              <dt>Storico audit</dt><dd><code>{{ config.paths.history }}</code><br><span class="hint">Si può cancellare: si perdono solo lo storico e l’ultimo risultato.</span></dd>
+              <dt>File di sessione</dt><dd><code>{{ config.paths.runtime }}</code></dd>
+            </dl>
+          </section>
+          <aside class="guide" aria-labelledby="about-title">
+            <h2 id="about-title">Informazioni</h2>
+            <dl class="facts compact">
+              <dt>Versione</dt><dd>{{ config.version }}</dd>
+              <dt>Sistema</dt><dd>{{ platformName(config.platform) }}</dd>
+              <dt>Installazione</dt><dd><code>{{ config.installRoot }}</code></dd>
+            </dl>
+            <p class="hint">La disinstallazione non cancella le cartelle dei dati: impostazioni, controlli personalizzati e storico restano finché non le elimini tu.</p>
+          </aside>
+        </div>
+      </ng-container>
+
       <footer><span>BaradWatchU Client {{ version }}</span><span>I dati di audit restano sul dispositivo.</span><button class="text-button" type="button" (click)="refresh()" [disabled]="busy || saving">Aggiorna dati</button></footer>
     </main>
   `,
@@ -325,6 +370,7 @@ class AppComponent implements OnInit {
   form = this.emptyForm();
   importFile: File | null = null;
   notifications: NotificationsView | null = null;
+  configuration: ConfigurationView | null = null;
   private readonly token = sessionToken();
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -353,7 +399,8 @@ class AppComponent implements OnInit {
   go(view: View, event?: Event): void {
     event?.preventDefault();
     this.view = view;
-    const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : '#/';
+    const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : view === 'settings' ? '#/impostazioni' : '#/';
+    if (view === 'settings') void this.loadConfiguration().catch(error => { this.error = `Impostazioni: ${this.errorText(error)}`; });
     if (location.hash !== hash) window.history.replaceState(null, '', hash);
     window.scrollTo({ top: 0 });
   }
@@ -366,7 +413,8 @@ class AppComponent implements OnInit {
       this.request<DashboardData>('/api/requirements'),
       this.request<AuditReport | null>('/api/status'),
       this.loadHistory(),
-      this.loadNotifications()
+      this.loadNotifications(),
+      this.view === 'settings' ? this.loadConfiguration() : Promise.resolve()
     ]);
     const errors: string[] = [];
     if (outcomes[0].status === 'fulfilled') this.setData(outcomes[0].value);
@@ -375,6 +423,7 @@ class AppComponent implements OnInit {
     else errors.push(`Ultimo risultato: ${this.errorText(outcomes[1].reason)}`);
     if (outcomes[2].status === 'rejected') errors.push(`Storico: ${this.errorText(outcomes[2].reason)}`);
     if (outcomes[3].status === 'rejected') errors.push(`Notifiche: ${this.errorText(outcomes[3].reason)}`);
+    if (outcomes[4].status === 'rejected') errors.push(`Impostazioni: ${this.errorText(outcomes[4].reason)}`);
     this.error = errors.join(' · ');
     this.loading = false;
   }
@@ -518,6 +567,18 @@ class AppComponent implements OnInit {
     await this.mutate(() => this.request<DashboardData>(`/api/custom-checks/${encodeURIComponent(id)}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: '{}' }), () => `Controllo ${id} eliminato.`);
   }
 
+  async loadConfiguration(): Promise<void> { this.configuration = await this.request<ConfigurationView>('/api/configuration'); }
+  get configTrayText(): string { const tray = this.configuration?.tray; if (!tray) return ''; if (!tray.installed) return 'Tray non installata'; return tray.running === true ? 'Tray attiva' : tray.running === false ? 'Tray non attiva' : 'Stato tray non rilevabile'; }
+  platformName(platform: string): string { return platform === 'windows' ? 'Windows' : platform === 'linux' ? 'Linux' : platform === 'macos' ? 'macOS' : platform; }
+  async setAutostart(event: Event): Promise<void> {
+    const enabled = (event.target as HTMLInputElement).checked;
+    this.saving = true;
+    try {
+      this.configuration = await this.request<ConfigurationView>('/api/configuration/autostart', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+      this.flash(enabled ? 'Avvio automatico della tray attivato.' : 'Avvio automatico della tray disattivato.');
+    } catch (error: unknown) { this.error = this.errorText(error); await this.loadConfiguration().catch(() => undefined); }
+    finally { this.saving = false; }
+  }
   async loadNotifications(): Promise<void> { this.notifications = await this.request<NotificationsView>('/api/notifications'); }
   async setPreference(key: 'enabled' | 'informative', event: Event): Promise<void> {
     if (!this.notifications) return;
@@ -550,7 +611,7 @@ class AppComponent implements OnInit {
     const used = this.customs.map(item => /^CUSTOM-(\d+)$/.exec(item.customToolId ?? item.id)?.[1]).filter((n): n is string => !!n).map(Number);
     return `CUSTOM-${String((used.length ? Math.max(...used) : 0) + 1).padStart(3, '0')}`;
   }
-  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : location.hash.startsWith('#/notifiche') ? 'notifications' : 'overview'; }
+  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : location.hash.startsWith('#/notifiche') ? 'notifications' : location.hash.startsWith('#/impostazioni') ? 'settings' : 'overview'; }
   private scrollToHistory(): void {
     if (location.hash.startsWith('#/history')) setTimeout(() => document.getElementById('history-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
   }

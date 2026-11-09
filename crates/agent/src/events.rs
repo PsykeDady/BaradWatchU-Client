@@ -397,9 +397,20 @@ pub fn save_preferences(preferences: &NotificationPreferences) -> Result<(), Cli
     req::atomic_json(&dir.join("notifications.json"), &value)
 }
 
-/// Linux: whether this user's tray companion holds its lock (pid written by the tray).
-/// `None` when it cannot be determined on this platform.
+/// Whether this user's tray companion holds its lock. Linux: the PID written by the tray is
+/// a live `baradwatchu-tray`. Windows: the tray keeps an exclusive lock on the file, so
+/// reading it fails with a lock violation while the tray runs. `None` elsewhere.
 pub fn tray_running() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        let path = req::runtime_dir().ok()?.join("tray.lock");
+        return Some(match fs::read(path) {
+            Ok(_) => false,
+            Err(error) => error.raw_os_error() == Some(ERROR_LOCK_VIOLATION),
+        });
+    }
+    #[allow(unreachable_code)]
     if !cfg!(target_os = "linux") {
         return None;
     }

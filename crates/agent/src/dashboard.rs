@@ -51,6 +51,7 @@ pub enum Route {
     Custom,
     History,
     Notifications,
+    Settings,
 }
 
 impl Route {
@@ -60,6 +61,7 @@ impl Route {
             Self::Custom => "#/custom",
             Self::History => "#/history",
             Self::Notifications => "#/notifiche",
+            Self::Settings => "#/impostazioni",
         }
     }
 }
@@ -71,7 +73,7 @@ pub struct Options {
 }
 
 pub const USAGE: &str =
-    "Usage: dashboard [--no-browser] [--open status|custom|history|notifications]";
+    "Usage: dashboard [--no-browser] [--open status|custom|history|notifications|settings]";
 
 pub fn parse_options(args: &[std::ffi::OsString]) -> Result<Options, String> {
     let mut options = Options {
@@ -92,6 +94,7 @@ pub fn parse_options(args: &[std::ffi::OsString]) -> Result<Options, String> {
                     Some("custom") => Route::Custom,
                     Some("history") => Route::History,
                     Some("notifications") => Route::Notifications,
+                    Some("settings") => Route::Settings,
                     _ => return Err(USAGE.into()),
                 };
                 seen_route = true;
@@ -385,6 +388,12 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
     match (method, path) {
         ("GET", "/api/ping") => Response::json(200, "{\"ok\":true}"),
         ("GET", "/api/notifications") => api(crate::events::dashboard_notifications_json()),
+        ("GET", "/api/configuration") => api(crate::configuration::dashboard_configuration_json()),
+        ("PUT", "/api/configuration/autostart") => {
+            api(crate::configuration::dashboard_set_autostart(
+                std::str::from_utf8(body).unwrap_or_default(),
+            ))
+        }
         ("PUT", "/api/notifications") => api(crate::events::dashboard_update_preferences(
             std::str::from_utf8(body).unwrap_or(""),
         )),

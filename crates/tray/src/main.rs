@@ -13,7 +13,7 @@ mod platform;
 use std::process::ExitCode;
 
 const USAGE: &str =
-    "Usage: baradwatchu-tray [--version | --help | autostart enable|disable|status]";
+    "Usage: baradwatchu-tray [--version | --help | autostart enable|disable|status [--json]]";
 
 fn help() -> String {
     format!(
@@ -78,6 +78,11 @@ fn main() -> ExitCode {
         ))),
         ["--help" | "-h"] => Ok(Some(help())),
         ["autostart", action @ ("enable" | "disable" | "status")] => autostart(action).map(Some),
+        // Machine-readable state for the agent's dashboard settings page.
+        ["autostart", "status", "--json"] => Ok(Some(format!(
+            "{{\"enabled\":{}}}",
+            platform::autostart_enabled()
+        ))),
         _ => {
             eprintln!("Error: {USAGE}");
             return ExitCode::from(2);

@@ -97,14 +97,14 @@ baradwatchu-agent audit [--json] [--notify] [--log]
 baradwatchu-agent status [--json]
 baradwatchu-agent custom accept CUSTOM-ID
 baradwatchu-agent custom remove CUSTOM-ID
-baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]
+baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications|settings]
 baradwatchu-agent notifications [--json]
 baradwatchu-agent notifications set enabled|informative on|off
 baradwatchu-agent events --json [--after ID]
 baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]
 baradwatchu-agent consent list [--json]
 baradwatchu-agent consent accept|reject REQUEST-ID
-baradwatchu-tray [--version | --help | autostart enable|disable|status]
+baradwatchu-tray [--version | --help | autostart enable|disable|status [--json]]
 ```
 
 In sviluppo usa `cargo run -p baradwatchu-agent -- …`. Codici di uscita di `audit`/`check`: 0 tutto conforme (o disabilitato/non applicabile), 4 almeno un `WARN`, 3 almeno un `FAIL`, 1 almeno un `ERROR`, 2 errore d'uso. Ogni audit viene salvato in JSON in `~/.cache/baradwatchu/audit/reports/` per `status` e lo storico della dashboard; `--log` scrive anche un `.log` in testo semplice con tool, codici di uscita e diagnostica in `~/.cache/baradwatchu/audit/`. La cartella si può cancellare: si perdono solo lo storico e l'ultimo risultato. Lo storico in `~/.local/state/baradwatchu/audits/` viene spostato lì automaticamente una volta. `list --json` e l'API della dashboard usano nomi di campo camelCase. `custom accept` e `custom remove` funzionano anche se la configurazione della cartella non è valida. I vecchi comandi `workstation`, `policy validate`, `audit --policy`, `audit --format` e `audit --local-config` sono stati rimossi; la CLI li rifiuta prima di leggere qualsiasi dato locale. Ogni audit completato (da CLI, dashboard o tray) aggiunge anche un evento a `~/.local/state/baradwatchu/events.jsonl` (si tengono gli ultimi 200); `events --json` è lo stato compatto che la tray interroga e `notifications` mostra o modifica le preferenze di notifica (`~/.config/baradwatchu/notifications.json`).
@@ -116,6 +116,7 @@ In sviluppo usa `cargo run -p baradwatchu-agent -- …`. Codici di uscita di `au
 - **Stato postazione:** riepilogo dell'ultimo audit (i contatori filtrano l'elenco), filtri per esito, ricerca, requisiti ordinati per gravità dopo un audit, dettagli per requisito, impostazioni, parametri e dettagli tecnici/integrità compressi. Gli audit storici si aprono dal pannello laterale senza modificare lo stato corrente.
 - **Controlli personalizzati:** una sezione separata elenca i tuoi controlli con stato d'integrità e ultimo esito, e offre **Controlla ora**, **Accetta versione attuale**, **Carica nuovo file**, **Ripristina** l'integrato (per gli override) ed **Elimina**. Le cartelle non valide compaiono con il loro errore e si possono eliminare. **Nuovo controllo** apre il modulo di importazione: ID (viene proposto il primo `CUSTOM-NNN` libero), nome, descrizione, priorità, timeout, file, argomenti e, nelle opzioni avanzate, copia dei metadati o sostituzione di un integrato. Il file mantiene il suo nome nella nuova cartella. La sezione spiega anche la struttura delle cartelle e il formato dell'output.
 - **Notifiche:** preferenze di notifica (notifiche desktop sì/no, informative sì/no), stato della tray, storico locale degli eventi e richieste di consenso. **Simula una richiesta** crea una richiesta di prova locale da 60 secondi; la dashboard non decide mai una richiesta. `#/history` apre la pagina di stato sullo storico degli audit.
+- **Impostazioni:** avvio della tray all'accesso (lo stesso interruttore di **Avvia al login** nel menu della tray; l'agente esegue la tray installata accanto a sé con `autostart enable|disable|status --json`, argomenti fissi, senza shell, timeout di 10 secondi), se la tray è installata e attiva (Linux: PID vivo; Windows: il lock esclusivo della tray su `tray.lock`), versione, sistema operativo, cartella di installazione e cartelle dei dati locali (impostazioni, controlli personalizzati, eventi e consenso, storico degli audit, file di sessione). La disinstallazione non cancella mai queste cartelle. Si apre con `dashboard --open settings` o `#/impostazioni`.
 
 Build di sviluppo:
 
