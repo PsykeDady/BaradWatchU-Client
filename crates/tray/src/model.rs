@@ -107,6 +107,7 @@ pub fn health(snapshot: Option<&Snapshot>) -> Health {
     }
 }
 
+#[cfg(test)]
 pub fn health_label(health: Health) -> &'static str {
     match health {
         Health::Unreachable => "agente non raggiungibile",
@@ -118,13 +119,33 @@ pub fn health_label(health: Health) -> &'static str {
     }
 }
 
+pub fn health_label_in(health: Health, language: baradwatchu_messages::Language) -> &'static str {
+    let key = match health {
+        Health::Unreachable => "tray.health_unreachable",
+        Health::Attention => "tray.health_attention",
+        Health::Critical => "tray.health_critical",
+        Health::Anomalies => "tray.health_anomalies",
+        Health::NoAudit => "tray.health_no_audit",
+        Health::Ok => "tray.health_ok",
+    };
+    baradwatchu_messages::message(key, language)
+}
+
+#[cfg(test)]
 pub fn age(now_ms: u64, then_ms: u64) -> String {
+    age_in(now_ms, then_ms, baradwatchu_messages::Language::Italian)
+}
+
+fn age_in(now_ms: u64, then_ms: u64, language: baradwatchu_messages::Language) -> String {
     let seconds = now_ms.saturating_sub(then_ms) / 1000;
     match seconds {
-        0..=59 => "pochi secondi fa".into(),
-        60..=3599 => format!("{} min fa", seconds / 60),
-        3600..=86_399 => format!("{} h fa", seconds / 3600),
-        _ => format!("{} g fa", seconds / 86_400),
+        0..=59 => baradwatchu_messages::message("tray.age.seconds", language).into(),
+        60..=3599 => baradwatchu_messages::message("tray.age.minutes", language)
+            .replace("{count}", &(seconds / 60).to_string()),
+        3600..=86_399 => baradwatchu_messages::message("tray.age.hours", language)
+            .replace("{count}", &(seconds / 3600).to_string()),
+        _ => baradwatchu_messages::message("tray.age.days", language)
+            .replace("{count}", &(seconds / 86_400).to_string()),
     }
 }
 
@@ -137,6 +158,7 @@ fn counts(audit: &AuditDigest) -> String {
 
 /// Multi-line summary for the tooltip and the "last result" window. Integrity and custom
 /// checks are reported separately and PASS is never presented as a certification.
+#[cfg(test)]
 pub fn summary(snapshot: Option<&Snapshot>, comm_error: Option<&str>, now_ms: u64) -> String {
     let health = health(snapshot);
     let mut lines = vec![format!("BaradWatchU — {}", health_label(health))];
@@ -186,6 +208,84 @@ pub fn summary(snapshot: Option<&Snapshot>, comm_error: Option<&str>, now_ms: u6
             snapshot.pending_consents.len()
         ));
     }
+    lines.join("\n")
+}
+
+pub fn summary_in(
+    snapshot: Option<&Snapshot>,
+    comm_error: Option<&str>,
+    now_ms: u64,
+    language: baradwatchu_messages::Language,
+) -> String {
+    let health = health(snapshot);
+    let mut lines = vec![format!(
+        "BaradWatchU — {}",
+        health_label_in(health, language)
+    )];
+    let Some(snapshot) = snapshot else {
+        lines.push(
+            comm_error
+                .unwrap_or(baradwatchu_messages::message(
+                    "tray.health_unreachable",
+                    language,
+                ))
+                .to_owned(),
+        );
+        lines.push(baradwatchu_messages::message("tray.retry", language).into());
+        return lines.join("\n");
+    };
+    if let Some(audit) = &snapshot.last_audit {
+        lines.push(
+            baradwatchu_messages::message("tray.summary.last", language)
+                .replace(
+                    "{age}",
+                    &age_in(now_ms, audit.completed_at_unix_ms, language),
+                )
+                .replace("{counts}", &counts(audit)),
+        );
+        lines.push(if audit.integrity_issues.is_empty() {
+            baradwatchu_messages::message("tray.summary.integrity_clear", language).into()
+        } else {
+            baradwatchu_messages::message("tray.summary.integrity_blocked", language)
+                .replace("{count}", &audit.integrity_issues.len().to_string())
+                .replace("{ids}", &audit.integrity_issues.join(", "))
+        });
+        if !audit.execution_errors.is_empty() {
+            lines.push(
+                baradwatchu_messages::message("tray.summary.errors", language)
+                    .replace("{ids}", &audit.execution_errors.join(", ")),
+            );
+        }
+        if audit.custom_checks > 0 {
+            lines.push(
+                baradwatchu_messages::message("tray.summary.custom", language)
+                    .replace("{total}", &audit.custom_checks.to_string())
+                    .replace("{not_pass}", &audit.custom_not_pass.to_string()),
+            );
+        }
+        lines.push(baradwatchu_messages::message("tray.summary.disclaimer", language).into());
+    } else if let Some(error) = &snapshot.last_audit_error {
+        lines.push(
+            baradwatchu_messages::message("tray.summary.unreadable", language)
+                .replace("{error}", error),
+        );
+    } else {
+        lines.push(
+            baradwatchu_messages::message(
+                if language.effective() == baradwatchu_messages::Language::Italian {
+                    "tray.no_audit"
+                } else {
+                    "tray.no_audit"
+                },
+                language,
+            )
+            .to_owned(),
+        );
+    }
+    lines.push(
+        baradwatchu_messages::message("tray.summary.pending", language)
+            .replace("{count}", &snapshot.pending_consents.len().to_string()),
+    );
     lines.join("\n")
 }
 
@@ -275,9 +375,11 @@ impl Notifier {
             });
         }
         if extra > 0 {
+            let language = baradwatchu_messages::configured_language();
             notes.push(Note {
-                title: "BaradWatchU: altri eventi".into(),
-                body: format!("Altri {extra} eventi: consulta le notifiche nella dashboard."),
+                title: baradwatchu_messages::message("tray.notice.more_title", language).into(),
+                body: baradwatchu_messages::message("tray.notice.more_body", language)
+                    .replace("{count}", &extra.to_string()),
                 urgency: Urgency::Low,
             });
         }
@@ -293,9 +395,11 @@ impl Notifier {
         if !self.preferences.enabled {
             return vec![];
         }
+        let language = baradwatchu_messages::configured_language();
         vec![Note {
-            title: "BaradWatchU: agente non raggiungibile".into(),
-            body: format!("{error}. La tray riprova automaticamente."),
+            title: baradwatchu_messages::message("tray.notice.agent_lost", language).into(),
+            body: baradwatchu_messages::message("tray.notice.retry", language)
+                .replace("{error}", error),
             urgency: Urgency::Normal,
         }]
     }

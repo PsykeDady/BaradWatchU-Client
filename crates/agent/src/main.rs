@@ -10,14 +10,30 @@ fn main() -> ExitCode {
         let options = match baradwatchu_agent::dashboard::parse_options(&args[1..]) {
             Ok(options) => options,
             Err(usage) => {
-                eprintln!("Error: {usage}");
+                eprintln!(
+                    "{}: {usage}",
+                    baradwatchu_agent::messages::message(
+                        "cli.error",
+                        baradwatchu_messages::configured_language()
+                    )
+                );
                 return ExitCode::from(2);
             }
         };
         return match baradwatchu_agent::dashboard::run(options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
-                eprintln!("Error: {error}");
+                let error = baradwatchu_messages::localize_diagnostic(
+                    &error,
+                    baradwatchu_messages::configured_language(),
+                );
+                eprintln!(
+                    "{}: {error}",
+                    baradwatchu_agent::messages::message(
+                        "cli.error",
+                        baradwatchu_messages::configured_language()
+                    )
+                );
                 ExitCode::FAILURE
             }
         };
@@ -25,13 +41,30 @@ fn main() -> ExitCode {
     match cli::run(&args) {
         Ok(output) => match io::stdout().lock().write_all(output.text.as_bytes()) {
             Ok(()) => ExitCode::from(output.code),
-            Err(error) => {
-                eprintln!("Cannot write output: {error}");
+            Err(_error) => {
+                eprintln!(
+                    "{}: {}",
+                    baradwatchu_agent::messages::message(
+                        "cli.error",
+                        baradwatchu_messages::configured_language()
+                    ),
+                    baradwatchu_messages::message(
+                        "cli.output_error",
+                        baradwatchu_messages::configured_language()
+                    )
+                );
                 ExitCode::FAILURE
             }
         },
         Err(error) => {
-            eprintln!("Error: {}", error.message);
+            eprintln!(
+                "{}: {}",
+                baradwatchu_agent::messages::message(
+                    "cli.error",
+                    baradwatchu_messages::configured_language()
+                ),
+                error.message
+            );
             ExitCode::from(error.code)
         }
     }

@@ -13,7 +13,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 const ARTIFACT_EXTENSIONS: [&str; 3] = ["json", "log", "pdf"];
-const USAGE: &str = "Usage: history [--json] | history delete STAMP | history clear --yes";
+fn usage_text() -> &'static str {
+    baradwatchu_messages::message("history.usage", baradwatchu_messages::configured_language())
+}
 
 struct Artifact {
     path: PathBuf,
@@ -218,14 +220,15 @@ fn listed(directory: &Path) -> Result<Vec<ListedAudit>, CliError> {
 }
 
 fn removal_text(removal: &Removal) -> String {
-    format!(
-        "Rimossi {} audit ({} file, {} liberati). Restano {} audit ({}).\n",
-        removal.removed_audits,
-        removal.removed_files,
-        size_text(removal.freed_bytes),
-        removal.usage.audits,
-        size_text(removal.usage.bytes)
+    baradwatchu_messages::message(
+        "history.removed",
+        baradwatchu_messages::configured_language(),
     )
+    .replace("{audits}", &removal.removed_audits.to_string())
+    .replace("{files}", &removal.removed_files.to_string())
+    .replace("{size}", &size_text(removal.freed_bytes))
+    .replace("{remaining}", &removal.usage.audits.to_string())
+    .replace("{remaining_size}", &size_text(removal.usage.bytes))
 }
 
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
@@ -234,7 +237,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         .map(|arg| arg.to_str())
         .collect::<Option<Vec<_>>>();
     let Some(args) = args else {
-        return Err(CliError(USAGE.into()));
+        return Err(CliError(usage_text().into()));
     };
     let text = match args.as_slice() {
         [] | ["--json"] => {
@@ -242,20 +245,29 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             let audits = listed(&directory)?;
             if args.is_empty() {
                 let total = usage_of(&artifacts_at(&directory)?);
-                let mut text = format!(
-                    "Storico audit: {} ({} audit, {})\n",
-                    directory.display(),
-                    total.audits,
-                    size_text(total.bytes)
-                );
+                let mut text = baradwatchu_messages::message(
+                    "history.header",
+                    baradwatchu_messages::configured_language(),
+                )
+                .replace("{path}", &directory.display().to_string())
+                .replace("{audits}", &total.audits.to_string())
+                .replace("{size}", &size_text(total.bytes));
                 for audit in &audits {
-                    text.push_str(&format!(
-                        "  {}  {:<7} {} file, {}\n",
-                        audit.completed_at_unix_ms,
-                        audit.overall_status.as_deref().unwrap_or("?"),
-                        audit.files,
-                        size_text(audit.bytes)
-                    ));
+                    let language = baradwatchu_messages::configured_language();
+                    let status = match audit.overall_status.as_deref() {
+                        Some("PASS") => baradwatchu_messages::message("status.pass", language),
+                        Some("FAIL") => baradwatchu_messages::message("status.fail", language),
+                        Some("WARN") => baradwatchu_messages::message("status.warning", language),
+                        Some("ERROR") => baradwatchu_messages::message("status.error", language),
+                        _ => baradwatchu_messages::message("history.status.unknown", language),
+                    };
+                    text.push_str(
+                        &baradwatchu_messages::message("history.entry", language)
+                            .replace("{stamp}", &audit.completed_at_unix_ms.to_string())
+                            .replace("{status}", &format!("{status:<7}"))
+                            .replace("{files}", &audit.files.to_string())
+                            .replace("{size}", &size_text(audit.bytes)),
+                    );
                 }
                 text
             } else {
@@ -264,7 +276,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         ["delete", stamp] => removal_text(&delete_at(&req::history_dir()?, parse_stamp(stamp)?)?),
         ["clear", "--yes"] => removal_text(&clear_at(&req::history_dir()?)?),
-        _ => return Err(CliError(USAGE.into())),
+        _ => return Err(CliError(usage_text().into())),
     };
     Ok(CliOutput { text, code: 0 })
 }

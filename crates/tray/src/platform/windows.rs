@@ -56,20 +56,27 @@ pub fn attach_parent_console() {
 }
 
 fn ask(title: &str, text: &str) -> DialogOutcome {
-    let text = format!("{text}\n\n(Sì/Accetta = autorizza solo questa richiesta · No/Rifiuta · Annulla = decidi più tardi)");
+    let language = baradwatchu_messages::configured_language();
+    let accept = baradwatchu_messages::message("consent.button.accept", language);
+    let reject = baradwatchu_messages::message("consent.button.reject", language);
+    let later = baradwatchu_messages::message("consent.button.later", language);
+    let text = format!(
+        "{text}\n\n{}",
+        baradwatchu_messages::message("consent.button_hint", language)
+    );
     match rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
         .set_title(title)
         .set_description(text)
         .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-            "Accetta".into(),
-            "Rifiuta".into(),
-            "Decidi più tardi".into(),
+            accept.into(),
+            reject.into(),
+            later.into(),
         ))
         .show()
     {
-        rfd::MessageDialogResult::Custom(label) if label == "Accetta" => DialogOutcome::Accept,
-        rfd::MessageDialogResult::Custom(label) if label == "Rifiuta" => DialogOutcome::Reject,
+        rfd::MessageDialogResult::Custom(label) if label == accept => DialogOutcome::Accept,
+        rfd::MessageDialogResult::Custom(label) if label == reject => DialogOutcome::Reject,
         rfd::MessageDialogResult::Yes => DialogOutcome::Accept,
         rfd::MessageDialogResult::No => DialogOutcome::Reject,
         _ => DialogOutcome::Later,

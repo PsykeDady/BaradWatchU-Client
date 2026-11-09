@@ -187,8 +187,11 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "baradwatchu-agent"
 version = "0.0.1"
 dependencies = [
+ "baradwatchu-messages",
+ "flate2",
  "getrandom 0.3.4",
  "libc",
+ "png",
  "serde",
  "serde_json",
  "sha2",
@@ -196,9 +199,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "baradwatchu-messages"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "baradwatchu-tray"
 version = "0.0.1"
 dependencies = [
+ "baradwatchu-messages",
  "libc",
  "notify-rust",
  "rfd",

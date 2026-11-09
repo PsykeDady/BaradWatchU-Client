@@ -27,7 +27,18 @@ impl Response {
         }
     }
     fn error(status: u16, message: &str) -> Self {
+        let message = baradwatchu_messages::localize_diagnostic(
+            message,
+            baradwatchu_messages::configured_language(),
+        );
         Self::json(status, serde_json::json!({"error": message}).to_string())
+    }
+    fn pdf(bytes: Vec<u8>) -> Self {
+        Self {
+            status: 200,
+            content_type: "application/pdf",
+            body: bytes,
+        }
     }
 }
 
@@ -72,8 +83,12 @@ pub struct Options {
     pub route: Route,
 }
 
-pub const USAGE: &str =
-    "Usage: dashboard [--no-browser] [--open status|custom|history|notifications|settings]";
+pub fn usage() -> &'static str {
+    baradwatchu_messages::message(
+        "cli.dashboard.usage",
+        baradwatchu_messages::configured_language(),
+    )
+}
 
 pub fn parse_options(args: &[std::ffi::OsString]) -> Result<Options, String> {
     let mut options = Options {
@@ -95,11 +110,11 @@ pub fn parse_options(args: &[std::ffi::OsString]) -> Result<Options, String> {
                     Some("history") => Route::History,
                     Some("notifications") => Route::Notifications,
                     Some("settings") => Route::Settings,
-                    _ => return Err(USAGE.into()),
+                    _ => return Err(usage().into()),
                 };
                 seen_route = true;
             }
-            _ => return Err(USAGE.into()),
+            _ => return Err(usage().into()),
         }
     }
     Ok(options)
@@ -173,7 +188,13 @@ fn session_url(session: &Session, route: Route) -> String {
 fn open_in_browser(dir: &Path, session: &Session, route: Route) {
     let url = session_url(session, route);
     let launcher = dir.join("open-dashboard.html");
-    let html = format!("<!doctype html><html lang=\"it\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\" content=\"0;url={url}\"><title>BaradWatchU</title></head><body><p><a href=\"{url}\">Apri la dashboard BaradWatchU</a></p></body></html>\n");
+    let language = baradwatchu_messages::configured_language().effective();
+    let html_language = match language {
+        baradwatchu_messages::Language::Italian => "it",
+        _ => "en",
+    };
+    let open_label = baradwatchu_messages::message("cli.dashboard.open_link", language);
+    let html = format!("<!doctype html><html lang=\"{html_language}\"><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"refresh\" content=\"0;url={url}\"><title>BaradWatchU</title></head><body><p><a href=\"{url}\">{open_label}</a></p></body></html>\n");
     if requirements::atomic_text(&launcher, &html).is_err() {
         return;
     }
@@ -203,10 +224,13 @@ fn open_in_browser(dir: &Path, session: &Session, route: Route) {
 
 pub fn run(options: Options) -> Result<(), String> {
     let dir = runtime_dir()?;
+    let language = baradwatchu_messages::configured_language();
     if let Some(session) = read_session(&dir).filter(session_alive) {
         println!(
-            "Dashboard già attiva: {}",
-            session_url(&session, options.route)
+            "{}",
+            baradwatchu_messages::message("cli.dashboard.already_running", language)
+                .replace("{url}", &session_url(&session, options.route))
+                .trim_end()
         );
         if options.open_browser {
             open_in_browser(&dir, &session, options.route);
@@ -229,8 +253,10 @@ pub fn run(options: Options) -> Result<(), String> {
     requirements::atomic_json(&dir.join("dashboard.json"), &session).map_err(|e| e.0)?;
     let origin = format!("http://127.0.0.1:{port}");
     println!(
-        "Dashboard locale: {} (Ctrl+C per chiuderla)",
-        session_url(&session, options.route)
+        "{}",
+        baradwatchu_messages::message("cli.dashboard.started", language)
+            .replace("{url}", &session_url(&session, options.route))
+            .trim_end()
     );
     io::stdout()
         .flush()
@@ -389,8 +415,18 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
         ("GET", "/api/ping") => Response::json(200, "{\"ok\":true}"),
         ("GET", "/api/notifications") => api(crate::events::dashboard_notifications_json()),
         ("GET", "/api/configuration") => api(crate::configuration::dashboard_configuration_json()),
+        ("GET", "/api/messages") => api(crate::configuration::dashboard_messages_json()),
+        ("GET", "/api/report-theme") => api(crate::pdf::dashboard_theme_json()),
+        ("PUT", "/api/report-theme") => api(crate::pdf::dashboard_update_theme(
+            std::str::from_utf8(body).unwrap_or(""),
+        )),
         ("PUT", "/api/configuration/autostart") => {
             api(crate::configuration::dashboard_set_autostart(
+                std::str::from_utf8(body).unwrap_or_default(),
+            ))
+        }
+        ("PUT", "/api/configuration/language") => {
+            api(crate::configuration::dashboard_set_language(
                 std::str::from_utf8(body).unwrap_or_default(),
             ))
         }
@@ -444,6 +480,15 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
             api(crate::history::dashboard_delete_json(stamp))
         }
         ("GET", route) if route.starts_with("/api/history/") => {
+            if let Some(stamp) = route
+                .strip_prefix("/api/history/")
+                .and_then(|value| value.strip_suffix("/pdf"))
+            {
+                return match crate::pdf::history_pdf(stamp) {
+                    Ok(bytes) => Response::pdf(bytes),
+                    Err(error) => Response::error(404, &error.0),
+                };
+            }
             let stamp = &route["/api/history/".len()..];
             api(requirements::dashboard_history_report_json(stamp))
         }
@@ -575,6 +620,15 @@ mod tests {
             route("GET", "/api/history/not-a-timestamp", &[], &path).status,
             400
         );
+        let stamp = requirements::now_ms().to_string();
+        let history = requirements::history_dir().unwrap();
+        fs::create_dir_all(&history).unwrap();
+        let pdf_bytes = b"%PDF-1.7\nmock report";
+        fs::write(history.join(format!("{stamp}.pdf")), pdf_bytes).unwrap();
+        let response = route("GET", &format!("/api/history/{stamp}/pdf"), &[], &path);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/pdf");
+        assert_eq!(response.body, pdf_bytes);
     }
 
     #[test]

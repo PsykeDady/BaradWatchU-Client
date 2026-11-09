@@ -291,10 +291,14 @@ pub(crate) fn digest(report: &AuditReport) -> AuditDigest {
     digest
 }
 
-fn short_list(items: &[String]) -> String {
+fn short_list(items: &[String], language: baradwatchu_messages::Language) -> String {
     let mut text = items.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
     if items.len() > 5 {
-        text.push_str(&format!(" e altri {}", items.len() - 5));
+        text.push(' ');
+        text.push_str(
+            &baradwatchu_messages::message("events.more_ids", language)
+                .replace("{count}", &(items.len() - 5).to_string()),
+        );
     }
     text
 }
@@ -302,6 +306,7 @@ fn short_list(items: &[String]) -> String {
 /// One event per audit, classified by its most serious aspect, so an audit never produces
 /// a burst of notifications.
 pub(crate) fn audit_event(report: &AuditReport) -> NewEvent {
+    let language = baradwatchu_messages::configured_language();
     let d = digest(report);
     let counts = format!(
         "PASS {} · FAIL {} · WARN {} · ERROR {}",
@@ -319,35 +324,36 @@ pub(crate) fn audit_event(report: &AuditReport) -> NewEvent {
         (
             EventKind::IntegrityIssue,
             Severity::Critical,
-            "Audit: problema di integrità".to_owned(),
-            format!(
-                "Non eseguiti perché lo SHA-256 del tool non corrisponde: {}. {counts}.",
-                short_list(&d.integrity_issues)
-            ),
+            baradwatchu_messages::message("events.integrity.title", language).to_owned(),
+            baradwatchu_messages::message("events.integrity.body", language)
+                .replace("{ids}", &short_list(&d.integrity_issues, language))
+                .replace("{counts}", &counts),
         )
     } else if !d.execution_errors.is_empty() {
         (
             EventKind::AuditError,
             Severity::Critical,
-            "Audit: errori di esecuzione".to_owned(),
-            format!(
-                "Controlli in errore: {}. {counts}.",
-                short_list(&d.execution_errors)
-            ),
+            baradwatchu_messages::message("events.error.title", language).to_owned(),
+            baradwatchu_messages::message("events.error.body", language)
+                .replace("{ids}", &short_list(&d.execution_errors, language))
+                .replace("{counts}", &counts),
         )
     } else if !d.anomalies.is_empty() {
         (
             EventKind::AuditAnomalies,
             Severity::Warning,
-            "Audit con anomalie".to_owned(),
-            format!("{counts}. Da verificare: {}.", short_list(&d.anomalies)),
+            baradwatchu_messages::message("events.anomaly.title", language).to_owned(),
+            baradwatchu_messages::message("events.anomaly.body", language)
+                .replace("{ids}", &short_list(&d.anomalies, language))
+                .replace("{counts}", &counts),
         )
     } else {
         (
             EventKind::AuditCompleted,
             Severity::Info,
-            "Audit completato".to_owned(),
-            format!("{counts}. Esito dei controlli locali, non una certificazione di sicurezza."),
+            baradwatchu_messages::message("events.completed.title", language).to_owned(),
+            baradwatchu_messages::message("events.completed.body", language)
+                .replace("{counts}", &counts),
         )
     };
     NewEvent {
@@ -494,9 +500,18 @@ pub(crate) fn dashboard_update_preferences(text: &str) -> Result<String, CliErro
     dashboard_notifications_json()
 }
 
-const NOTIFICATIONS_USAGE: &str =
-    "Usage: notifications [--json] | notifications set enabled|informative on|off";
-const EVENTS_USAGE: &str = "Usage: events --json [--after ID]";
+fn notifications_usage() -> &'static str {
+    baradwatchu_messages::message(
+        "cli.notifications.usage",
+        baradwatchu_messages::configured_language(),
+    )
+}
+fn events_usage() -> &'static str {
+    baradwatchu_messages::message(
+        "cli.events.usage",
+        baradwatchu_messages::configured_language(),
+    )
+}
 
 pub fn run_events(args: &[OsString]) -> Result<CliOutput, CliError> {
     let after = match args {
@@ -505,9 +520,9 @@ pub fn run_events(args: &[OsString]) -> Result<CliOutput, CliError> {
             value
                 .to_str()
                 .and_then(|v| v.parse::<u64>().ok())
-                .ok_or_else(|| CliError(EVENTS_USAGE.into()))?,
+                .ok_or_else(|| CliError(events_usage().into()))?,
         ),
-        _ => return Err(CliError(EVENTS_USAGE.into())),
+        _ => return Err(CliError(events_usage().into())),
     };
     Ok(CliOutput {
         text: snapshot_json(after)?,
@@ -520,17 +535,35 @@ pub fn run_notifications(args: &[OsString]) -> Result<CliOutput, CliError> {
     match args {
         [] => {
             let preferences = load_preferences()?;
-            let on = |value: bool| if value { "attive" } else { "disattivate" };
+            let language = baradwatchu_messages::configured_language();
+            let on = |value: bool| {
+                baradwatchu_messages::message(
+                    if value {
+                        "cli.notifications.on"
+                    } else {
+                        "cli.notifications.off"
+                    },
+                    language,
+                )
+            };
             let mut text = format!(
-                "Notifiche desktop: {}\nNotifiche informative: {}\n",
+                "{}: {}\n{}: {}\n",
+                baradwatchu_messages::message("cli.notifications.desktop", language),
                 on(preferences.enabled),
+                baradwatchu_messages::message("cli.notifications.informative", language),
                 on(preferences.informative)
             );
             let events = read_events()?;
             if events.is_empty() {
-                text.push_str("Nessun evento registrato.\n");
+                text.push_str(&format!(
+                    "{}\n",
+                    baradwatchu_messages::message("cli.notifications.empty", language)
+                ));
             } else {
-                text.push_str("\nEventi recenti:\n");
+                text.push_str(&format!(
+                    "\n{}\n",
+                    baradwatchu_messages::message("cli.notifications.recent", language)
+                ));
                 for event in events.iter().rev().take(10) {
                     text.push_str(&format!(
                         "  {} [{:?}] {}: {}\n",
@@ -548,21 +581,27 @@ pub fn run_notifications(args: &[OsString]) -> Result<CliOutput, CliError> {
             let enabled = match text(value).as_str() {
                 "on" => true,
                 "off" => false,
-                _ => return Err(CliError(NOTIFICATIONS_USAGE.into())),
+                _ => return Err(CliError(notifications_usage().into())),
             };
             let mut preferences = load_preferences()?;
             match text(key).as_str() {
                 "enabled" => preferences.enabled = enabled,
                 "informative" => preferences.informative = enabled,
-                _ => return Err(CliError(NOTIFICATIONS_USAGE.into())),
+                _ => return Err(CliError(notifications_usage().into())),
             }
             save_preferences(&preferences)?;
             Ok(CliOutput {
-                text: format!("Preferenza {} impostata a {}.\n", text(key), text(value)),
+                text: baradwatchu_messages::message(
+                    "cli.notifications.saved",
+                    baradwatchu_messages::configured_language(),
+                )
+                .replace("{key}", &text(key))
+                .replace("{value}", &text(value))
+                    + "\n",
                 code: 0,
             })
         }
-        _ => Err(CliError(NOTIFICATIONS_USAGE.into())),
+        _ => Err(CliError(notifications_usage().into())),
     }
 }
 
@@ -575,6 +614,7 @@ mod tests {
         ResultRecord {
             id: id.into(),
             name: id.into(),
+            description: String::new(),
             priority: Priority::High,
             status,
             compliance_status: Some(status),
@@ -590,6 +630,9 @@ mod tests {
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: stamp,
             results,
+            client: req::ClientIdentity::default(),
+            pdf: None,
+            extensions: req::AuditExtensions::default(),
             log_file: None,
         }
     }

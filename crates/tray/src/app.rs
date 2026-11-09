@@ -18,7 +18,6 @@ use tray_icon::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CONSENT_TITLE: &str = "BaradWatchU — richiesta di consenso";
 
 #[derive(Debug)]
 pub enum Msg {
@@ -42,12 +41,19 @@ pub enum Control {
 struct Items {
     header: MenuItem,
     last_line: MenuItem,
+    open: MenuItem,
     audit: MenuItem,
+    last: MenuItem,
+    history: MenuItem,
     pending: MenuItem,
+    events: MenuItem,
     autostart: CheckMenuItem,
+    about: MenuItem,
+    quit: MenuItem,
 }
 
 pub struct App {
+    language: baradwatchu_messages::Language,
     agent: Agent,
     post: Poster,
     tray: TrayIcon,
@@ -81,20 +87,33 @@ fn note(title: &str, body: &str, urgency: Urgency) -> Note {
 
 impl App {
     pub fn new(post: Poster, agent: Agent, lock: InstanceLock) -> Result<Self, String> {
-        let exe = std::env::current_exe().map_err(|_| "eseguibile della tray non trovato")?;
+        let language = baradwatchu_messages::configured_language();
+        let tr = |key| baradwatchu_messages::message(key, language).to_owned();
+        let exe = std::env::current_exe()
+            .map_err(|_| baradwatchu_messages::message("tray.error.executable", language))?;
         let item = |id: &str, text: &str, enabled: bool| MenuItem::with_id(id, text, enabled, None);
         let items = Items {
-            header: item("header", "BaradWatchU — avvio…", false),
-            last_line: item("last-line", "Ultimo audit: in attesa dell'agente", false),
-            audit: item("audit", "Esegui audit", true),
-            pending: item("pending", "Richieste in sospeso: 0", false),
+            header: item(
+                "header",
+                &format!("BaradWatchU — {}", tr("tray.starting")),
+                false,
+            ),
+            last_line: item("last-line", &tr("tray.waiting"), false),
+            open: item("open", &tr("tray.open_dashboard"), true),
+            audit: item("audit", &tr("tray.audit"), true),
+            last: item("last", &tr("tray.last_result"), true),
+            history: item("history", &tr("tray.history"), true),
+            pending: item("pending", &format!("{}: 0", tr("tray.pending")), false),
+            events: item("events", &tr("tray.notifications"), true),
             autostart: CheckMenuItem::with_id(
                 "autostart",
-                "Avvia al login",
+                &tr("tray.start_login"),
                 true,
                 platform::autostart_enabled(),
                 None,
             ),
+            about: item("about", &tr("tray.about"), true),
+            quit: item("quit", &tr("tray.quit"), true),
         };
         let menu = Menu::new();
         let separator = PredefinedMenuItem::separator;
@@ -102,27 +121,33 @@ impl App {
             &items.header,
             &items.last_line,
             &separator(),
-            &item("open", "Apri dashboard", true),
+            &items.open,
             &items.audit,
-            &item("last", "Visualizza ultimo risultato", true),
-            &item("history", "Storico audit", true),
+            &items.last,
+            &items.history,
             &separator(),
             &items.pending,
-            &item("events", "Notifiche recenti", true),
+            &items.events,
             &separator(),
             &items.autostart,
-            &item("about", "Informazioni", true),
-            &item("quit", "Chiudi tray (l'agente resta disponibile)", true),
+            &items.about,
+            &items.quit,
         ])
-        .map_err(|_| "impossibile creare il menu della tray")?;
+        .map_err(|_| baradwatchu_messages::message("tray.error.menu", language))?;
         let tray = TrayIconBuilder::new()
             .with_id("baradwatchu")
             .with_title("BaradWatchU")
-            .with_tooltip("BaradWatchU — connessione all'agente…")
+            .with_tooltip(baradwatchu_messages::message("tray.tooltip", language))
             .with_menu(Box::new(menu))
-            .with_icon(icon::icon(Health::Unreachable).ok_or("icona non valida")?)
+            .with_icon(
+                icon::icon(Health::Unreachable)
+                    .ok_or_else(|| baradwatchu_messages::message("tray.error.icon", language))?,
+            )
             .build()
-            .map_err(|error| format!("impossibile creare l'icona nella system tray: {error}"))?;
+            .map_err(|error| {
+                baradwatchu_messages::message("tray.error.icon_create", language)
+                    .replace("{error}", &error.to_string())
+            })?;
         let menu_post = post.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             menu_post(Msg::Menu(event.id.0.clone()));
@@ -133,6 +158,7 @@ impl App {
             thread::sleep(POLL_INTERVAL);
         });
         Ok(Self {
+            language,
             agent,
             post,
             tray,
@@ -163,8 +189,9 @@ impl App {
             Msg::AuditDone(result) => {
                 self.auditing = false;
                 if let Err(error) = result {
+                    let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
                     platform::notify(note(
-                        "BaradWatchU: errore nell'esecuzione dell'audit",
+                        baradwatchu_messages::message("tray.audit_error", self.language),
                         &error,
                         Urgency::Critical,
                     ));
@@ -178,8 +205,9 @@ impl App {
             } => self.on_consent_closed(request_id, outcome),
             Msg::ConsentRecorded(result) => {
                 if let Err(error) = result {
+                    let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
                     platform::notify(note(
-                        "BaradWatchU: decisione non registrata",
+                        baradwatchu_messages::message("tray.consent_error", self.language),
                         &error,
                         Urgency::Critical,
                     ));
@@ -211,6 +239,7 @@ impl App {
                 self.comm_error = None;
             }
             Err(error) => {
+                let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
                 for item in self.notifier.on_failure(&error) {
                     platform::notify(item);
                 }
@@ -223,6 +252,7 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        self.language = baradwatchu_messages::configured_language();
         let health = model::health(self.snapshot.as_ref());
         if self.health != Some(health) {
             if let Some(image) = icon::icon(health) {
@@ -230,34 +260,55 @@ impl App {
             }
             self.health = Some(health);
         }
-        let summary = model::summary(self.snapshot.as_ref(), self.comm_error.as_deref(), now_ms());
-        let _ = self.tray.set_tooltip(Some(&summary));
-        self.items
-            .header
-            .set_text(format!("BaradWatchU — {}", model::health_label(health)));
-        self.items.last_line.set_text(
-            summary
-                .lines()
-                .nth(1)
-                .unwrap_or("Ultimo audit: non disponibile"),
+        let summary = model::summary_in(
+            self.snapshot.as_ref(),
+            self.comm_error.as_deref(),
+            now_ms(),
+            self.language,
         );
+        let _ = self.tray.set_tooltip(Some(&summary));
+        self.items.header.set_text(format!(
+            "BaradWatchU — {}",
+            model::health_label_in(health, self.language)
+        ));
+        self.items
+            .last_line
+            .set_text(
+                summary
+                    .lines()
+                    .nth(1)
+                    .unwrap_or(baradwatchu_messages::message(
+                        "tray.last_unavailable",
+                        self.language,
+                    )),
+            );
         self.refresh_menu();
     }
 
     fn refresh_menu(&self) {
+        // The preference can be changed from the dashboard while the tray is running.
+        let language = baradwatchu_messages::configured_language();
+        let text = |key| baradwatchu_messages::message(key, language);
         self.items.audit.set_enabled(!self.auditing);
         self.items.audit.set_text(if self.auditing {
-            "Audit in corso…"
+            text("tray.audit_running")
         } else {
-            "Esegui audit"
+            text("tray.audit")
         });
+        self.items.open.set_text(text("tray.open_dashboard"));
+        self.items.last.set_text(text("tray.last_result"));
+        self.items.history.set_text(text("tray.history"));
+        self.items.events.set_text(text("tray.notifications"));
+        self.items.about.set_text(text("tray.about"));
+        self.items.quit.set_text(text("tray.quit"));
+        self.items.autostart.set_text(text("tray.start_login"));
         let pending = self
             .snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.pending_consents.len());
         self.items
             .pending
-            .set_text(format!("Richieste in sospeso: {pending}"));
+            .set_text(format!("{}: {pending}", text("tray.pending")));
         self.items.pending.set_enabled(pending > 0);
         self.items
             .autostart
@@ -276,18 +327,24 @@ impl App {
                 self.spawn(move || Msg::AuditDone(agent.audit()));
             }
             "last" => {
-                let text =
-                    model::summary(self.snapshot.as_ref(), self.comm_error.as_deref(), now_ms());
-                if !platform::info_dialog("BaradWatchU — ultimo risultato", &text) {
-                    platform::notify(note("BaradWatchU — ultimo risultato", &text, Urgency::Low));
+                let text = model::summary_in(
+                    self.snapshot.as_ref(),
+                    self.comm_error.as_deref(),
+                    now_ms(),
+                    self.language,
+                );
+                let title = baradwatchu_messages::message("tray.last_title", self.language);
+                if !platform::info_dialog(title, &text) {
+                    platform::notify(note(title, &text, Urgency::Low));
                 }
             }
             "pending" => self.offer_next_consent(true),
             "autostart" => {
                 let wanted = !platform::autostart_enabled();
                 if let Err(error) = platform::set_autostart(wanted, &self.exe) {
+                    let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
                     platform::notify(note(
-                        "BaradWatchU: avvio automatico non modificato",
+                        baradwatchu_messages::message("tray.autostart_error", self.language),
                         &error,
                         Urgency::Normal,
                     ));
@@ -296,16 +353,23 @@ impl App {
             }
             "about" => {
                 let agent_state = match &self.snapshot {
-                    Some(snapshot) => format!("agente {} raggiungibile", snapshot.agent_version),
-                    None => "agente non raggiungibile".into(),
+                    Some(snapshot) => {
+                        baradwatchu_messages::message("tray.about_reachable", self.language)
+                            .replace("{version}", &snapshot.agent_version)
+                    }
+                    None => baradwatchu_messages::message("tray.about_unreachable", self.language)
+                        .into(),
                 };
                 let text = format!(
-                    "BaradWatchU Tray {}\nAgente: {} ({agent_state})\n\nLa tray mostra lo stato, le notifiche e le richieste di consenso. Gli audit sono eseguiti dall'agente: chiudere la tray non arresta l'agente né la dashboard.",
+                    "BaradWatchU Tray {}\n{}: {} ({agent_state})\n\n{}",
                     env!("CARGO_PKG_VERSION"),
-                    self.agent.path().display()
+                    baradwatchu_messages::message("agent.label", self.language),
+                    self.agent.path().display(),
+                    baradwatchu_messages::message("tray.about_body", self.language)
                 );
-                if !platform::info_dialog("Informazioni su BaradWatchU", &text) {
-                    platform::notify(note("Informazioni su BaradWatchU", &text, Urgency::Low));
+                let title = baradwatchu_messages::message("tray.about_title", self.language);
+                if !platform::info_dialog(title, &text) {
+                    platform::notify(note(title, &text, Urgency::Low));
                 }
             }
             "quit" => return Control::Exit,
@@ -316,8 +380,9 @@ impl App {
 
     fn open_dashboard(&self, route: DashboardRoute) {
         if let Err(error) = self.agent.open_dashboard(route) {
+            let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
             platform::notify(note(
-                "BaradWatchU: dashboard non disponibile",
+                baradwatchu_messages::message("tray.dashboard_error", self.language),
                 &error,
                 Urgency::Normal,
             ));
@@ -349,7 +414,7 @@ impl App {
         let post = self.post.clone();
         let request_id = consent.request_id.clone();
         platform::consent_dialog(
-            CONSENT_TITLE,
+            baradwatchu_messages::message("tray.consent_title", self.language),
             &consent.prompt,
             platform::dialog_timeout(consent.remaining_seconds),
             Box::new(move |outcome| {
@@ -373,9 +438,12 @@ impl App {
                 return;
             }
             DialogOutcome::Unavailable(reason) => {
+                let reason = baradwatchu_messages::localize_diagnostic(&reason, self.language);
                 platform::notify(note(
-                    "BaradWatchU: finestra di consenso non disponibile",
-                    &format!("{reason}. Puoi decidere con: baradwatchu-agent consent accept|reject {request_id}"),
+                    baradwatchu_messages::message("tray.consent_window_error", self.language),
+                    &baradwatchu_messages::message("tray.consent_window_hint", self.language)
+                        .replace("{reason}", &reason)
+                        .replace("{id}", &request_id),
                     Urgency::Critical,
                 ));
                 return;

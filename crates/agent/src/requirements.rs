@@ -300,6 +300,8 @@ struct CustomToolResult {
 pub struct ResultRecord {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     pub priority: Priority,
     pub status: ResultStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,8 +319,77 @@ pub struct AuditReport {
     pub schema_version: String,
     pub completed_at_unix_ms: u64,
     pub results: Vec<ResultRecord>,
+    /// Hash of the running agent executable. Older cached reports may omit it.
+    #[serde(default)]
+    pub client: ClientIdentity,
+    /// Reserved report extensions: PDF status and future policy features.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<PdfArtifact>,
+    #[serde(default)]
+    pub extensions: AuditExtensions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientIdentity {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfArtifact {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditExtensions {
+    /// Future per-machine exceptions; current DISABLED results remain represented in results.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_requirements: Vec<DisabledRequirement>,
+    /// Future provider model; empty until provider execution is implemented.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<ProviderResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisabledRequirement {
+    pub id: String,
+    pub priority: Priority,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderResult {
+    pub requirement_id: String,
+    pub provider_id: String,
+    pub origin: ControlOrigin,
+    pub required: bool,
+    pub status: ResultStatus,
+    pub summary: String,
+    #[serde(default)]
+    pub details: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -633,10 +704,15 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             .expect("tool is inside the installation root")
             .to_string_lossy()
             .replace('\\', "/");
+        let (display_name, display_description) = baradwatchu_messages::requirement_metadata(
+            &config.id,
+            baradwatchu_messages::configured_language(),
+        )
+        .unwrap_or((&config.name, &config.description));
         requirements.push(Requirement {
             id: config.id.clone(),
-            name: config.name,
-            description: config.description,
+            name: display_name.to_owned(),
+            description: display_description.to_owned(),
             enabled: config.enabled,
             priority: config.priority,
             parameters: config.parameters,
@@ -1131,6 +1207,29 @@ fn sha256_bytes(bytes: &[u8]) -> Option<String> {
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
+fn current_client_identity() -> ClientIdentity {
+    let result = std::env::current_exe()
+        .map_err(|error| format!("percorso dell'agente non disponibile: {error}"))
+        .and_then(|path| {
+            fs::read(path).map_err(|error| format!("eseguibile dell'agente non leggibile: {error}"))
+        })
+        .and_then(|bytes| {
+            sha256_bytes(&bytes).ok_or_else(|| "calcolo SHA-256 non riuscito".to_owned())
+        });
+    match result {
+        Ok(sha256) => ClientIdentity {
+            version: env!("CARGO_PKG_VERSION").into(),
+            sha256: Some(sha256),
+            sha256_error: None,
+        },
+        Err(error) => ClientIdentity {
+            version: env!("CARGO_PKG_VERSION").into(),
+            sha256: None,
+            sha256_error: Some(error),
+        },
+    }
+}
+
 fn control_provenance(requirement: &Requirement) -> ControlProvenance {
     let root = if requirement.origin == ControlOrigin::Builtin {
         install_root().ok()
@@ -1505,6 +1604,7 @@ fn error_with_details(
     ResultRecord {
         id: requirement.id.clone(),
         name: requirement.name.clone(),
+        description: requirement.description.clone(),
         priority,
         status: ResultStatus::Error,
         compliance_status: None,
@@ -1900,6 +2000,7 @@ fn execute_with_timeout(
         return ResultRecord {
             id: requirement.id.clone(),
             name: requirement.name.clone(),
+            description: requirement.description.clone(),
             priority,
             status: ResultStatus::NotApplicable,
             compliance_status: None,
@@ -2289,6 +2390,7 @@ fn execute_with_timeout(
     ResultRecord {
         id: requirement.id.clone(),
         name: requirement.name.clone(),
+        description: requirement.description.clone(),
         priority,
         status: result_status,
         compliance_status: None,
@@ -2321,10 +2423,51 @@ fn save_audit_at(
     report.log_file = include_log.then(|| log_path.display().to_string());
     let report_path = reports.join(format!("{stamp}.json"));
     if include_log {
-        let mut log = format!("BaradWatchU — log audit\nCompletato (Unix ms): {stamp}\n\n");
+        let sha = report.client.sha256.as_deref().unwrap_or_else(|| {
+            report
+                .client
+                .sha256_error
+                .as_deref()
+                .unwrap_or("NON DISPONIBILE")
+        });
+        let mut log = format!(
+            "BaradWatchU — log audit\nCompletato (Unix ms): {stamp}\nClient {} · SHA-256 {}\n\n",
+            report.client.version, sha
+        );
         for result in &report.results {
             log.push_str(&human_result(result));
             log.push('\n');
+        }
+        if let Some(pdf) = &report.pdf {
+            if let Some(path) = &pdf.path {
+                log.push_str(
+                    &baradwatchu_messages::message(
+                        "cli.audit.pdf",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .replace("{path}", path)
+                    .as_str(),
+                );
+                if let Some(warning) = &pdf.warning {
+                    log.push_str(
+                        &baradwatchu_messages::message(
+                            "cli.pdf.theme_warning",
+                            baradwatchu_messages::configured_language(),
+                        )
+                        .replace("{warning}", warning)
+                        .as_str(),
+                    );
+                }
+            } else if let Some(error) = &pdf.error {
+                log.push_str(
+                    &baradwatchu_messages::message(
+                        "cli.pdf.failed",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .replace("{reason}", error)
+                    .as_str(),
+                );
+            }
         }
         atomic_text(&log_path, &log)?;
     }
@@ -2466,23 +2609,70 @@ pub(crate) fn history_entry(report: &AuditReport) -> AuditHistoryEntry {
 }
 
 fn human_result(result: &ResultRecord) -> String {
+    let language = baradwatchu_messages::configured_language();
+    let status = baradwatchu_messages::message(
+        match result.status {
+            ResultStatus::Pass => "status.pass",
+            ResultStatus::Fail => "status.fail",
+            ResultStatus::Warn => "status.warning",
+            ResultStatus::Error => "status.error",
+            ResultStatus::Disabled => "status.disabled",
+            ResultStatus::NotApplicable => "status.not_applicable",
+        },
+        language,
+    );
+    let name = result
+        .provenance
+        .as_ref()
+        .is_none_or(|provenance| provenance.origin == ControlOrigin::Builtin)
+        .then(|| baradwatchu_messages::requirement_metadata(&result.id, language))
+        .flatten()
+        .map_or(result.name.as_str(), |(name, _)| name);
     let mut text = format!(
         "{}  {:<11} {} ({}) — {}\n",
-        result.id, result.status, result.name, result.priority, result.summary
+        result.id, status, name, result.priority, result.summary
     );
     if let Some(provenance) = &result.provenance {
-        text.push_str(&format!(
-            "    - Provenienza: {:?}; integrità: {:?}; SHA-256 atteso: {}; effettivo: {}\n",
-            provenance.origin,
-            provenance.integrity_status,
-            provenance.expected_sha256.as_deref().unwrap_or("UNKNOWN"),
-            provenance.actual_sha256.as_deref().unwrap_or("UNKNOWN")
-        ));
+        let origin = baradwatchu_messages::message(
+            if provenance.origin == ControlOrigin::Builtin {
+                "origin.builtin"
+            } else {
+                "origin.custom"
+            },
+            language,
+        );
+        let integrity = baradwatchu_messages::message(
+            match provenance.integrity_status {
+                IntegrityStatus::Verified => "integrity.verified",
+                IntegrityStatus::Mismatch => "integrity.mismatch",
+                IntegrityStatus::Unknown => "integrity.unknown",
+            },
+            language,
+        );
+        text.push_str(
+            &baradwatchu_messages::message("cli.result.provenance", language)
+                .replace("{origin}", origin)
+                .replace("{integrity}", integrity)
+                .replace(
+                    "{expected}",
+                    provenance.expected_sha256.as_deref().unwrap_or("UNKNOWN"),
+                )
+                .replace(
+                    "{actual}",
+                    provenance.actual_sha256.as_deref().unwrap_or("UNKNOWN"),
+                ),
+        );
         if let Some(path) = &provenance.tool_path {
-            text.push_str(&format!("    - Tool: {path}\n"));
+            text.push_str(
+                &baradwatchu_messages::message("cli.result.tool", language).replace("{path}", path),
+            );
         }
         if let Some(id) = &provenance.override_builtin_id {
-            text.push_str(&format!("    - OVERRIDE del controllo integrato: {id}\n"));
+            text.push_str(
+                &baradwatchu_messages::message("cli.result.override", language)
+                    .replace("{id}", id)
+                    .as_str(),
+            );
         }
     }
     for detail in &result.details {
@@ -2512,7 +2702,12 @@ fn parse_priority(value: &OsString) -> Option<Priority> {
     }
 }
 
-const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | history [--json] | history delete STAMP | history clear --yes | custom accept ID | custom remove ID | dashboard [--no-browser] [--open ROUTE] | notifications [--json] | notifications set enabled|informative on|off | events --json [--after ID] | consent simulate|list|accept|reject … | --version";
+fn usage() -> &'static str {
+    baradwatchu_messages::message(
+        "cli.requirements.usage",
+        baradwatchu_messages::configured_language(),
+    )
+}
 
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     // Custom-check maintenance must work even when the catalog cannot be built.
@@ -2520,16 +2715,22 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         [command, action, id] if command == "custom" && action == "remove" => {
             let id = id.to_str().unwrap_or("");
             remove_custom(id)?;
+            let language = baradwatchu_messages::configured_language();
             return Ok(CliOutput {
-                text: format!("Controllo personalizzato {id} eliminato.\n"),
+                text: baradwatchu_messages::message("cli.custom.removed", language)
+                    .replace("{id}", id),
                 code: 0,
             });
         }
         [command, action, id] if command == "custom" && action == "accept" => {
             let id = id.to_str().unwrap_or("");
             let (hash, version) = accept_custom(id)?;
+            let language = baradwatchu_messages::configured_language();
             return Ok(CliOutput {
-                text: format!("{id}: SHA-256 atteso aggiornato a {hash} (versione {version}).\n"),
+                text: baradwatchu_messages::message("cli.custom.hash_updated", language)
+                    .replace("{id}", id)
+                    .replace("{hash}", &hash)
+                    .replace("{version}", &version.to_string()),
                 code: 0,
             });
         }
@@ -2557,7 +2758,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         .and_then(|command| command.to_str())
         .is_some_and(|command| COMMANDS.contains(&command))
     {
-        return Err(CliError(USAGE.into()));
+        return Err(CliError(usage().into()));
     }
     match args {
         [command, options @ ..] if command == "audit" => {
@@ -2565,11 +2766,23 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         [command, _] | [command, _, _] if command == "check" => {
             if args.len() == 3 && args[2] != "--log" {
-                return Err(CliError("Usage: check ID [--log]".into()));
+                return Err(CliError(
+                    baradwatchu_messages::message(
+                        "cli.check.usage",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .into(),
+                ));
             }
         }
         [command, ..] if command == "check" => {
-            return Err(CliError("Usage: check ID [--log]".into()))
+            return Err(CliError(
+                baradwatchu_messages::message(
+                    "cli.check.usage",
+                    baradwatchu_messages::configured_language(),
+                )
+                .into(),
+            ))
         }
         _ => {}
     }
@@ -2580,6 +2793,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     }
     match args {
         [command] if command == "refresh" => {
+            let language = baradwatchu_messages::configured_language();
             let builtin = catalog
                 .requirements
                 .iter()
@@ -2592,22 +2806,37 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 .iter()
                 .filter(|item| item.configuration_error.is_some())
                 .collect::<Vec<_>>();
-            let mut text = format!("Discovery aggiornata: {} controlli rilevati ({} integrati, {} personalizzati).\nCartella controlli personalizzati: {}\n", catalog.requirements.len(), builtin, catalog.requirements.len() - builtin, custom_root()?.display());
+            let mut text = baradwatchu_messages::message("cli.refresh.done", language)
+                .replace("{total}", &catalog.requirements.len().to_string())
+                .replace("{builtin}", &builtin.to_string())
+                .replace(
+                    "{custom}",
+                    &(catalog.requirements.len() - builtin).to_string(),
+                );
+            text.push_str(
+                &baradwatchu_messages::message("cli.refresh.folder", language)
+                    .replace("{path}", &custom_root()?.display().to_string()),
+            );
             for item in broken {
-                text.push_str(&format!(
-                    "  [NON VALIDO] {}: {}\n",
-                    item.id,
-                    item.configuration_error.as_deref().unwrap_or("")
-                ));
+                text.push_str(
+                    &baradwatchu_messages::message("cli.refresh.invalid", language)
+                        .replace("{id}", &item.id)
+                        .replace(
+                            "{reason}",
+                            item.configuration_error.as_deref().unwrap_or(""),
+                        ),
+                );
             }
             for name in &registry.ignored {
-                text.push_str(&format!(
-                    "  [IGNORATA] cartella {name}: il nome deve essere un ID CUSTOM-…\n"
-                ));
+                text.push_str(
+                    &baradwatchu_messages::message("cli.refresh.ignored", language)
+                        .replace("{name}", name),
+                );
             }
             Ok(CliOutput { text, code: 0 })
         }
         [command] if command == "list" => {
+            let language = baradwatchu_messages::configured_language();
             let list = catalog
                 .requirements
                 .iter()
@@ -2622,18 +2851,72 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                     item
                 })
                 .collect::<Vec<_>>();
-            let text = list.iter().map(|r| {
-                if let Some(reason) = &r.configuration_error {
-                    return format!("{}  NON VALIDO {} [CUSTOM]\n    Errore: {}\n", r.id, r.name, reason);
-                }
-                let evidence = control_provenance(r);
-                format!("{}  {:<8} {:<7} {} [{}{}]\n    Tool: {}\n    Integrity: {:?} expected={} actual={}\n",
-                    r.id, if r.enabled { "enabled" } else { "disabled" }, r.priority, r.name,
-                    match r.origin { ControlOrigin::Builtin => "BUILTIN", ControlOrigin::Custom => "CUSTOM" },
-                    if r.replaces_builtin.is_some() { " OVERRIDE" } else { "" },
-                    evidence.tool_path.as_deref().unwrap_or("non disponibile"), evidence.integrity_status,
-                    evidence.expected_sha256.as_deref().unwrap_or("UNKNOWN"), evidence.actual_sha256.as_deref().unwrap_or("UNKNOWN"))
-            }).collect();
+            let text = list
+                .iter()
+                .map(|r| {
+                    if let Some(reason) = &r.configuration_error {
+                        let reason = baradwatchu_messages::localize_diagnostic(reason, language);
+                        return baradwatchu_messages::message("cli.list.invalid", language)
+                            .replace("{id}", &r.id)
+                            .replace("{name}", &r.name)
+                            .replace("{reason}", &reason);
+                    }
+                    let evidence = control_provenance(r);
+                    let enabled = baradwatchu_messages::message(
+                        if r.enabled {
+                            "cli.value.enabled"
+                        } else {
+                            "cli.value.disabled"
+                        },
+                        language,
+                    );
+                    let origin = baradwatchu_messages::message(
+                        if r.origin == ControlOrigin::Builtin {
+                            "origin.builtin"
+                        } else {
+                            "origin.custom"
+                        },
+                        language,
+                    );
+                    let integrity = baradwatchu_messages::message(
+                        match evidence.integrity_status {
+                            IntegrityStatus::Verified => "integrity.verified",
+                            IntegrityStatus::Mismatch => "integrity.mismatch",
+                            IntegrityStatus::Unknown => "integrity.unknown",
+                        },
+                        language,
+                    );
+                    let override_tag = if r.replaces_builtin.is_some() {
+                        baradwatchu_messages::message("cli.list.override", language)
+                    } else {
+                        ""
+                    };
+                    let tool = baradwatchu_messages::message("cli.list.tool", language).replace(
+                        "{path}",
+                        evidence
+                            .tool_path
+                            .as_deref()
+                            .unwrap_or(baradwatchu_messages::message(
+                                "cli.value.path_unavailable",
+                                language,
+                            )),
+                    );
+                    let integrity = baradwatchu_messages::message("cli.list.integrity", language)
+                        .replace("{status}", integrity)
+                        .replace(
+                            "{expected}",
+                            evidence.expected_sha256.as_deref().unwrap_or("UNKNOWN"),
+                        )
+                        .replace(
+                            "{actual}",
+                            evidence.actual_sha256.as_deref().unwrap_or("UNKNOWN"),
+                        );
+                    format!(
+                        "{}  {:<12} {:<7} {} [{}{}]\n{}{}",
+                        r.id, enabled, r.priority, r.name, origin, override_tag, tool, integrity
+                    )
+                })
+                .collect();
             Ok(CliOutput { text, code: 0 })
         }
         [command, flag] if command == "list" && flag == "--json" => {
@@ -2674,8 +2957,17 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             local.enabled = command == "enable";
             let enabled = local.enabled;
             save_settings(&settings)?;
+            let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
-                text: format!("{} {}\n", if enabled { "Enabled" } else { "Disabled" }, id),
+                text: baradwatchu_messages::message(
+                    if enabled {
+                        "cli.enabled"
+                    } else {
+                        "cli.disabled"
+                    },
+                    language,
+                )
+                .replace("{id}", id),
                 code: 0,
             })
         }
@@ -2697,8 +2989,11 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 });
             local.priority = priority;
             save_settings(&settings)?;
+            let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
-                text: format!("Priority for {id}: {priority}\n"),
+                text: baradwatchu_messages::message("cli.priority.saved", language)
+                    .replace("{id}", id)
+                    .replace("{priority}", &priority.to_string()),
                 code: 0,
             })
         }
@@ -2728,8 +3023,10 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 });
             local.parameters = parameters;
             save_settings(&settings)?;
+            let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
-                text: format!("Parameters saved for {id}\n"),
+                text: baradwatchu_messages::message("cli.parameters.saved", language)
+                    .replace("{id}", id),
                 code: 0,
             })
         }
@@ -2745,12 +3042,22 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             Some(report) => {
                 let mut text = report.results.iter().map(human_result).collect::<String>();
                 if let Some(path) = report.log_file {
-                    text.push_str(&format!("\nLog audit: {path}\n"));
+                    text.push_str(
+                        &baradwatchu_messages::message(
+                            "cli.audit.log",
+                            baradwatchu_messages::configured_language(),
+                        )
+                        .replace("{path}", &path),
+                    );
                 }
                 Ok(CliOutput { text, code: 0 })
             }
             None => Ok(CliOutput {
-                text: "No audit results saved yet. Run `baradwatchu-agent audit`.\n".into(),
+                text: baradwatchu_messages::message(
+                    "cli.status.empty",
+                    baradwatchu_messages::configured_language(),
+                )
+                .into(),
                 code: 0,
             }),
         },
@@ -2761,7 +3068,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             },
             code: 0,
         }),
-        _ => Err(CliError(USAGE.into())),
+        _ => Err(CliError(usage().into())),
     }
 }
 
@@ -2781,11 +3088,23 @@ fn parse_audit_options(options: &[OsString]) -> Result<(bool, bool, bool), CliEr
             Some("--json") => &mut json,
             Some("--notify") => &mut notify,
             Some("--log") => &mut log,
-            _ => return Err(CliError("Usage: audit [--json] [--notify] [--log]".into())),
+            _ => {
+                return Err(CliError(
+                    baradwatchu_messages::message(
+                        "cli.audit.usage",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .into(),
+                ))
+            }
         };
         if *target {
             return Err(CliError(
-                "Usage: audit [--json] [--notify] [--log] (options cannot be repeated)".into(),
+                baradwatchu_messages::message(
+                    "cli.audit.repeat_usage",
+                    baradwatchu_messages::configured_language(),
+                )
+                .into(),
             ));
         }
         *target = true;
@@ -2810,6 +3129,7 @@ fn run_check(
         ResultRecord {
             id: requirement.id.clone(),
             name: requirement.name.clone(),
+            description: requirement.description.clone(),
             priority,
             status: ResultStatus::Disabled,
             compliance_status: None,
@@ -2830,12 +3150,22 @@ fn run_check(
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results: vec![result.clone()],
+        client: current_client_identity(),
+        pdf: None,
+        extensions: AuditExtensions::default(),
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
     let mut text = human_result(&result);
     if let Some(path) = log_path {
-        text.push_str(&format!("Log audit: {}\n", path.display()));
+        text.push_str(
+            &baradwatchu_messages::message(
+                "cli.audit.log",
+                baradwatchu_messages::configured_language(),
+            )
+            .replace("{path}", &path.display().to_string())
+            .as_str(),
+        );
     }
     Ok(CliOutput {
         text,
@@ -2851,6 +3181,7 @@ fn run_audit(
     include_log: bool,
 ) -> Result<CliOutput, CliError> {
     let mut results = Vec::with_capacity(catalog.requirements.len());
+    let mut disabled_requirements = Vec::new();
     for requirement in &catalog.requirements {
         let local = settings.requirements.get(&requirement.id);
         let enabled = local.map_or(requirement.enabled, |v| v.enabled);
@@ -2862,9 +3193,18 @@ fn run_audit(
                 local.map_or(&requirement.parameters, |v| &v.parameters),
             )
         } else {
+            disabled_requirements.push(DisabledRequirement {
+                id: requirement.id.clone(),
+                priority,
+                reason: None,
+                author: None,
+                disabled_at_unix_ms: None,
+                expires_at_unix_ms: None,
+            });
             ResultRecord {
                 id: requirement.id.clone(),
                 name: requirement.name.clone(),
+                description: requirement.description.clone(),
                 priority,
                 status: ResultStatus::Disabled,
                 compliance_status: None,
@@ -2881,9 +3221,33 @@ fn run_audit(
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results,
+        client: current_client_identity(),
+        pdf: None,
+        extensions: AuditExtensions {
+            disabled_requirements,
+            providers: Vec::new(),
+        },
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
+    let pdf = crate::pdf::generate_for_audit(&report);
+    report.pdf = Some(match pdf {
+        Ok(generated) => PdfArtifact {
+            status: "GENERATED".into(),
+            path: Some(generated.path.display().to_string()),
+            error: None,
+            warning: generated.warning,
+        },
+        Err(error) => PdfArtifact {
+            status: "FAILED".into(),
+            path: None,
+            error: Some(error),
+            warning: None,
+        },
+    });
+    // Persist the PDF location or generation failure in the cached JSON and optional text log.
+    // PDF failure never changes the completed audit or its status code.
+    let _ = save_audit(&mut report, include_log);
     // The event log feeds the tray companion and the dashboard; failing to record it
     // must not discard a completed audit.
     let _ = crate::events::record_audit(&report);
@@ -2914,13 +3278,118 @@ fn run_audit(
     let text = if json {
         output_json(&report)?
     } else {
-        let mut text = report.results.iter().map(human_result).collect::<String>();
+        let mut text = audit_summary_text(&report);
+        text.push_str(&report.results.iter().map(human_result).collect::<String>());
         if let Some(path) = log_path {
-            text.push_str(&format!("\nLog audit: {}\n", path.display()));
+            text.push_str(
+                &baradwatchu_messages::message(
+                    "cli.audit.log",
+                    baradwatchu_messages::configured_language(),
+                )
+                .replace("{path}", &path.display().to_string())
+                .as_str(),
+            );
+        }
+        match report.pdf.as_ref() {
+            Some(artifact) if artifact.status == "GENERATED" => {
+                text.push_str(
+                    &baradwatchu_messages::message(
+                        "cli.audit.pdf",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .replace(
+                        "{path}",
+                        artifact
+                            .path
+                            .as_deref()
+                            .unwrap_or(baradwatchu_messages::message(
+                                "cli.value.path_unavailable",
+                                baradwatchu_messages::configured_language(),
+                            )),
+                    ),
+                );
+                if let Some(warning) = &artifact.warning {
+                    text.push_str(
+                        &baradwatchu_messages::message(
+                            "cli.pdf.theme_warning",
+                            baradwatchu_messages::configured_language(),
+                        )
+                        .replace("{warning}", warning)
+                        .as_str(),
+                    );
+                }
+            }
+            Some(artifact) => {
+                text.push_str(
+                    &baradwatchu_messages::message(
+                        "cli.pdf.failed",
+                        baradwatchu_messages::configured_language(),
+                    )
+                    .replace(
+                        "{reason}",
+                        artifact
+                            .error
+                            .as_deref()
+                            .unwrap_or(baradwatchu_messages::message(
+                                "cli.value.reason_unavailable",
+                                baradwatchu_messages::configured_language(),
+                            )),
+                    )
+                    .as_str(),
+                );
+            }
+            None => text.push_str(
+                &baradwatchu_messages::message(
+                    "cli.pdf.failed",
+                    baradwatchu_messages::configured_language(),
+                )
+                .replace(
+                    "{reason}",
+                    baradwatchu_messages::message(
+                        "cli.value.state_unavailable",
+                        baradwatchu_messages::configured_language(),
+                    ),
+                )
+                .as_str(),
+            ),
         }
         text
     };
     Ok(CliOutput { text, code })
+}
+
+fn audit_summary_text(report: &AuditReport) -> String {
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut warn = 0;
+    let mut error = 0;
+    let mut other = 0;
+    for result in &report.results {
+        match result.status {
+            ResultStatus::Pass => pass += 1,
+            ResultStatus::Fail => fail += 1,
+            ResultStatus::Warn => warn += 1,
+            ResultStatus::Error => error += 1,
+            ResultStatus::Disabled | ResultStatus::NotApplicable => other += 1,
+        }
+    }
+    let sha = report.client.sha256.as_deref().unwrap_or_else(|| {
+        report
+            .client
+            .sha256_error
+            .as_deref()
+            .unwrap_or("NON DISPONIBILE")
+    });
+    let language = baradwatchu_messages::configured_language();
+    baradwatchu_messages::message("cli.audit.summary", language)
+        .replace("{date}", &report.completed_at_unix_ms.to_string())
+        .replace("{version}", &report.client.version)
+        .replace("{sha}", sha)
+        .replace("{pass}", &pass.to_string())
+        .replace("{fail}", &fail.to_string())
+        .replace("{warn}", &warn.to_string())
+        .replace("{error}", &error.to_string())
+        .replace("{other}", &other.to_string())
 }
 
 pub(crate) fn dashboard_data_json() -> Result<String, CliError> {
@@ -3016,6 +3485,7 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
         ResultRecord {
             id: requirement.id.clone(),
             name: requirement.name.clone(),
+            description: requirement.description.clone(),
             priority,
             status: ResultStatus::Disabled,
             compliance_status: None,
@@ -3036,6 +3506,9 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results: vec![result],
+        client: current_client_identity(),
+        pdf: None,
+        extensions: AuditExtensions::default(),
         log_file: None,
     };
     save_audit(&mut report, false)?;
@@ -3116,7 +3589,10 @@ fn send_notification(report: &AuditReport) {
 }
 
 pub fn help() -> String {
-    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent history [--json]\n  baradwatchu-agent history delete STAMP\n  baradwatchu-agent history clear --yes\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent notifications set enabled|informative on|off\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]\n  baradwatchu-agent consent list [--json]\n  baradwatchu-agent consent accept|reject ID\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally in the audit history (cache folder); `history delete` removes one audit (report, log, PDF), `history clear --yes` removes them all to free space. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user. Desktop notifications and the consent window are provided by the optional baradwatchu-tray companion; consent requests are local simulations only (no remote requests yet) and only an explicit accept authorizes one request.\n", env!("CARGO_PKG_VERSION"))
+    baradwatchu_messages::agent_help(
+        baradwatchu_messages::configured_language(),
+        env!("CARGO_PKG_VERSION"),
+    )
 }
 
 /// Serialises tests that change process-wide environment variables and points every
@@ -3183,6 +3659,15 @@ impl Drop for TestEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_identity_hash_matches_running_executable_bytes() {
+        let identity = current_client_identity();
+        let actual = sha256_bytes(&fs::read(std::env::current_exe().unwrap()).unwrap()).unwrap();
+        assert_eq!(identity.sha256.as_deref(), Some(actual.as_str()));
+        assert_eq!(identity.version, env!("CARGO_PKG_VERSION"));
+        assert!(identity.sha256_error.is_none());
+    }
 
     fn base64_encode(input: &[u8]) -> String {
         const TABLE: &[u8; 64] =
@@ -3283,6 +3768,87 @@ mod tests {
 
     fn pass_tool(summary: &str) -> Vec<u8> {
         status_tool("PASS", summary)
+    }
+
+    #[test]
+    fn audit_persists_json_then_generates_pdf_from_it_and_reports_client_hash() {
+        let _env = TestEnv::new("automatic-pdf");
+        write_custom_folder(
+            &_env,
+            "CUSTOM-PDF",
+            TOOL,
+            &pass_tool("PDF fixture"),
+            serde_json::json!({}),
+        );
+        let mut catalog = catalog().unwrap();
+        catalog
+            .requirements
+            .retain(|requirement| requirement.id == "CUSTOM-PDF");
+        let settings = load_settings(&catalog).unwrap();
+        let output = run_audit(&catalog, &settings, true, false, false).unwrap();
+        let report: AuditReport = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(
+            report.results[0].description,
+            catalog.requirements[0].description
+        );
+        assert!(!report.results[0].description.is_empty());
+        assert!(report
+            .client
+            .sha256
+            .as_ref()
+            .is_some_and(|hash| valid_sha256(hash)));
+        assert_eq!(report.client.version, env!("CARGO_PKG_VERSION"));
+        let artifact = report.pdf.expect("audit should return PDF status");
+        assert_eq!(artifact.status, "GENERATED", "{:?}", artifact.error);
+        let pdf_path = PathBuf::from(artifact.path.unwrap());
+        let bytes = fs::read(pdf_path).unwrap();
+        assert!(bytes.starts_with(b"%PDF-1.7"));
+        let pdf_text = String::from_utf8_lossy(&bytes);
+        for label in ["DESCRIZIONE", "RIASSUNTO", "DETTAGLI"] {
+            assert!(pdf_text.contains(label));
+        }
+        let saved = fs::read(
+            history_dir()
+                .unwrap()
+                .join("reports")
+                .join(format!("{}.json", report.completed_at_unix_ms)),
+        )
+        .unwrap();
+        let saved: AuditReport = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(
+            saved.results[0].description,
+            catalog.requirements[0].description
+        );
+        assert_eq!(saved.pdf.unwrap().status, "GENERATED");
+    }
+
+    #[test]
+    fn pdf_failure_is_reported_without_failing_the_audit() {
+        let env = TestEnv::new("pdf-failure");
+        write_custom_folder(
+            &env,
+            "CUSTOM-PDF",
+            TOOL,
+            &pass_tool("Audit remains successful"),
+            serde_json::json!({}),
+        );
+        let theme = state_dir().unwrap().join("report-theme.json");
+        fs::create_dir_all(theme.parent().unwrap()).unwrap();
+        fs::write(&theme, b"{invalid json").unwrap();
+        let mut catalog = catalog().unwrap();
+        catalog
+            .requirements
+            .retain(|requirement| requirement.id == "CUSTOM-PDF");
+        let settings = load_settings(&catalog).unwrap();
+        let output = run_audit(&catalog, &settings, true, false, false).unwrap();
+        let report: AuditReport = serde_json::from_str(&output.text).unwrap();
+        assert_eq!(output.code, 0, "PDF failure must not change audit status");
+        let artifact = report.pdf.unwrap();
+        assert_eq!(artifact.status, "FAILED");
+        assert!(artifact
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("tema")));
     }
 
     #[test]
@@ -4245,6 +4811,7 @@ mod tests {
         let result = ResultRecord {
             id: "REQ-009".into(),
             name: "Sicurezza di avvio".into(),
+            description: "Verifica firmware e avvio sicuro".into(),
             priority: Priority::Optional,
             status: ResultStatus::Warn,
             compliance_status: None,
@@ -4272,6 +4839,9 @@ mod tests {
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: now_ms(),
             results: vec![],
+            client: current_client_identity(),
+            pdf: None,
+            extensions: AuditExtensions::default(),
             log_file: None,
         };
         let log_path = save_audit_at(&directory, &mut report, false).unwrap();
@@ -4357,6 +4927,7 @@ mod tests {
                 results: vec![ResultRecord {
                     id: "REQ-001".into(),
                     name: "Aggiornamenti software".into(),
+                    description: "Verifica gli aggiornamenti".into(),
                     priority: Priority::High,
                     status,
                     compliance_status: None,
@@ -4365,6 +4936,9 @@ mod tests {
                     completed_at_unix_ms: stamp,
                     provenance: None,
                 }],
+                client: current_client_identity(),
+                pdf: None,
+                extensions: AuditExtensions::default(),
                 log_file: None,
             };
             fs::write(

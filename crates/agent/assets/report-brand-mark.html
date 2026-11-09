@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PDF snapshot of the original dashboard mark</title>
+<style>
+html,body { margin:0; width:256px; height:256px; background:transparent; overflow:hidden; }
+.frame { width:96px; height:96px; position:absolute; transform:scale(2.6666666667); transform-origin:top left;
+  font:14px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; }
+.backdrop { position:absolute; left:28px; top:28px; width:40px; height:40px;
+  border-radius:50%; background:#0e0b0a; }
+/* The brand mark is a burning eye drawn in CSS (the letter inside is hidden). */
+.brand-mark { position: relative; width: 40px; height: 40px; display: grid; place-items: center; font-size: 0; border-radius: 50%;
+  background: radial-gradient(ellipse 46% 32% at 50% 50%, #ffe3a1 0, #ffb04a 30%, #ec5a1f 62%, #7a1f0a 88%, transparent 100%), radial-gradient(circle at 50% 50%, rgba(255, 120, 40, .35), transparent 70%);
+  box-shadow: 0 0 18px rgba(236, 90, 31, .45); animation: ember-pulse 3.6s ease-in-out infinite; }
+.brand-mark::before { content: ""; width: 4px; height: 17px; background: #120604; border-radius: 50%; box-shadow: 0 0 3px #000; }
+@keyframes ember-pulse { 0%, 100% { box-shadow: 0 0 14px rgba(236, 90, 31, .35); } 50% { box-shadow: 0 0 24px rgba(255, 130, 50, .6); } }
+
+.brand-mark { animation:none; }
+</style>
+<!-- Regenerate with headless Chrome, transparent background, 256x256 viewport. -->
+<div class="frame"><div class="backdrop"><span class="brand-mark">B</span></div></div>

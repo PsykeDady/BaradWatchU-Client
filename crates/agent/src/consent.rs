@@ -138,32 +138,45 @@ pub(crate) fn random_hex(bytes: usize) -> Result<String, CliError> {
 }
 
 pub fn prompt(request: &ConsentRequest) -> String {
+    let language = baradwatchu_messages::configured_language();
     let simulated = request.source == ConsentSource::LocalSimulation;
     let mut text = String::new();
     if simulated {
-        text.push_str("[SIMULAZIONE — nessuna richiesta reale, nessun dato verrà inviato]\n\n");
+        text.push_str(baradwatchu_messages::message("consent.simulated", language));
+        text.push_str("\n\n");
     }
-    text.push_str(&format!(
-        "Il server BaradWatchU {} richiede il report della tua postazione tramite l'account {} ({}), dal dispositivo dichiarato {}.\n\nVuoi autorizzare questa richiesta?\n\n",
-        request.server_id, request.account_name, request.account_id, request.declared_device
+    text.push_str(
+        &baradwatchu_messages::message("consent.prompt", language)
+            .replace("{server}", &request.server_id)
+            .replace("{account}", &request.account_name)
+            .replace("{account_id}", &request.account_id)
+            .replace("{device}", &request.declared_device),
+    );
+    text.push_str("\n\n");
+    text.push_str(baradwatchu_messages::message(
+        if simulated {
+            "consent.reject_simulated"
+        } else {
+            "consent.reject"
+        },
+        language,
     ));
-    text.push_str(if simulated {
-        "Il rifiuto sarà comunicato al richiedente (in simulazione non viene inviato nulla)."
-    } else {
-        "Il rifiuto sarà comunicato al richiedente."
-    });
-    text.push_str(&format!("\n\nRichiesta {}", request.request_id));
+    text.push_str("\n\n");
+    text.push_str(
+        &baradwatchu_messages::message("consent.request", language)
+            .replace("{id}", &request.request_id),
+    );
     text
 }
 
 fn effect(request: &ConsentRequest) -> String {
-    match request.state {
-        ConsentState::Pending => "In attesa di una decisione esplicita: finché non accetti non esiste alcuna autorizzazione.",
-        ConsentState::Accepted => "Consenso registrato solo per questa richiesta. Simulazione M7: nessun report è stato inviato.",
-        ConsentState::Rejected => "Rifiuto registrato. Simulazione M7: nessuna comunicazione remota.",
-        ConsentState::Expired => "Scaduta senza risposta: nessuna autorizzazione.",
-    }
-    .into()
+    let key = match request.state {
+        ConsentState::Pending => "consent.effect.pending",
+        ConsentState::Accepted => "consent.effect.accepted",
+        ConsentState::Rejected => "consent.effect.rejected",
+        ConsentState::Expired => "consent.effect.expired",
+    };
+    baradwatchu_messages::message(key, baradwatchu_messages::configured_language()).into()
 }
 
 fn view(request: ConsentRequest, now: u64) -> ConsentView {
@@ -197,28 +210,30 @@ fn save(dir: &Path, request: &ConsentRequest) -> Result<(), CliError> {
 }
 
 fn close_event(request: &ConsentRequest) -> NewEvent {
+    let language = baradwatchu_messages::configured_language();
     let (kind, title) = match request.state {
         ConsentState::Accepted => (
             EventKind::ConsentAccepted,
-            "Richiesta di consenso accettata",
+            baradwatchu_messages::message("consent.title.accepted", language),
         ),
         ConsentState::Rejected => (
             EventKind::ConsentRejected,
-            "Richiesta di consenso rifiutata",
+            baradwatchu_messages::message("consent.title.rejected", language),
         ),
-        _ => (EventKind::ConsentExpired, "Richiesta di consenso scaduta"),
+        _ => (
+            EventKind::ConsentExpired,
+            baradwatchu_messages::message("consent.title.expired", language),
+        ),
     };
     NewEvent {
         kind,
         severity: Severity::Info,
         title: title.into(),
-        body: format!(
-            "Server {} · account {} · richiesta {}. {}",
-            request.server_id,
-            request.account_name,
-            &request.request_id[..8],
-            effect(request)
-        ),
+        body: baradwatchu_messages::message("consent.event_body", language)
+            .replace("{server}", &request.server_id)
+            .replace("{account}", &request.account_name)
+            .replace("{id}", &request.request_id[..8])
+            .replace("{effect}", &effect(request)),
         audit_completed_at_unix_ms: None,
         request_id: Some(request.request_id.clone()),
         fingerprint: None,
@@ -285,6 +300,7 @@ pub fn pending_views() -> Result<Vec<ConsentView>, CliError> {
 }
 
 pub fn create_simulated(params: SimulationParams) -> Result<ConsentView, CliError> {
+    let language = baradwatchu_messages::configured_language();
     if !(MIN_TTL_SECONDS..=MAX_TTL_SECONDS).contains(&params.ttl_seconds) {
         return Err(CliError(format!(
             "La scadenza deve essere tra {MIN_TTL_SECONDS} e {MAX_TTL_SECONDS} secondi"
@@ -310,11 +326,11 @@ pub fn create_simulated(params: SimulationParams) -> Result<ConsentView, CliErro
     let _ = events::append_event(NewEvent {
         kind: EventKind::ConsentRequested,
         severity: Severity::Action,
-        title: "Richiesta di consenso (simulata)".into(),
-        body: format!(
-            "Il server {} chiede il report della postazione tramite l'account {}. Decidi nella finestra di consenso; senza risposta entro {} s non viene autorizzato nulla.",
-            request.server_id, request.account_name, params.ttl_seconds
-        ),
+        title: baradwatchu_messages::message("consent.simulated_title", language).into(),
+        body: baradwatchu_messages::message("consent.simulated_body", language)
+            .replace("{server}", &request.server_id)
+            .replace("{account}", &request.account_name)
+            .replace("{seconds}", &params.ttl_seconds.to_string()),
         audit_completed_at_unix_ms: None,
         request_id: Some(request.request_id.clone()),
         fingerprint: None,
@@ -372,23 +388,35 @@ pub(crate) fn dashboard_simulate(text: &str) -> Result<String, CliError> {
     events::dashboard_notifications_json()
 }
 
-const USAGE: &str = "Usage: consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS] | consent list [--json] | consent accept ID [--via window] | consent reject ID [--via window]";
+fn usage() -> &'static str {
+    baradwatchu_messages::message("consent.usage", baradwatchu_messages::configured_language())
+}
 
 fn human(view: &ConsentView) -> String {
-    format!(
-        "{}  {:?}  server {} · account {} ({}) · dispositivo {}{}\n",
-        view.request.request_id,
-        view.request.state,
-        view.request.server_id,
-        view.request.account_name,
-        view.request.account_id,
-        view.request.declared_device,
-        if view.request.state == ConsentState::Pending {
-            format!(" · scade tra {} s", view.remaining_seconds)
-        } else {
-            String::new()
-        }
-    )
+    let language = baradwatchu_messages::configured_language();
+    let state = baradwatchu_messages::message(
+        match view.request.state {
+            ConsentState::Pending => "consent.state.pending",
+            ConsentState::Accepted => "consent.state.accepted",
+            ConsentState::Rejected => "consent.state.rejected",
+            ConsentState::Expired => "consent.state.expired",
+        },
+        language,
+    );
+    let expires = if view.request.state == ConsentState::Pending {
+        baradwatchu_messages::message("consent.cli_expires", language)
+            .replace("{seconds}", &view.remaining_seconds.to_string())
+    } else {
+        String::new()
+    };
+    baradwatchu_messages::message("consent.cli_row", language)
+        .replace("{id}", &view.request.request_id)
+        .replace("{state}", state)
+        .replace("{server}", &view.request.server_id)
+        .replace("{account}", &view.request.account_name)
+        .replace("{account_id}", &view.request.account_id)
+        .replace("{device}", &view.request.declared_device)
+        .replace("{expires}", &expires)
 }
 
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
@@ -396,7 +424,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         value
             .to_str()
             .map(str::to_owned)
-            .ok_or_else(|| CliError(USAGE.into()))
+            .ok_or_else(|| CliError(usage().into()))
     };
     match args {
         [command, options @ ..] if command == "simulate" => {
@@ -404,11 +432,11 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             let mut seen = Vec::new();
             for pair in options.chunks(2) {
                 let [key, value] = pair else {
-                    return Err(CliError(USAGE.into()));
+                    return Err(CliError(usage().into()));
                 };
                 let key = text(key)?;
                 if seen.contains(&key) {
-                    return Err(CliError(USAGE.into()));
+                    return Err(CliError(usage().into()));
                 }
                 let value = text(value)?;
                 match key.as_str() {
@@ -417,25 +445,32 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                     "--account-id" => params.account_id = value,
                     "--device" => params.declared_device = value,
                     "--ttl" => {
-                        params.ttl_seconds = value.parse().map_err(|_| CliError(USAGE.into()))?
+                        params.ttl_seconds = value.parse().map_err(|_| CliError(usage().into()))?
                     }
-                    _ => return Err(CliError(USAGE.into())),
+                    _ => return Err(CliError(usage().into())),
                 }
                 seen.push(key);
             }
             let view = create_simulated(params)?;
+            let language = baradwatchu_messages::configured_language();
             Ok(CliOutput {
-                text: format!(
-                    "Richiesta simulata creata: {}\nScade tra {} s. Senza una decisione esplicita non viene autorizzato nulla.\n",
-                    view.request.request_id, view.remaining_seconds
-                ),
+                text: baradwatchu_messages::message("consent.simulate.created", language)
+                    .replace("{id}", &view.request.request_id)
+                    .replace("{seconds}", &view.remaining_seconds.to_string())
+                    + "\n",
                 code: 0,
             })
         }
         [command] if command == "list" => {
             let views = all_views()?;
             let text = if views.is_empty() {
-                "Nessuna richiesta di consenso.\n".into()
+                format!(
+                    "{}\n",
+                    baradwatchu_messages::message(
+                        "consent.none",
+                        baradwatchu_messages::configured_language()
+                    )
+                )
             } else {
                 views.iter().map(human).collect()
             };
@@ -451,7 +486,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 [flag, value] if flag == "--via" && value == "window" => {
                     DecisionChannel::ConsentWindow
                 }
-                _ => return Err(CliError(USAGE.into())),
+                _ => return Err(CliError(usage().into())),
             };
             let view = decide(&text(id)?, command == "accept", channel)?;
             Ok(CliOutput {
@@ -459,7 +494,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 code: 0,
             })
         }
-        _ => Err(CliError(USAGE.into())),
+        _ => Err(CliError(usage().into())),
     }
 }
 

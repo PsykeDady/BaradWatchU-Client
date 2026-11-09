@@ -48,7 +48,12 @@ pub fn run(build: Builder) -> Result<(), String> {
                     match build(poster.clone()) {
                         Ok(created) => app = Some(created),
                         Err(error) => {
-                            eprintln!("Errore: {error}");
+                            let language = baradwatchu_messages::configured_language();
+                            let error = baradwatchu_messages::localize_diagnostic(&error, language);
+                            eprintln!(
+                                "{}: {error}",
+                                baradwatchu_messages::message("cli.error", language)
+                            );
                             *control_flow = ControlFlow::ExitWithCode(1);
                         }
                     }

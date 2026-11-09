@@ -72,8 +72,12 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Optio
 }
 
 fn consent_blocking(title: &str, text: &str, timeout: Duration) -> DialogOutcome {
+    let language = baradwatchu_messages::configured_language();
+    let accept = baradwatchu_messages::message("consent.button.accept", language);
+    let reject = baradwatchu_messages::message("consent.button.reject", language);
+    let later = baradwatchu_messages::message("consent.button.later", language);
     if Path::new(ZENITY).is_file() {
-        // "Accetta" is never the default button: Enter/Escape/closing mean "decide later".
+        // Accept is never the default button: Enter/Escape/closing mean "decide later".
         let child = Command::new(ZENITY)
             .args([
                 "--question",
@@ -82,8 +86,9 @@ fn consent_blocking(title: &str, text: &str, timeout: Duration) -> DialogOutcome
                 "--default-cancel",
             ])
             .args(["--icon=dialog-warning", "--title", title, "--text", text])
-            .args(["--ok-label=Accetta", "--cancel-label=Decidi più tardi"])
-            .args(["--extra-button=Rifiuta"])
+            .arg(format!("--ok-label={accept}"))
+            .arg(format!("--cancel-label={later}"))
+            .arg(format!("--extra-button={reject}"))
             .arg(format!("--timeout={}", timeout.as_secs().max(1)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -94,7 +99,7 @@ fn consent_blocking(title: &str, text: &str, timeout: Duration) -> DialogOutcome
         };
         return match wait_with_timeout(child, timeout + Duration::from_secs(5)) {
             Some((0, _)) => DialogOutcome::Accept,
-            Some((1, stdout)) if stdout.trim() == "Rifiuta" => DialogOutcome::Reject,
+            Some((1, stdout)) if stdout.trim() == reject => DialogOutcome::Reject,
             Some((5, _)) | None => DialogOutcome::TimedOut,
             Some(_) => DialogOutcome::Later,
         };
@@ -102,8 +107,8 @@ fn consent_blocking(title: &str, text: &str, timeout: Duration) -> DialogOutcome
     if Path::new(KDIALOG).is_file() {
         let child = Command::new(KDIALOG)
             .args(["--title", title])
-            .args(["--yes-label", "Accetta", "--no-label", "Rifiuta"])
-            .args(["--cancel-label", "Decidi più tardi"])
+            .args(["--yes-label", accept, "--no-label", reject])
+            .args(["--cancel-label", later])
             .args(["--warningyesnocancel", text])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -197,8 +202,10 @@ fn exec_value(exe: &Path) -> Result<String, String> {
 }
 
 pub fn desktop_entry(exe: &Path) -> Result<String, String> {
+    let language = baradwatchu_messages::configured_language();
+    let comment = baradwatchu_messages::message("tray.desktop.comment", language);
     Ok(format!(
-        "[Desktop Entry]\nType=Application\nName=BaradWatchU Tray\nComment=Stato di BaradWatchU, notifiche e richieste di consenso\nExec={}\nIcon=security-high\nTerminal=false\nCategories=System;Security;\nX-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n{AUTOSTART_MARKER}\n",
+        "[Desktop Entry]\nType=Application\nName=BaradWatchU Tray\nComment={comment}\nExec={}\nIcon=security-high\nTerminal=false\nCategories=System;Security;\nX-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\n{AUTOSTART_MARKER}\n",
         exec_value(exe)?
     ))
 }

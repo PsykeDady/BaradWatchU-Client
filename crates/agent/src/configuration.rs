@@ -42,6 +42,8 @@ struct ConfigurationView {
     schema_version: &'static str,
     version: &'static str,
     platform: &'static str,
+    language: baradwatchu_messages::Language,
+    effective_language: &'static str,
     install_root: String,
     tray: TrayView,
     paths: DataPaths,
@@ -131,11 +133,19 @@ fn autostart_state() -> Result<bool, String> {
 fn shown(path: Result<PathBuf, CliError>) -> String {
     match path {
         Ok(path) => path.display().to_string(),
-        Err(error) => format!("non determinabile ({})", error.0),
+        Err(error) => {
+            let language = baradwatchu_messages::configured_language();
+            let reason = baradwatchu_messages::localize_diagnostic(&error.0, language);
+            format!(
+                "{} ({reason})",
+                baradwatchu_messages::message("cli.value.undetermined", language)
+            )
+        }
     }
 }
 
 fn view(error: Option<String>) -> Result<String, CliError> {
+    let language = baradwatchu_messages::configured_language();
     let installed = tray_path().is_some_and(|path| path.is_file());
     let (autostart, read_error) = if installed {
         match autostart_state() {
@@ -149,12 +159,18 @@ fn view(error: Option<String>) -> Result<String, CliError> {
         schema_version: VIEW_SCHEMA,
         version: env!("CARGO_PKG_VERSION"),
         platform: req::platform_key(),
+        language: baradwatchu_messages::configured_language(),
+        effective_language: baradwatchu_messages::configured_language()
+            .effective()
+            .code(),
         install_root: shown(req::install_root()),
         tray: TrayView {
             installed,
             running: crate::events::tray_running(),
             autostart,
-            error: error.or(read_error),
+            error: error
+                .or(read_error)
+                .map(|text| baradwatchu_messages::localize_diagnostic(&text, language)),
         },
         paths: DataPaths {
             configuration: shown(req::state_dir()),
@@ -168,6 +184,15 @@ fn view(error: Option<String>) -> Result<String, CliError> {
 
 pub(crate) fn dashboard_configuration_json() -> Result<String, CliError> {
     view(None)
+}
+
+pub(crate) fn dashboard_messages_json() -> Result<String, CliError> {
+    let language = baradwatchu_messages::configured_language();
+    req::output_json(&serde_json::json!({
+        "language": language,
+        "effectiveLanguage": language.effective().code(),
+        "messages": baradwatchu_messages::dashboard_catalog(language),
+    }))
 }
 
 /// `{"enabled": true|false}`: asks the tray to enable or disable its start at login.
@@ -184,6 +209,39 @@ pub(crate) fn dashboard_set_autostart(text: &str) -> Result<String, CliError> {
     let action = if enabled { "enable" } else { "disable" };
     run_tray(&["autostart", action])
         .map_err(|error| CliError(format!("Avvio automatico non modificato: {error}")))?;
+    view(None)
+}
+
+pub(crate) fn dashboard_set_language(text: &str) -> Result<String, CliError> {
+    let value = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|_| CliError("Invalid language request".into()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError("Invalid language request".into()))?;
+    if object.len() != 1 || !object.contains_key("language") {
+        return Err(CliError(
+            "Expected {\"language\":\"system|italian|english\"}".into(),
+        ));
+    }
+    let language = match object["language"].as_str() {
+        Some("system") => baradwatchu_messages::Language::System,
+        Some("italian") => baradwatchu_messages::Language::Italian,
+        Some("english") => baradwatchu_messages::Language::English,
+        _ => {
+            return Err(CliError(
+                "Language must be system, italian, or english".into(),
+            ))
+        }
+    };
+    let directory = req::state_dir()?;
+    req::ensure_private_dir(&directory)?;
+    req::atomic_json(
+        &directory.join("language.json"),
+        &baradwatchu_messages::LanguagePreference {
+            schema_version: "baradwatchu.language.v1".into(),
+            language,
+        },
+    )?;
     view(None)
 }
 

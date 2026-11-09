@@ -12,20 +12,29 @@ mod platform;
 
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "Usage: baradwatchu-tray [--version | --help | autostart enable|disable|status [--json]]";
+fn usage() -> &'static str {
+    baradwatchu_messages::message("tray.usage", baradwatchu_messages::configured_language())
+}
 
 fn help() -> String {
     format!(
-        "BaradWatchU Tray {}\n\n{USAGE}\n\nWithout arguments the tray starts in the current desktop session (one instance per user).\nIt shows the agent state, runs audits through the agent, sends native notifications and\nopens a dedicated window for consent requests. Closing it does not stop the agent.\n`autostart` manages start at login for the current user only (no administrator rights).\n",
-        env!("CARGO_PKG_VERSION")
+        "BaradWatchU Tray {}\n\n{}\n\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        usage(),
+        baradwatchu_messages::message("tray.help", baradwatchu_messages::configured_language())
     )
 }
 
 fn run() -> Result<(), String> {
     platform::check_session()?;
     let Some(lock) = platform::acquire_instance_lock()? else {
-        println!("BaradWatchU Tray è già attiva in questa sessione.");
+        println!(
+            "{}",
+            baradwatchu_messages::message(
+                "tray.already_running",
+                baradwatchu_messages::configured_language()
+            )
+        );
         return Ok(());
     };
     let agent = agent::Agent::locate()?;
@@ -33,18 +42,41 @@ fn run() -> Result<(), String> {
 }
 
 fn autostart(action: &str) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|_| "eseguibile della tray non trovato")?;
+    let exe = std::env::current_exe().map_err(|_| {
+        baradwatchu_messages::message(
+            "tray.executable_missing",
+            baradwatchu_messages::configured_language(),
+        )
+    })?;
     match action {
-        "enable" => platform::set_autostart(true, &exe)
-            .map(|_| "Avvio automatico al login attivato.".into()),
-        "disable" => platform::set_autostart(false, &exe)
-            .map(|_| "Avvio automatico al login disattivato.".into()),
-        "status" => Ok(if platform::autostart_enabled() {
-            "Avvio automatico al login: attivo".into()
-        } else {
-            "Avvio automatico al login: non attivo".into()
+        "enable" => platform::set_autostart(true, &exe).map(|_| {
+            baradwatchu_messages::message(
+                "tray.autostart_enabled",
+                baradwatchu_messages::configured_language(),
+            )
+            .into()
         }),
-        _ => Err(USAGE.into()),
+        "disable" => platform::set_autostart(false, &exe).map(|_| {
+            baradwatchu_messages::message(
+                "tray.autostart_disabled",
+                baradwatchu_messages::configured_language(),
+            )
+            .into()
+        }),
+        "status" => Ok(if platform::autostart_enabled() {
+            baradwatchu_messages::message(
+                "tray.autostart_on",
+                baradwatchu_messages::configured_language(),
+            )
+            .into()
+        } else {
+            baradwatchu_messages::message(
+                "tray.autostart_off",
+                baradwatchu_messages::configured_language(),
+            )
+            .into()
+        }),
+        _ => Err(usage().into()),
     }
 }
 
@@ -61,7 +93,14 @@ fn main() -> ExitCode {
     {
         Ok(args) => args,
         Err(_) => {
-            eprintln!("Error: {USAGE}");
+            eprintln!(
+                "{}: {}",
+                baradwatchu_messages::message(
+                    "cli.error",
+                    baradwatchu_messages::configured_language()
+                ),
+                usage()
+            );
             return ExitCode::from(2);
         }
     };
@@ -84,7 +123,14 @@ fn main() -> ExitCode {
             platform::autostart_enabled()
         ))),
         _ => {
-            eprintln!("Error: {USAGE}");
+            eprintln!(
+                "{}: {}",
+                baradwatchu_messages::message(
+                    "cli.error",
+                    baradwatchu_messages::configured_language()
+                ),
+                usage()
+            );
             return ExitCode::from(2);
         }
     };
@@ -95,7 +141,17 @@ fn main() -> ExitCode {
         }
         Ok(None) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Errore: {error}");
+            let error = baradwatchu_messages::localize_diagnostic(
+                &error,
+                baradwatchu_messages::configured_language(),
+            );
+            eprintln!(
+                "{}: {error}",
+                baradwatchu_messages::message(
+                    "cli.error",
+                    baradwatchu_messages::configured_language()
+                )
+            );
             ExitCode::FAILURE
         }
     }

@@ -12,19 +12,23 @@ pub fn check_session() -> Result<(), String> {
 /// NSAlert must run on the main thread: the call blocks the tray loop until answered.
 /// It cannot close itself on expiry; a late Accept is refused by the agent.
 pub fn consent_dialog(title: &str, text: &str, _timeout: Duration, done: DialogDone) {
+    let language = baradwatchu_messages::configured_language();
+    let accept = baradwatchu_messages::message("consent.button.accept", language);
+    let reject = baradwatchu_messages::message("consent.button.reject", language);
+    let later = baradwatchu_messages::message("consent.button.later", language);
     let outcome = match rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Warning)
         .set_title(title)
         .set_description(text)
         .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
-            "Accetta".into(),
-            "Rifiuta".into(),
-            "Decidi più tardi".into(),
+            accept.into(),
+            reject.into(),
+            later.into(),
         ))
         .show()
     {
-        rfd::MessageDialogResult::Custom(label) if label == "Accetta" => DialogOutcome::Accept,
-        rfd::MessageDialogResult::Custom(label) if label == "Rifiuta" => DialogOutcome::Reject,
+        rfd::MessageDialogResult::Custom(label) if label == accept => DialogOutcome::Accept,
+        rfd::MessageDialogResult::Custom(label) if label == reject => DialogOutcome::Reject,
         _ => DialogOutcome::Later,
     };
     done(outcome);

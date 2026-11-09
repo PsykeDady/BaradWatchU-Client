@@ -144,7 +144,13 @@ pub fn notify(note: Note) {
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         let _ = note.urgency;
         if let Err(error) = notification.show() {
-            eprintln!("Notifica non inviata ({}): {error}", note.title);
+            let language = baradwatchu_messages::configured_language();
+            eprintln!(
+                "{}",
+                baradwatchu_messages::message("tray.notification.failed", language)
+                    .replace("{title}", &note.title)
+                    .replace("{error}", &error.to_string())
+            );
         }
     });
 }

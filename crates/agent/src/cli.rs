@@ -49,7 +49,10 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
             code: output.code,
         })
         .map_err(|error| Error {
-            message: error.0,
+            message: baradwatchu_messages::localize_diagnostic(
+                &error.0,
+                baradwatchu_messages::configured_language(),
+            ),
             code: 2,
         })
 }
