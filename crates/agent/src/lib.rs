@@ -5,4 +5,5 @@ mod configuration;
 pub mod consent;
 pub mod dashboard;
 pub mod events;
+mod history;
 pub mod requirements;

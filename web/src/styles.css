@@ -162,6 +162,12 @@ h2 { font-family: var(--display); letter-spacing: .03em; }
 .history-card { padding: 13px; }
 .history-intro { margin: 0 0 10px; color: var(--muted); font-size: 10px; }
 .history-loading, .history-empty { display: flex; align-items: center; gap: 8px; padding: 18px 4px; color: var(--muted); font-size: 11px; }
+.history-tools { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 10px; }
+.history-usage { color: var(--muted); font-size: 10px; }
+.history-row { display: flex; align-items: stretch; gap: 4px; border-top: 1px solid var(--line); }
+.history-row .history-item { border-top: 0; }
+.history-delete { flex: none; width: 28px; margin: 6px 0; padding: 0; color: var(--faint); background: transparent; border: 1px solid transparent; border-radius: 6px; font-size: 11px; }
+.history-delete:hover:not(:disabled), .history-delete:focus-visible { color: var(--fail); background: var(--fail-bg); border-color: rgba(236, 90, 67, .35); }
 .history-item { display: block; width: 100%; margin: 0; padding: 10px 8px; color: inherit; background: transparent; border: 0; border-top: 1px solid var(--line); border-radius: 6px; text-align: left; }
 .history-item:hover, .history-item.selected { background: var(--surface-2); }
 .history-item.selected { box-shadow: inset 2px 0 var(--ember); }

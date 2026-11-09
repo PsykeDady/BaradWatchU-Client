@@ -13,6 +13,8 @@ interface Requirement { id: string; name: string; description: string; enabled: 
 interface AuditResult { id: string; name: string; priority: Priority; status: ResultStatus; complianceStatus?: ResultStatus; summary: string; details: string[]; completedAtUnixMs: number; provenance?: Provenance; }
 interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; }
 interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; }
+interface HistoryUsage { audits: number; files: number; bytes: number; }
+interface HistoryRemoval { removedAudits: number; removedFiles: number; freedBytes: number; usage: HistoryUsage; }
 interface HistoryEntry { completedAtUnixMs: number; overallStatus: ResultStatus; pass: number; fail: number; warn: number; error: number; other: number; }
 interface SummaryCounts { pass: number; fail: number; warn: number; error: number; other: number; }
 type EventSeverity = 'INFO' | 'WARNING' | 'CRITICAL' | 'ACTION';
@@ -158,12 +160,19 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <aside class="history-section" aria-labelledby="history-title">
             <div class="section-heading"><div><p class="eyebrow">ARCHIVIO LOCALE</p><h2 id="history-title">Storico audit</h2></div><span class="section-count">{{ history.length }}</span></div>
             <div class="history-card">
+              <div class="history-tools" *ngIf="historyUsage">
+                <span class="history-usage">{{ historyUsage.audits }} audit · {{ formatBytes(historyUsage.bytes) }} su disco</span>
+                <button class="button danger small" type="button" [disabled]="busy || saving || historyUsage.files === 0" (click)="clearHistory()">Svuota cronologia</button>
+              </div>
               <div *ngIf="historyLoading" class="history-loading"><span class="spinner small"></span>Caricamento storico…</div>
               <p *ngIf="!historyLoading && history.length === 0" class="history-empty">Gli audit completati appariranno qui.</p>
-              <button *ngFor="let entry of history" type="button" class="history-item" [class.selected]="selectedHistoryStamp === entry.completedAtUnixMs" (click)="showHistory(entry)" [attr.aria-current]="selectedHistoryStamp === entry.completedAtUnixMs ? 'true' : null">
+              <div *ngFor="let entry of history" class="history-row">
+              <button type="button" class="history-item" [class.selected]="selectedHistoryStamp === entry.completedAtUnixMs" (click)="showHistory(entry)" [attr.aria-current]="selectedHistoryStamp === entry.completedAtUnixMs ? 'true' : null">
                 <span class="history-item-top"><span class="history-status" [attr.data-status]="entry.overallStatus">{{ statusLabel(entry.overallStatus) }}</span><span class="history-time">{{ formatDate(entry.completedAtUnixMs) }}</span></span>
                 <span class="history-counts"><span class="mini-count pass">{{ entry.pass }} ok</span><span class="mini-count fail" *ngIf="entry.fail">{{ entry.fail }} da correggere</span><span class="mini-count warn" *ngIf="entry.warn">{{ entry.warn }} da verificare</span><span class="mini-count error" *ngIf="entry.error">{{ entry.error }} errori</span></span>
               </button>
+              <button type="button" class="history-delete" [disabled]="busy || saving" (click)="deleteHistory(entry)" [attr.aria-label]="'Elimina l’audit del ' + formatDate(entry.completedAtUnixMs)" title="Elimina questo audit (report, log e PDF)">✕</button>
+              </div>
               <p *ngIf="history.length >= 50" class="history-limit">Sono mostrate le 50 esecuzioni più recenti.</p>
             </div>
           </aside>
@@ -318,7 +327,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <dt>Impostazioni</dt><dd><code>{{ config.paths.configuration }}</code></dd>
               <dt>Controlli personalizzati</dt><dd><code>{{ config.paths.customChecks }}</code></dd>
               <dt>Eventi e consenso</dt><dd><code>{{ config.paths.state }}</code></dd>
-              <dt>Storico audit</dt><dd><code>{{ config.paths.history }}</code><br><span class="hint">Si può cancellare: si perdono solo lo storico e l’ultimo risultato.</span></dd>
+              <dt>Storico audit</dt><dd><code>{{ config.paths.history }}</code><br><span class="hint">Si può svuotare dalla sezione «Storico audit» (un audit alla volta o tutto) oppure con «baradwatchu-agent history clear --yes»: si perdono solo lo storico e l’ultimo risultato.</span></dd>
               <dt>File di sessione</dt><dd><code>{{ config.paths.runtime }}</code></dd>
             </dl>
           </section>
@@ -354,6 +363,7 @@ class AppComponent implements OnInit {
   ignoredFolders: string[] = [];
   currentReport: AuditReport | null = null;
   history: HistoryEntry[] = [];
+  historyUsage: HistoryUsage | null = null;
   selectedHistoryStamp: number | null = null;
   historicalReport: AuditReport | null = null;
   parameterText: Record<string, string> = {};
@@ -483,6 +493,37 @@ class AppComponent implements OnInit {
       this.error = `Impossibile aprire l’audit storico: ${this.errorText(error)}`;
       this.selectedHistoryStamp = null;
     } finally { this.historyLoading = false; }
+  }
+
+  async deleteHistory(entry: HistoryEntry): Promise<void> {
+    if (!window.confirm(`Eliminare l’audit del ${this.formatDate(entry.completedAtUnixMs)}?\n\nVerranno cancellati il report, il log e l’eventuale PDF. L’operazione non si può annullare.`)) return;
+    await this.removeHistory(`/api/history/${entry.completedAtUnixMs}`, entry.completedAtUnixMs);
+  }
+
+  async clearHistory(): Promise<void> {
+    const usage = this.historyUsage;
+    if (!usage || !window.confirm(`Svuotare tutta la cronologia?\n\nVerranno cancellati ${usage.audits} audit (${this.formatBytes(usage.bytes)}): report, log e PDF, compreso l’ultimo risultato. L’operazione non si può annullare.`)) return;
+    await this.removeHistory('/api/history', null);
+  }
+
+  formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KiB', 'MiB', 'GiB']; let value = bytes / 1024; let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit += 1; }
+    return `${value.toLocaleString('it-IT', { maximumFractionDigits: 1 })} ${units[unit]}`;
+  }
+
+  private async removeHistory(path: string, stamp: number | null): Promise<void> {
+    this.saving = true; this.error = '';
+    try {
+      const removal = await this.request<HistoryRemoval>(path, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      if (stamp === null || this.selectedHistoryStamp === stamp) this.showCurrent();
+      this.historyUsage = removal.usage;
+      this.currentReport = await this.request<AuditReport | null>('/api/status');
+      await this.loadHistory();
+      this.flash(`Eliminati ${removal.removedAudits} audit, liberati ${this.formatBytes(removal.freedBytes)}.`);
+    } catch (error: unknown) { this.error = this.errorText(error); await this.loadHistory().catch(() => undefined); }
+    finally { this.saving = false; }
   }
 
   showCurrent(): void { this.selectedHistoryStamp = null; this.historicalReport = null; }
@@ -668,7 +709,10 @@ class AppComponent implements OnInit {
   }
   private async loadHistory(): Promise<void> {
     this.historyLoading = true;
-    try { this.history = await this.request<HistoryEntry[]>('/api/history'); }
+    try {
+      const [history, usage] = await Promise.all([this.request<HistoryEntry[]>('/api/history'), this.request<HistoryUsage>('/api/history/usage')]);
+      this.history = history; this.historyUsage = usage;
+    }
     finally { this.historyLoading = false; }
   }
   private async saveSettings(message: string): Promise<void> {

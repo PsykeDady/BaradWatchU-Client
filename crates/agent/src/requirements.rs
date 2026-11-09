@@ -2374,7 +2374,10 @@ pub(crate) fn load_last_audit() -> Result<Option<AuditReport>, CliError> {
         .map_err(|_| CliError("Latest audit JSON is invalid".into()))
 }
 
-fn read_history_report(path: &Path, expected_stamp: u64) -> Result<AuditReport, CliError> {
+pub(crate) fn read_history_report(
+    path: &Path,
+    expected_stamp: u64,
+) -> Result<AuditReport, CliError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| CliError("Cannot inspect an audit history report".into()))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 2 * 1024 * 1024
@@ -2509,7 +2512,7 @@ fn parse_priority(value: &OsString) -> Option<Priority> {
     }
 }
 
-const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | custom accept ID | custom remove ID | dashboard [--no-browser] [--open ROUTE] | notifications [--json] | notifications set enabled|informative on|off | events --json [--after ID] | consent simulate|list|accept|reject … | --version";
+const USAGE: &str = "Usage: refresh | list [--json] | enable ID | disable ID | priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL | configure ID JSON_OBJECT | check ID [--log] | audit [--json] [--notify] [--log] | status [--json] | history [--json] | history delete STAMP | history clear --yes | custom accept ID | custom remove ID | dashboard [--no-browser] [--open ROUTE] | notifications [--json] | notifications set enabled|informative on|off | events --json [--after ID] | consent simulate|list|accept|reject … | --version";
 
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     // Custom-check maintenance must work even when the catalog cannot be built.
@@ -3113,7 +3116,7 @@ fn send_notification(report: &AuditReport) {
 }
 
 pub fn help() -> String {
-    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent notifications set enabled|informative on|off\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]\n  baradwatchu-agent consent list [--json]\n  baradwatchu-agent consent accept|reject ID\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user. Desktop notifications and the consent window are provided by the optional baradwatchu-tray companion; consent requests are local simulations only (no remote requests yet) and only an explicit accept authorizes one request.\n", env!("CARGO_PKG_VERSION"))
+    format!("BaradWatchU Client {}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID\n  baradwatchu-agent disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent history [--json]\n  baradwatchu-agent history delete STAMP\n  baradwatchu-agent history clear --yes\n  baradwatchu-agent custom accept ID\n  baradwatchu-agent custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open status|custom|history|notifications]\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent notifications set enabled|informative on|off\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate [--server ID] [--account NAME] [--account-id ID] [--device NAME] [--ttl SECONDS]\n  baradwatchu-agent consent list [--json]\n  baradwatchu-agent consent accept|reject ID\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool); `custom accept` pins the current tool SHA-256 after an intentional edit. Use --log to write a plain-text audit log; structured reports are kept locally in the audit history (cache folder); `history delete` removes one audit (report, log, PDF), `history clear --yes` removes them all to free space. Audits run without the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run directly as the current user. Desktop notifications and the consent window are provided by the optional baradwatchu-tray companion; consent requests are local simulations only (no remote requests yet) and only an explicit accept authorizes one request.\n", env!("CARGO_PKG_VERSION"))
 }
 
 /// Serialises tests that change process-wide environment variables and points every

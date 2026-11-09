@@ -437,6 +437,12 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
             }
             api(requirements::dashboard_check_json(id))
         }
+        ("GET", "/api/history/usage") => api(crate::history::dashboard_usage_json()),
+        ("DELETE", "/api/history") => api(crate::history::dashboard_clear_json()),
+        ("DELETE", route) if route.starts_with("/api/history/") => {
+            let stamp = &route["/api/history/".len()..];
+            api(crate::history::dashboard_delete_json(stamp))
+        }
         ("GET", route) if route.starts_with("/api/history/") => {
             let stamp = &route["/api/history/".len()..];
             api(requirements::dashboard_history_report_json(stamp))

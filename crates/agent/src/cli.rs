@@ -39,6 +39,7 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
         Some("consent") => Some(crate::consent::run(&args[1..])),
         Some("notifications") => Some(crate::events::run_notifications(&args[1..])),
         Some("events") => Some(crate::events::run_events(&args[1..])),
+        Some("history") => Some(crate::history::run(&args[1..])),
         _ => None,
     };
     routed
