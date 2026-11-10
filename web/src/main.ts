@@ -356,7 +356,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             <div class="form-panel" *ngIf="reportTheme as catalog">
               <div class="form-head"><h2>{{ t('ui.settings.pdf_theme') }}</h2></div>
               <p class="hint">{{ t('ui.settings.pdf_hint') }}</p>
-              <p class="hint">{{ t('ui.settings.themes_folder') }} <code>{{ config.paths.configuration }}/themes/</code></p>
+              <p class="hint">{{ t('ui.settings.themes_folder') }} <code>{{ config.paths.configuration }}{{ config.platform === 'windows' ? '\\\\themes\\\\' : '/themes/' }}</code></p>
               <label class="wide">{{ t('ui.settings.pdf_theme') }}
                 <select [disabled]="saving" (change)="saveReportTheme($event)">
                   <option *ngIf="!selectedReportTheme" [value]="catalog.selectedThemeId" [selected]="true" disabled>{{ t('ui.settings.theme_missing').replace('{id}', catalog.selectedThemeId) }}</option>
@@ -456,7 +456,13 @@ class AppComponent implements OnInit {
   }
 
   ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); }
-  @HostListener('window:hashchange') onHashChange(): void { this.view = this.viewFromHash(); this.scrollToHistory(); }
+  @HostListener('window:hashchange') onHashChange(): void {
+    const view = this.viewFromHash();
+    // Links and back/forward reach Settings without go(): load its data the same way.
+    if (view === 'settings' && this.view !== 'settings') { this.go('settings'); return; }
+    this.view = view;
+    this.scrollToHistory();
+  }
 
   go(view: View, event?: Event): void {
     event?.preventDefault();

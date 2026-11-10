@@ -293,7 +293,9 @@ function Test-RequirementAssets([string]$ShareRoot) {
         if ($config.id -ne $folder.Name -or $config.schemaVersion -ne 'baradwatchu.custom-checks.v1') { return "invalid check configuration identity: $($folder.Name)" }
         $prefix = "catalog/checks-windows/$($folder.Name)/"
         $tool = if ($config.PSObject.Properties['toolPath']) { "$($config.toolPath)" } else { '' }
-        $providers = if ($config.PSObject.Properties['providers'] -and $config.providers) { @($config.providers.PSObject.Properties) } else { @() }
+        # @(...) around the whole if: PowerShell turns an empty array returned by an `if`
+        # expression into $null, and StrictMode then fails on .Count.
+        $providers = @(if ($config.PSObject.Properties['providers'] -and $config.providers) { $config.providers.PSObject.Properties })
         if ($tool -and $providers.Count -eq 0) {
             if ([IO.Path]::IsPathRooted($tool) -or $tool -match '(^|[\\/])\.\.([\\/]|$)') { return "unsafe relative tool path: $($folder.Name)" }
             $expected = $prefix + ($tool -replace '^\./', '')
@@ -570,10 +572,30 @@ function Get-Shortcuts {
     }
     return $list
 }
-function New-Shortcuts {
+# Start menu entries share one folder and fixed names for every installation of this user: an
+# entry that points into another installation (another -Prefix, or the setup) is left alone.
+function Get-OwnShortcuts {
+    $shell = $null
+    $own = New-Object System.Collections.Generic.List[object]
+    foreach ($entry in Get-Shortcuts) {
+        $path = Join-Path $StartMenuDir $entry.Name
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            if (-not $shell) { $shell = New-Object -ComObject WScript.Shell }
+            $target = $shell.CreateShortcut($path).TargetPath
+            if ($target -and -not (Test-Inside $target $Prefix)) {
+                Write-Host "Start menu entry '$($entry.Name)' belongs to another BaradWatchU installation ($target): left unchanged." -ForegroundColor Yellow
+                continue
+            }
+        }
+        $own.Add($entry)
+    }
+    # Callers wrap the result in @(): an empty list must stay empty, not become one element.
+    return $own.ToArray()
+}
+function New-Shortcuts([object[]]$Entries) {
     New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
     $shell = New-Object -ComObject WScript.Shell
-    foreach ($entry in Get-Shortcuts) {
+    foreach ($entry in $Entries) {
         $link = $shell.CreateShortcut((Join-Path $StartMenuDir $entry.Name))
         $link.TargetPath = $entry.Target
         $link.Arguments = $entry.Arguments
@@ -611,7 +633,18 @@ function Invoke-PostInstall {
     $tray = Join-Path $Prefix "bin\$TrayBin"
     # Start at login: on by default for a first installation; a reinstall keeps the user's
     # choice (tray menu "Avvia al login"); -TrayAutostart forces it, -NoTrayAutostart skips it.
-    if ($TrayAutostart -or ($script:FreshInstall -and -not $NoTrayAutostart)) {
+    # The HKCU Run value is shared by every installation of this user: the default never takes
+    # it over from another installation; -TrayAutostart does, because it is explicit.
+    $runEntry = Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
+    $otherOwner = $null
+    if ($runEntry) {
+        $command = "$($runEntry.$RunValue)".Trim('"')
+        try { $command = Get-FullPath $command } catch { }
+        if (-not [string]::Equals($command, $tray, [StringComparison]::OrdinalIgnoreCase)) { $otherOwner = $command }
+    }
+    if (-not $TrayAutostart -and $script:FreshInstall -and -not $NoTrayAutostart -and $otherOwner) {
+        Write-Host "Start at login already used by another BaradWatchU installation ($otherOwner): left unchanged (use -TrayAutostart to move it here)." -ForegroundColor Yellow
+    } elseif ($TrayAutostart -or ($script:FreshInstall -and -not $NoTrayAutostart)) {
         $result = Invoke-Tray $tray @('autostart', 'enable')
         if ($result.Text) { Write-Host $result.Text }
         if ($result.Code -ne 0) { Write-Host 'Warning: tray autostart could not be enabled' -ForegroundColor Yellow }
@@ -697,7 +730,8 @@ function Invoke-Install {
             $dest = Join-Path $Prefix $rel
             if ((Test-Path -LiteralPath $dest) -and -not (Test-HashOk $dest $old[$rel])) { Fail "changed old file preserved: $dest" }
         }
-        foreach ($entry in Get-Shortcuts) { $entries.Add("shortcut`t-`t$($entry.Name)") }
+        $ownShortcuts = @(Get-OwnShortcuts)
+        foreach ($entry in $ownShortcuts) { $entries.Add("shortcut`t-`t$($entry.Name)") }
         Write-Host "Staged $($staged.Count) files before modifying $Prefix."
         # Last step before any file changes: close this installation's running programs.
         Stop-RunningInstances
@@ -726,7 +760,7 @@ function Invoke-Install {
         Move-Item -LiteralPath $tmpManifest -Destination $manifestPath -Force
         $stale = @($oldShortcuts | Where-Object { (Get-Shortcuts | ForEach-Object { $_.Name }) -notcontains $_ })
         if ($stale.Count -gt 0) { Remove-Shortcuts ([string[]]$stale) }
-        New-Shortcuts
+        New-Shortcuts $ownShortcuts
         Write-Host "Installed BaradWatchU Client $ProductVersion in $Prefix (Start menu: BaradWatchU). No service or system setting was changed; configuration and user data were preserved."
         Invoke-PostInstall
     } finally {

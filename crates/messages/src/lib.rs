@@ -53,18 +53,22 @@ impl Default for LanguagePreference {
     }
 }
 
+/// Same rule as the agent's configuration folder (`requirements::state_dir`), so the language
+/// the dashboard saves is the one every program reads: `$XDG_CONFIG_HOME/baradwatchu` when
+/// set (also on Windows: tests and development shells), then `%APPDATA%\baradwatchu` on
+/// Windows, then `$HOME/.config/baradwatchu`.
 pub fn configuration_directory() -> Option<PathBuf> {
-    if cfg!(windows) {
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .map(|path| path.join("baradwatchu"))
-    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
-        Some(PathBuf::from(path).join("baradwatchu"))
-    } else {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|path| path.join(".config/baradwatchu"))
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
+        return Some(PathBuf::from(path).join("baradwatchu"));
     }
+    if cfg!(windows) {
+        if let Some(path) = std::env::var_os("APPDATA").filter(|path| !path.is_empty()) {
+            return Some(PathBuf::from(path).join("baradwatchu"));
+        }
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|path| path.join(".config/baradwatchu"))
 }
 
 pub fn configured_language() -> Language {
@@ -116,6 +120,8 @@ fn detect_system_language() -> Language {
     }
     // Ignore C/POSIX: those are often set by wrappers and do not describe the user's
     // desktop language. Continue through the remaining locale variables instead.
+    // (Windows returned above: its UI language, not POSIX variables, is authoritative.)
+    #[cfg(not(windows))]
     for locale in ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"]
         .into_iter()
         .filter_map(|key| std::env::var(key).ok())
@@ -138,6 +144,8 @@ fn language_from_apple_languages(value: &str) -> Option<Language> {
         .find_map(language_from_locale)
 }
 
+// Unused on Windows outside tests: the UI language comes from GetUserDefaultUILanguage.
+#[cfg_attr(windows, allow(dead_code))]
 fn language_from_locale(locale: &str) -> Option<Language> {
     let language = locale.trim().split(['_', '-', '.', '@']).next()?;
     if language.eq_ignore_ascii_case("it") {
@@ -165,6 +173,9 @@ struct LocaleCatalog {
 struct RequirementText {
     name: String,
     description: String,
+    /// Windows wording when the built-in check works differently there (other tools and
+    /// sources); empty = `description` applies to every platform.
+    windows_description: String,
 }
 
 fn locale_catalog(language: Language) -> &'static LocaleCatalog {
@@ -623,6 +634,12 @@ pub fn dashboard_catalog(
         "pdf.warning.text_contrast",
         "pdf.warning.accent_contrast",
         "ui.settings.pdf_hint",
+        "ui.settings.themes_folder",
+        "ui.settings.theme_accent",
+        "ui.settings.theme_logo",
+        "ui.settings.theme_cli",
+        "ui.settings.theme_default_logo",
+        "ui.settings.theme_missing",
         "ui.settings.configuration",
         "ui.settings.logo_path",
         "ui.settings.logo_placeholder",
@@ -729,7 +746,14 @@ pub fn requirement_metadata(id: &str, language: Language) -> Option<(&'static st
     locale_catalog(language)
         .requirements
         .get(id)
-        .map(|metadata| (metadata.name.as_str(), metadata.description.as_str()))
+        .map(|metadata| {
+            let description = if cfg!(windows) && !metadata.windows_description.is_empty() {
+                &metadata.windows_description
+            } else {
+                &metadata.description
+            };
+            (metadata.name.as_str(), description.as_str())
+        })
 }
 
 pub fn agent_help(language: Language, version: &str) -> String {

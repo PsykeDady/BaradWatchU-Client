@@ -63,8 +63,9 @@ en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Clo
 #if WithTray == "1"
 [Tasks]
 ; Selected by default, offered only on a first installation: an upgrade keeps the user's
-; choice (tray menu "Avvia al login"). Silent opt-out: /MERGETASKS="!trayautostart".
-Name: "trayautostart"; Description: "{cm:TrayAutostart}"; Check: IsFirstInstall
+; choice (tray menu "Avvia al login"). Not offered while the start-at-login entry belongs to
+; another BaradWatchU installation (install.ps1). Silent opt-out: /MERGETASKS="!trayautostart".
+Name: "trayautostart"; Description: "{cm:TrayAutostart}"; Check: IsFirstInstall and AutostartFree
 #endif
 
 [Files]
@@ -91,9 +92,6 @@ Name: "{group}\{cm:Tray}"; Filename: "{app}\bin\baradwatchu-tray.exe"; WorkingDi
 [Run]
 Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart enable"; Tasks: trayautostart; Flags: runhidden
 
-[UninstallRun]
-; Removes the per-user Run entry only if it exists; the tray itself never runs as a service.
-Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart disable"; Flags: runhidden; RunOnceId: "BaradWatchUTrayAutostart"
 #endif
 
 [Code]
@@ -101,6 +99,25 @@ Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart disable"; Fla
 function IsFirstInstall(): Boolean;
 begin
   Result := not RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}_is1');
+end;
+
+{ Command of the per-user start-at-login entry shared by every BaradWatchU installation, or ''. }
+function AutostartCommand(): String;
+begin
+  if not RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'BaradWatchU-Tray', Result) then
+    Result := '';
+end;
+
+{ The entry starts this installation's tray (path compared case-insensitively). }
+function AutostartIsOurs(): Boolean;
+begin
+  Result := Pos(Lowercase(AddBackslash(ExpandConstant('{app}'))), Lowercase(AutostartCommand())) > 0;
+end;
+
+{ No entry yet, or already this installation's: the default task may set it. }
+function AutostartFree(): Boolean;
+begin
+  Result := (AutostartCommand() = '') or AutostartIsOurs();
 end;
 
 { Counts BaradWatchU programs running from Dir (WMI, current user's view). Never stops them. }
@@ -145,4 +162,13 @@ begin
   Result := RunningFrom(ExpandConstant('{app}')) = 0;
   if not Result then
     SuppressibleMsgBox(CustomMessage('StillRunning'), mbError, MB_OK, IDOK);
+end;
+
+{ Uninstall: remove the per-user start-at-login entry only when it starts this installation's
+  tray (another BaradWatchU installation may own it). Done here, not in [UninstallRun]: a Check
+  there is evaluated at install time, before the entry exists. }
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if (CurUninstallStep = usUninstall) and AutostartIsOurs() then
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'BaradWatchU-Tray');
 end;

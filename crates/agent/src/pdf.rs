@@ -1395,9 +1395,16 @@ fn left_lines(result: &ResultRecord, disabled: Option<&DisabledRequirement>) -> 
         add_lines(
             &mut out,
             &format!(
-                "{}  {:?}",
+                "{}  {}",
                 baradwatchu_messages::message("pdf.integrity", language),
-                p.integrity_status
+                baradwatchu_messages::message(
+                    match p.integrity_status {
+                        crate::requirements::IntegrityStatus::Verified => "integrity.verified",
+                        crate::requirements::IntegrityStatus::Mismatch => "integrity.mismatch",
+                        crate::requirements::IntegrityStatus::Unknown => "integrity.unknown",
+                    },
+                    language
+                )
             ),
             38,
             LineStyle::Label,

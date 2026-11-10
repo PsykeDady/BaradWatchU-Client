@@ -736,27 +736,33 @@
   "requirements": {
     "REQ-001": {
       "name": "Aggiornamenti software",
-      "description": "Verifica se sono disponibili aggiornamenti per i pacchetti installati."
+      "description": "Verifica se sono disponibili aggiornamenti per i pacchetti installati.",
+      "windows_description": "Verifica tramite Windows Update che non ci siano aggiornamenti software in sospeso."
     },
     "REQ-002": {
       "name": "Protezione antivirus",
-      "description": "Verifica che un antivirus supportato (provider: ClamAV, Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori."
+      "description": "Verifica che un antivirus supportato (provider: ClamAV, Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori.",
+      "windows_description": "Verifica che un antivirus supportato (provider: Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori."
     },
     "REQ-003": {
       "name": "Protezione firewall",
-      "description": "Verifica che almeno uno tra UFW, firewalld e nftables fornisca evidenze di filtraggio operativo."
+      "description": "Verifica che almeno uno tra UFW, firewalld e nftables fornisca evidenze di filtraggio operativo.",
+      "windows_description": "Verifica che Windows Defender Firewall (o un firewall registrato nel Centro sicurezza) blocchi il traffico in ingresso su tutti i profili."
     },
     "REQ-004": {
       "name": "Filtro DNS",
-      "description": "Verifica che dnsmasq filtri il DNS oppure che /etc/hosts contenga una lista HaGeZi completa e aggiornata."
+      "description": "Verifica che dnsmasq filtri il DNS oppure che /etc/hosts contenga una lista HaGeZi completa e aggiornata.",
+      "windows_description": "Verifica che il file hosts contenga una lista HaGeZi completa e aggiornata."
     },
     "REQ-005": {
       "name": "VPN aziendale",
-      "description": "Verifica lo stato di connessione dei client VPN Cato e WireGuard supportati."
+      "description": "Verifica lo stato di connessione dei client VPN Cato e WireGuard supportati.",
+      "windows_description": "Verifica la presenza del client VPN Cato e se risulta connesso."
     },
     "REQ-006": {
       "name": "Cifratura dei dati",
-      "description": "Rileva i metodi di cifratura supportati: LUKS e eCryptfs."
+      "description": "Rileva i metodi di cifratura supportati: LUKS e eCryptfs.",
+      "windows_description": "Verifica che BitLocker protegga l’unità di sistema e le altre unità fisse."
     },
     "REQ-007": {
       "name": "Blocco schermo",
@@ -764,11 +770,13 @@
     },
     "REQ-008": {
       "name": "Sicurezza delle password",
-      "description": "Verifica scadenza, lunghezza e varietà minima richieste per le password degli account locali."
+      "description": "Verifica scadenza, lunghezza e varietà minima richieste per le password degli account locali.",
+      "windows_description": "Verifica scadenza, preavviso, lunghezza e complessità richieste per le password degli account locali."
     },
     "REQ-009": {
       "name": "Sicurezza di avvio",
-      "description": "Verifica le protezioni della piattaforma che contribuiscono all’avvio sicuro."
+      "description": "Verifica le protezioni della piattaforma che contribuiscono all’avvio sicuro.",
+      "windows_description": "Verifica avvio UEFI con Secure Boot attivo e presenza di un TPM 2.0."
     }
   },
   "cli_help": "BaradWatchU Client {version}\n\nUso:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID | disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent history [--json]\n  baradwatchu-agent history delete STAMP | history clear --yes\n  baradwatchu-agent report-theme list | report-theme use ID\n  baradwatchu-agent custom accept ID | custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open ROUTE]\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate|list|accept|reject …\n  baradwatchu-agent --version\n\nI controlli personalizzati si trovano in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool). `custom accept` registra lo SHA-256 del tool dopo una modifica intenzionale. I report sono salvati localmente nella cronologia; `history delete` elimina un audit e i relativi report, log e PDF, mentre `history clear --yes` li elimina tutti. Gli audit non richiedono la dashboard né il Server. REQ-001 può contattare i mirror Arch tramite checkupdates. I tool sono eseguiti come utente corrente. La tray opzionale fornisce notifiche desktop e la finestra di consenso; le richieste sono simulazioni locali e solo un'accettazione esplicita autorizza una singola richiesta.\n",
