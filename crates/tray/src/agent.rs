@@ -60,6 +60,21 @@ impl Agent {
         Ok(command)
     }
 
+    /// Milestone 2: the per-user agent that receives remote audit requests from the system
+    /// service (`remote link`). It lives as long as its stdin pipe: the tray holds the
+    /// write end, so the agent stops with the tray (exit, crash, logout).
+    pub fn spawn_link(&self) -> Result<Child, String> {
+        let mut command = self.command()?;
+        command
+            .args(["remote", "link", "--watch-stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+            .spawn()
+            .map_err(|_| "impossibile avviare il collegamento remoto".to_owned())
+    }
+
     pub fn snapshot(&self, after: Option<u64>) -> Result<model::Snapshot, String> {
         let mut command = self.command()?;
         command.args(["events", "--json"]);

@@ -15,7 +15,7 @@ interface PdfArtifact { status: 'GENERATED' | 'FAILED'; path?: string; error?: s
 interface ProviderResult { requirementId: string; providerId: string; name?: string; origin: 'BUILTIN' | 'CUSTOM'; required: boolean; status: ResultStatus; summary: string; details: string[]; }
 interface InstalledFile { requirementId: string; path: string; expectedSha256?: string; actualSha256?: string; state: 'VERIFIED' | 'MODIFIED' | 'MISSING' | 'UNEXPECTED' | 'UNSAFE'; }
 interface InstallationIntegrity { status: Integrity; platform: string; manifestSha256: string; verifiedFiles: number; files: InstalledFile[]; }
-interface AuditReport { schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; extensions?: { providers?: ProviderResult[] }; installation?: InstallationIntegrity; }
+interface AuditReport { initiator?: {origin: string; operatorDisplayName?: string; serverId?: string; serverDisplayName?: string}; schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; extensions?: { providers?: ProviderResult[] }; installation?: InstallationIntegrity; }
 interface ReportThemeOption { id: string; name: string; logoPath: string | null; primaryColor: string; secondaryColor: string; accentColor: string; }
 interface ReportThemeCatalog { schemaVersion: string; selectedThemeId: string; themes: ReportThemeOption[]; }
 interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; obsoleteSettingsFile?: string | null; }
@@ -30,6 +30,10 @@ interface NotificationPreferences { schemaVersion?: string; enabled: boolean; in
 interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
 interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
 interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
+interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; }
+interface TrustedServer { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; importedAtUnixMs: number; status: 'TRUSTED' | 'REVOKED'; revokedAtUnixMs?: number; }
+interface IdentityView { schemaVersion: string; status: 'NOT_CONFIGURED' | 'CONFIGURED' | 'DAMAGED'; identity?: PublicIdentity; problem?: string; protection?: { state: 'RESTRICTED' | 'TOO_OPEN' | 'NOT_VERIFIED'; detail?: string }; trust: { damaged: boolean; problem?: string; trusted: number; revoked: number; servers: TrustedServer[] }; directory: string; }
+interface ServerCandidate { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; conflict?: string; }
 interface UiMessages { language: 'system' | 'italian' | 'english'; effectiveLanguage: string; messages: Record<string, string>; }
 
 const TOKEN_KEY = 'bwu-session-token';
@@ -92,6 +96,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             <div class="run-context" *ngIf="viewingHistory"><span>{{ t('ui.history.viewing') }}</span><button class="text-button" type="button" (click)="showCurrent()">{{ t('ui.summary.back') }}</button></div>
           </div>
           <div class="settings-row report-meta" *ngIf="visibleReport as report">
+            <span *ngIf="report.initiator as initiator">{{ initiator.origin }} <ng-container *ngIf="initiator.origin === 'REMOTE'">· {{ initiator.operatorDisplayName || '?' }} · {{ initiator.serverDisplayName }} (<code>{{ initiator.serverId }}</code>)</ng-container></span>
             <span>{{ t('ui.pdf.client') }} {{ report.client?.version || 'legacy' }} · SHA-256 <code>{{ report.client?.sha256 || report.client?.sha256Error || t('ui.value.unavailable') }}</code></span>
             <span *ngIf="report.installation as installation" [class.integrity-warning]="installation.status !== 'VERIFIED'" [attr.title]="installationProblems(installation)">{{ installationText(installation) }}</span>
             <a class="button secondary small" *ngIf="report.pdf?.status === 'GENERATED'" href="#" (click)="openPdf(report, $event)">{{ t('ui.pdf.open') }}</a>
@@ -366,6 +371,85 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <p class="hint" *ngIf="selectedReportTheme as theme">{{ t('ui.settings.theme_accent') }} <code>{{ theme.accentColor }}</code> · {{ t('ui.settings.theme_logo') }} <code>{{ theme.logoPath || t('ui.settings.theme_default_logo') }}</code></p>
               <p class="hint">{{ t('ui.settings.theme_cli') }} <code>baradwatchu-agent report-theme list</code> · <code>baradwatchu-agent report-theme use ID</code></p>
             </div>
+            <!-- Identità crittografica del Client: la chiave privata non arriva mai alla dashboard. -->
+            <div class="form-panel" *ngIf="identity as id" aria-labelledby="identity-title">
+              <div class="form-head"><div><p class="eyebrow">{{ t('ui.identity.eyebrow') }}</p><h2 id="identity-title">{{ t('ui.identity.title') }}</h2></div><span class="tag" [class.danger]="id.status === 'DAMAGED'" [class.override]="id.status === 'CONFIGURED'" [class.muted]="id.status === 'NOT_CONFIGURED'">{{ identityStatusText }}</span></div>
+              <ng-container *ngIf="id.status === 'NOT_CONFIGURED'">
+                <p class="hint">{{ t('ui.identity.purpose') }}</p>
+                <div class="settings-row"><button class="button primary" type="button" [disabled]="saving" (click)="openIdentityDialog('generate')">{{ t('ui.identity.generate') }}</button></div>
+              </ng-container>
+              <ng-container *ngIf="id.status === 'DAMAGED'">
+                <div class="problem">{{ id.problem }}</div>
+                <p class="hint">{{ t('ui.identity.damaged_hint') }}</p>
+              </ng-container>
+              <ng-container *ngIf="id.identity as pub">
+                <dl class="facts identity-facts">
+                  <dt>{{ t('ui.identity.device_id') }}</dt><dd><code>{{ pub.id }}</code></dd>
+                  <dt>{{ t('ui.identity.fingerprint') }}</dt><dd><code>{{ pub.fingerprint }}</code></dd>
+                  <dt>{{ t('ui.identity.public_key') }}</dt>
+                  <dd class="key-row">
+                    <code *ngIf="showPublicKey" class="key-value">{{ pub.publicKey }}</code>
+                    <span *ngIf="!showPublicKey" class="key-hidden">•••••••••••• <small>{{ t('ui.identity.hidden') }}</small></span>
+                    <button type="button" class="eye-button" (click)="showPublicKey = !showPublicKey" [attr.aria-pressed]="showPublicKey" [attr.aria-label]="t(showPublicKey ? 'ui.identity.hide_key' : 'ui.identity.show_key')" [title]="t(showPublicKey ? 'ui.identity.hide_key' : 'ui.identity.show_key')">
+                      <svg *ngIf="showPublicKey" viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+                      <svg *ngIf="!showPublicKey" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18"/><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.4 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.1M6.6 6.6C3.8 8.4 2 12 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>
+                    </button>
+                  </dd>
+                  <dt>{{ t('ui.identity.created') }}</dt><dd>{{ pub.createdAtUnixMs ? formatDate(pub.createdAtUnixMs) : t('ui.value.unavailable') }}</dd>
+                  <dt>{{ t('ui.identity.private_key') }}</dt><dd [class.integrity-warning]="id.protection?.state === 'TOO_OPEN'">{{ protectionText(id) }}</dd>
+                </dl>
+                <p class="hint">{{ t('ui.identity.private_note') }}</p>
+                <div class="settings-row">
+                  <button class="button secondary small" type="button" (click)="copyPublicKey(pub.publicKey)">{{ t('ui.identity.copy') }}</button>
+                  <button class="button secondary small" type="button" (click)="exportIdentity(pub)">{{ t('ui.identity.export') }}</button>
+                </div>
+              </ng-container>
+              <div class="settings-row danger-row" *ngIf="id.status !== 'NOT_CONFIGURED'">
+                <button class="button danger small" type="button" [disabled]="saving" (click)="openIdentityDialog('reset')">{{ t('ui.identity.reset') }}</button>
+              </div>
+              <p class="hint">{{ t('ui.identity.folder') }} <code>{{ id.directory }}</code></p>
+            </div>
+            <!-- Trust store: chiavi pubbliche dei Server importate solo da file locali verificati fuori banda. -->
+            <div class="form-panel" *ngIf="identity as id" aria-labelledby="trust-title">
+              <div class="form-head"><div><p class="eyebrow">{{ t('ui.trust.eyebrow') }}</p><h2 id="trust-title">{{ t('ui.trust.title') }}</h2></div><span class="tag">{{ t('ui.trust.counts').replace('{trusted}', '' + id.trust.trusted).replace('{revoked}', '' + id.trust.revoked) }}</span></div>
+              <p class="hint">{{ t('ui.trust.intro') }}</p>
+              <p class="hint">{{ t('ui.trust.contract') }}</p>
+              <div *ngIf="id.trust.damaged" class="problem">{{ t('ui.trust.damaged') }} {{ id.trust.problem }}</div>
+              <p *ngIf="!id.trust.damaged && id.trust.servers.length === 0" class="empty-card">{{ t('ui.trust.none') }}</p>
+              <article class="trust-server" *ngFor="let server of id.trust.servers" [class.revoked]="server.status === 'REVOKED'">
+                <details>
+                  <summary><span class="tag" [class.danger]="server.status === 'REVOKED'" [class.override]="server.status === 'TRUSTED'">{{ t(server.status === 'TRUSTED' ? 'trust.status.trusted' : 'trust.status.revoked') }}</span> <strong>{{ server.name }}</strong> <code>{{ server.serverId }}</code></summary>
+                  <dl class="facts">
+                    <dt>{{ t('ui.trust.id') }}</dt><dd><code>{{ server.serverId }}</code></dd>
+                    <dt>{{ t('ui.identity.fingerprint') }}</dt><dd><code>{{ server.fingerprint }}</code></dd>
+                    <dt>{{ t('ui.identity.public_key') }}</dt><dd><code>{{ server.publicKey }}</code></dd>
+                    <dt>{{ t('ui.trust.imported') }}</dt><dd>{{ formatDate(server.importedAtUnixMs) }}</dd>
+                    <ng-container *ngIf="server.revokedAtUnixMs"><dt>{{ t('ui.trust.revoked_at') }}</dt><dd>{{ formatDate(server.revokedAtUnixMs) }}</dd></ng-container>
+                  </dl>
+                </details>
+                <button *ngIf="server.status === 'TRUSTED'" class="button danger small" type="button" [disabled]="saving" (click)="revokeServer(server)">{{ t('ui.trust.revoke') }}</button>
+              </article>
+              <div class="settings-row">
+                <label class="button secondary small file-button">{{ t('ui.trust.import') }}<input type="file" accept=".json,application/json" (change)="selectTrustFile($event)" [disabled]="saving"></label>
+                <button class="button danger small" type="button" [disabled]="saving || (id.trust.servers.length === 0 && !id.trust.damaged)" (click)="clearTrust()">{{ t('ui.trust.clear') }}</button>
+              </div>
+              <div class="trust-preview" *ngIf="trustCandidate as candidate" role="group" aria-labelledby="trust-preview-title">
+                <h3 id="trust-preview-title">{{ t('ui.trust.preview_title') }}</h3>
+                <dl class="facts">
+                  <dt>{{ t('ui.trust.file') }}</dt><dd><code>{{ trustFileName }}</code></dd>
+                  <dt>{{ t('ui.trust.name') }}</dt><dd><strong>{{ candidate.name }}</strong></dd>
+                  <dt>{{ t('ui.trust.id') }}</dt><dd><code>{{ candidate.serverId }}</code></dd>
+                  <dt>{{ t('ui.identity.fingerprint') }}</dt><dd><code class="fingerprint-big">{{ candidate.fingerprint }}</code></dd>
+                  <dt>{{ t('ui.identity.public_key') }}</dt><dd><code>{{ candidate.publicKey }}</code></dd>
+                </dl>
+                <div *ngIf="candidate.conflict" class="problem">{{ t('ui.trust.conflict') }} {{ candidate.conflict }}</div>
+                <ng-container *ngIf="!candidate.conflict">
+                  <p class="warning-box">{{ t('ui.trust.verify') }}</p>
+                  <label class="toggle"><input type="checkbox" [checked]="trustVerified" (change)="trustVerified = $any($event.target).checked"><span>{{ t('ui.trust.verified_check') }}</span></label>
+                </ng-container>
+                <div class="form-actions"><button class="button secondary" type="button" (click)="cancelTrustImport()">{{ t('ui.identity.cancel') }}</button><button class="button primary" type="button" [disabled]="saving || !!candidate.conflict || !trustVerified" (click)="confirmTrustImport()">{{ t('ui.trust.confirm_import') }}</button></div>
+              </div>
+            </div>
             <div class="section-heading"><div><p class="eyebrow">{{ t('ui.settings.local_data') }}</p><h2 id="paths-title">{{ t('ui.settings.folders') }}</h2></div></div>
             <dl class="facts" aria-labelledby="paths-title">
               <dt>{{ t('ui.settings.folders.configuration') }}</dt><dd><code>{{ config.paths.configuration }}</code></dd>
@@ -384,6 +468,26 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             </dl>
             <p class="hint">{{ t('ui.settings.uninstall_hint') }}</p>
           </aside>
+        </div>
+        <!-- Conferme obbligatorie per generazione e reset dell'identità. -->
+        <div class="modal-backdrop" *ngIf="identityDialog" (click)="closeIdentityDialog()">
+          <div class="modal" role="dialog" aria-modal="true" aria-labelledby="identity-dialog-title" [class.danger]="identityDialog === 'reset'" (click)="$event.stopPropagation()">
+            <ng-container *ngIf="identityDialog === 'generate'">
+              <h2 id="identity-dialog-title">{{ t('ui.identity.generate_title') }}</h2>
+              <p>{{ t('ui.identity.generate_purpose') }}</p>
+              <p><strong>{{ t('ui.identity.generate_question') }}</strong></p>
+              <p class="warning-box"><strong>{{ t('ui.identity.generate_warning') }}</strong></p>
+              <div class="form-actions"><button class="button secondary" type="button" (click)="closeIdentityDialog()">{{ t('ui.identity.cancel') }}</button><button class="button primary" type="button" [disabled]="saving" (click)="generateIdentity()">{{ t('ui.identity.confirm_generate') }}</button></div>
+            </ng-container>
+            <ng-container *ngIf="identityDialog === 'reset'">
+              <h2 id="identity-dialog-title" class="danger-title"><span aria-hidden="true">⚠</span> {{ t('ui.identity.reset_title') }}</h2>
+              <p class="reset-warning"><strong>{{ t('ui.identity.reset_text1') }}</strong></p>
+              <p class="reset-warning"><strong>{{ t('ui.identity.reset_text2') }}</strong></p>
+              <p class="hint">{{ t('ui.identity.reset_effects') }}</p>
+              <label class="reset-confirm">{{ t('ui.identity.reset_type') }}<input [value]="resetText" (input)="resetText = inputValue($event)" autocomplete="off" spellcheck="false" placeholder="RESET"></label>
+              <div class="form-actions"><button class="button secondary" type="button" (click)="closeIdentityDialog()">{{ t('ui.identity.cancel') }}</button><button class="button danger" type="button" [disabled]="saving || resetText !== 'RESET'" (click)="resetIdentity()">{{ t('ui.identity.reset_confirm') }}</button></div>
+            </ng-container>
+          </div>
         </div>
       </ng-container>
 
@@ -429,6 +533,14 @@ class AppComponent implements OnInit {
   notifications: NotificationsView | null = null;
   configuration: ConfigurationView | null = null;
   reportTheme: ReportThemeCatalog | null = null;
+  identity: IdentityView | null = null;
+  showPublicKey = false;
+  identityDialog: 'generate' | 'reset' | null = null;
+  resetText = '';
+  trustCandidate: ServerCandidate | null = null;
+  trustContent = '';
+  trustFileName = '';
+  trustVerified = false;
   uiMessages: UiMessages | null = null;
   private readonly token = sessionToken();
   private messageTimer: ReturnType<typeof setTimeout> | undefined;
@@ -468,7 +580,7 @@ class AppComponent implements OnInit {
     event?.preventDefault();
     this.view = view;
     const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : view === 'settings' ? '#/impostazioni' : '#/';
-    if (view === 'settings') void Promise.all([this.loadConfiguration(), this.loadReportTheme()]).catch(error => { this.error = `${this.t('ui.section.settings')} ${this.errorText(error)}`; });
+    if (view === 'settings') void Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity()]).catch(error => { this.error = `${this.t('ui.section.settings')} ${this.errorText(error)}`; });
     if (location.hash !== hash) window.history.replaceState(null, '', hash);
     window.scrollTo({ top: 0 });
   }
@@ -483,7 +595,7 @@ class AppComponent implements OnInit {
       this.request<AuditReport | null>('/api/status'),
       this.loadHistory(),
       this.loadNotifications(),
-      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme()]) : Promise.resolve()
+      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity()]) : Promise.resolve()
     ]);
     const errors: string[] = [];
     if (outcomes[0].status === 'fulfilled') this.setData(outcomes[0].value);
@@ -700,6 +812,86 @@ class AppComponent implements OnInit {
       this.flash(this.t(enabled ? 'ui.settings.autostart_on' : 'ui.settings.autostart_off'));
     } catch (error: unknown) { this.error = this.errorText(error); await this.loadConfiguration().catch(() => undefined); }
     finally { this.saving = false; }
+  }
+  // ---- Identità e trust store -------------------------------------------------------------
+  async loadIdentity(): Promise<void> { this.identity = await this.request<IdentityView>('/api/identity'); }
+  get identityStatusText(): string {
+    const status = this.identity?.status;
+    return this.t(status === 'CONFIGURED' ? 'ui.identity.configured' : status === 'DAMAGED' ? 'ui.identity.damaged' : 'ui.identity.not_configured');
+  }
+  protectionText(view: IdentityView): string {
+    const state = view.protection?.state;
+    const label = this.t(state === 'RESTRICTED' ? 'identity.protection.restricted' : state === 'TOO_OPEN' ? 'identity.protection.too_open' : 'identity.protection.not_verified');
+    return view.protection?.detail ? `${label} (${view.protection.detail})` : label;
+  }
+  openIdentityDialog(kind: 'generate' | 'reset'): void { this.identityDialog = kind; this.resetText = ''; }
+  @HostListener('document:keydown.escape') closeIdentityDialog(): void { if (!this.saving) { this.identityDialog = null; this.resetText = ''; } }
+  async generateIdentity(): Promise<void> { await this.identityAction('/api/identity/generate', { confirm: true }, () => this.t('ui.identity.generated')); }
+  async resetIdentity(): Promise<void> {
+    if (this.resetText !== 'RESET') return;
+    if (await this.identityAction('/api/identity/reset', { confirm: true }, () => this.t('ui.identity.reset_done'))) { this.showPublicKey = false; this.cancelTrustImport(); }
+  }
+  private async identityAction(path: string, body: unknown, success: () => string): Promise<boolean> {
+    this.saving = true; this.error = '';
+    try {
+      this.identity = await this.post<IdentityView>(path, body);
+      this.identityDialog = null; this.resetText = '';
+      this.flash(success());
+      return true;
+    } catch (error: unknown) {
+      this.error = this.errorText(error);
+      await this.loadIdentity().catch(() => undefined);
+      return false;
+    } finally { this.saving = false; }
+  }
+  /** Copies the full public key even while it is hidden on screen. */
+  async copyPublicKey(key: string): Promise<void> {
+    let copied = false;
+    try { await navigator.clipboard.writeText(key); copied = true; } catch {
+      const area = document.createElement('textarea');
+      area.value = key; area.setAttribute('readonly', ''); area.style.position = 'fixed'; area.style.opacity = '0';
+      document.body.appendChild(area); area.select();
+      try { copied = document.execCommand('copy'); } catch { copied = false; }
+      area.remove();
+    }
+    if (copied) this.flash(this.t('ui.identity.copied')); else this.error = this.t('ui.identity.copy_failed');
+  }
+  exportIdentity(identity: PublicIdentity): void {
+    const blob = new Blob([JSON.stringify(identity, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = `baradwatchu-${identity.id ?? 'identity'}.json`;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  }
+  async selectTrustFile(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    this.cancelTrustImport(); this.error = '';
+    if (file.size > 64 * 1024) { this.error = this.t('ui.trust.file_too_large'); return; }
+    try {
+      const content = await file.text();
+      this.trustCandidate = await this.post<ServerCandidate>('/api/trust/preview', { content });
+      this.trustContent = content; this.trustFileName = file.name;
+    } catch (error: unknown) { this.error = this.errorText(error); }
+  }
+  cancelTrustImport(): void { this.trustCandidate = null; this.trustContent = ''; this.trustFileName = ''; this.trustVerified = false; }
+  async confirmTrustImport(): Promise<void> {
+    const candidate = this.trustCandidate;
+    if (!candidate || candidate.conflict || !this.trustVerified) return;
+    const body = { content: this.trustContent, confirmFingerprint: candidate.fingerprint };
+    if (await this.identityAction('/api/trust/import', body, () => this.t('ui.trust.imported_ok').replace('{name}', candidate.name))) this.cancelTrustImport();
+  }
+  async revokeServer(server: TrustedServer): Promise<void> {
+    if (!window.confirm(this.t('ui.trust.revoke_confirm').replace('{name}', server.name).replace('{id}', server.serverId))) return;
+    await this.identityAction(`/api/trust/revoke/${encodeURIComponent(server.serverId)}`, { confirm: true }, () => this.t('ui.trust.revoked_ok').replace('{name}', server.name));
+  }
+  async clearTrust(): Promise<void> {
+    const count = this.identity?.trust.servers.length ?? 0;
+    if (!window.confirm(this.t('ui.trust.clear_confirm').replace('{count}', String(count)))) return;
+    await this.identityAction('/api/trust/clear', { confirm: true }, () => this.t('ui.trust.cleared'));
   }
   async loadNotifications(): Promise<void> { this.notifications = await this.request<NotificationsView>('/api/notifications'); }
   async setPreference(key: 'enabled' | 'informative', event: Event): Promise<void> {

@@ -18,6 +18,7 @@ use tray_icon::{
 };
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const LINK_RESTART: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum Msg {
@@ -156,6 +157,16 @@ impl App {
         thread::spawn(move || loop {
             tick_post(Msg::Tick);
             thread::sleep(POLL_INTERVAL);
+        });
+        // Remote audit requests reach this session through `remote link` (it does nothing
+        // until the user runs `remote enable`). Restarted if it stops; ends with the tray.
+        let link_agent = agent.clone();
+        thread::spawn(move || loop {
+            if let Ok(mut child) = link_agent.spawn_link() {
+                let _stdin = child.stdin.take(); // keep the pipe open while it runs
+                let _ = child.wait();
+            }
+            thread::sleep(LINK_RESTART);
         });
         Ok(Self {
             language,

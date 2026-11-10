@@ -5,6 +5,10 @@ mod configuration;
 pub mod consent;
 pub mod dashboard;
 pub mod events;
+pub mod identity;
+mod ipc;
+pub mod remote;
+mod service;
 pub mod messages {
     pub use baradwatchu_messages::*;
 }

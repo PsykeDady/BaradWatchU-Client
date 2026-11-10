@@ -1,10 +1,19 @@
-﻿; BaradWatchU Client: per-user Windows setup (Inno Setup 6).
+﻿; BaradWatchU Client: Windows setup (Inno Setup 6).
 ; Built by `install.ps1 -Package`, which stages the validated build and passes:
 ;   /DAppVersion=X.Y.Z  /DStageDir=<staged bin + share tree>  /DWithTray=1|0  /O<output dir>
-; No administrator rights, no service, no system settings: files go to
-; %LOCALAPPDATA%\Programs\BaradWatchU, entries to the user's Start menu and the
-; uninstaller to Settings > Apps. Settings, custom checks and audit history live in
-; %APPDATA% / %LOCALAPPDATA%\baradwatchu and are never touched by setup or uninstall.
+; Two modes (dialog at start; silent: /ALLUSERS or /CURRENTUSER):
+; - All users (default, administrator): the complete Client in Program Files, Windows service
+;   included, installed/updated/removed through packaging\service\install-service.ps1 (shipped
+;   in {app}\share\baradwatchu-client\service). The service is stopped before files change and
+;   restarted (and checked) on the new executable; a failed or cancelled setup restarts it.
+; - Current user only (no administrator rights): %LOCALAPPDATA%\Programs\BaradWatchU, user's
+;   Start menu; agent, dashboard, tray, identity and local audits; no service, no remote
+;   communication.
+; An upgrade keeps the mode of the existing installation.
+; Setup never generates keys, never enables the remote listener, never changes the firewall.
+; Settings, identities, trust stores, custom checks and audit history live in
+; %APPDATA% / %LOCALAPPDATA%\baradwatchu, service registrations in
+; %ProgramData%\BaradWatchU\service: setup and uninstall never touch them.
 
 #ifndef AppVersion
   #error AppVersion is required (use install.ps1 -Package)
@@ -25,7 +34,11 @@ AppVerName=BaradWatchU Client {#AppVersion}
 AppPublisher=BaradWatchU
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription=BaradWatchU Client setup
-PrivilegesRequired=lowest
+; All users (complete, with the service) by default; "only for me" stays available.
+; An upgrade keeps the mode of the existing installation (UsePreviousPrivileges).
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog commandline
+UsePreviousPrivileges=yes
 DefaultDirName={autopf}\BaradWatchU
 DisableProgramGroupPage=yes
 DefaultGroupName=BaradWatchU
@@ -57,11 +70,19 @@ it.Tray=Tray BaradWatchU
 en.Tray=BaradWatchU Tray
 it.TrayComment=Stato, notifiche e richieste di consenso
 en.TrayComment=Status, notifications and consent requests
+it.ServiceOther=Il servizio BaradWatchU appartiene a un'altra installazione (%1). Disinstalla prima quella installazione. Nessun file è stato modificato.
+en.ServiceOther=The BaradWatchU service belongs to another installation (%1). Uninstall that installation first. No file was changed.
+it.ServiceStopFailed=Impossibile fermare il servizio BaradWatchU prima dell'aggiornamento. Nessun file è stato modificato.
+en.ServiceStopFailed=The BaradWatchU service could not be stopped before the update. No file was changed.
+it.ServiceFailed=I file sono installati, ma il servizio BaradWatchU non è stato installato o avviato ed è fermo (nessun eseguibile vecchio in esecuzione). Da PowerShell amministratore esegui per vedere l'errore:
+en.ServiceFailed=The files are installed, but the BaradWatchU service could not be installed or started and is stopped (no old executable is running). From an elevated PowerShell run this to see the error:
+it.ServiceRemoveFailed=Impossibile rimuovere il servizio BaradWatchU; rimuovilo con: sc.exe delete BaradWatchU
+en.ServiceRemoveFailed=The BaradWatchU service could not be removed; remove it with: sc.exe delete BaradWatchU
 it.StillRunning=BaradWatchU è in esecuzione da questa cartella (dashboard o tray). Chiudi la dashboard (Ctrl+C o chiudi la sua finestra) e la tray (menu della tray › Chiudi tray), poi riprova. Nessun file è stato modificato.
 en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Close the dashboard (Ctrl+C or close its window) and the tray (tray menu › Close tray), then retry. No file was changed.
 
-#if WithTray == "1"
 [Tasks]
+#if WithTray == "1"
 ; Selected by default, offered only on a first installation: an upgrade keeps the user's
 ; choice (tray menu "Avvia al login"). Not offered while the start-at-login entry belongs to
 ; another BaradWatchU installation (install.ps1). Silent opt-out: /MERGETASKS="!trayautostart".
@@ -74,6 +95,8 @@ Source: "{#StageDir}\bin\baradwatchu-agent.exe"; DestDir: "{app}\bin"; Flags: ig
 Source: "{#StageDir}\bin\baradwatchu-tray.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 #endif
 Source: "{#StageDir}\share\*"; DestDir: "{app}\share"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Service component (all-users installations always run it; unused per user).
+Source: "{#SourcePath}..\service\install-service.ps1"; DestDir: "{app}\share\baradwatchu-client\service"; Flags: ignoreversion
 
 [InstallDelete]
 ; Hashed Angular bundles change name between versions: replace the web folder as a whole.
@@ -90,15 +113,110 @@ Name: "{group}\{cm:Tray}"; Filename: "{app}\bin\baradwatchu-tray.exe"; WorkingDi
 
 #if WithTray == "1"
 [Run]
-Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart enable"; Tasks: trayautostart; Flags: runhidden
+; runasoriginaluser: in an all-users installation the entry goes to the user who started setup.
+Filename: "{app}\bin\baradwatchu-tray.exe"; Parameters: "autostart enable"; Tasks: trayautostart; Flags: runhidden runasoriginaluser
 
 #endif
 
 [Code]
-{ No uninstall entry for this AppId yet: first installation for the current user. }
+const
+  ServiceName = 'BaradWatchU';
+  ServiceKey = 'SYSTEM\CurrentControlSet\Services\BaradWatchU';
+
+var
+  { Set when this setup stopped a running service; cleared once the service step ran. }
+  ServiceStopped: Boolean;
+  ServiceStepDone: Boolean;
+
+{ No uninstall entry for this AppId yet: first installation (per user: HKCU; all users: HKLM). }
 function IsFirstInstall(): Boolean;
 begin
-  Result := not RegKeyExists(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}_is1');
+  Result := not RegKeyExists(HKA, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}_is1');
+end;
+
+function AgentPath(): String;
+begin
+  Result := ExpandConstant('{app}\bin\baradwatchu-agent.exe');
+end;
+
+function PowerShell(const Arguments: String): Boolean;
+var
+  Code: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass ' + Arguments, '', SW_HIDE,
+    ewWaitUntilTerminated, Code) and (Code = 0);
+  Log('powershell ' + Arguments + ': ' + IntToStr(Code));
+end;
+
+{ The installed service, if any, runs this installation's agent. }
+function OurServiceInstalled(): Boolean;
+var
+  ImagePath: String;
+begin
+  Result := IsAdminInstallMode and RegQueryStringValue(HKLM, ServiceKey, 'ImagePath', ImagePath)
+    and (Pos(Lowercase(AgentPath()), Lowercase(ImagePath)) > 0);
+end;
+
+{ Image path of a service registered by another installation, or ''. }
+function OtherServicePath(): String;
+var
+  ImagePath: String;
+begin
+  Result := '';
+  if IsAdminInstallMode and RegQueryStringValue(HKLM, ServiceKey, 'ImagePath', ImagePath)
+    and (Pos(Lowercase(AgentPath()), Lowercase(ImagePath)) = 0) then
+    Result := ImagePath;
+end;
+
+function ServiceRunning(): Boolean;
+begin
+  Result := PowerShell('-Command "if ((Get-Service -Name ' + ServiceName + ').Status -eq ''Running'') { exit 0 } else { exit 3 }"');
+end;
+
+{ Stops this installation's running service before files change (no file has been touched). }
+function StopOurService(): Boolean;
+begin
+  Result := True;
+  if OurServiceInstalled() and ServiceRunning() then
+  begin
+    Result := PowerShell('-Command "Stop-Service -Name ' + ServiceName + ' -ErrorAction Stop; (Get-Service -Name ' + ServiceName + ').WaitForStatus(''Stopped'', [TimeSpan]::FromSeconds(30))"');
+    ServiceStopped := Result;
+  end;
+end;
+
+{ Failed or cancelled setup/uninstall: start the stopped service again on the files in place. }
+procedure RestoreService();
+begin
+  if ServiceStopped and not ServiceStepDone then
+  begin
+    ServiceStopped := False;
+    PowerShell('-Command "Start-Service -Name ' + ServiceName + '"');
+  end;
+end;
+
+function ServiceScript(const Arguments: String): Boolean;
+begin
+  Result := PowerShell('-File "' + ExpandConstant('{app}\share\baradwatchu-client\service\install-service.ps1') + '" -Agent "' + AgentPath() + '" ' + Arguments);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssPostInstall) and IsAdminInstallMode then
+  begin
+    ServiceStepDone := True;
+    { All users = complete installation: the service is always installed or updated. }
+    if not ServiceScript('') then
+    begin
+      ServiceScript('-Stop');
+      SuppressibleMsgBox(CustomMessage('ServiceFailed') + #13#10 + '"' + ExpandConstant('{app}\share\baradwatchu-client\service\install-service.ps1') + '"', mbError, MB_OK, IDOK);
+    end;
+  end;
+end;
+
+procedure DeinitializeSetup();
+begin
+  RestoreService();
 end;
 
 { Command of the per-user start-at-login entry shared by every BaradWatchU installation, or ''. }
@@ -149,19 +267,43 @@ begin
   end;
 end;
 
-{ Upgrade: refuse while programs of the target folder run (no file has been touched yet). }
+{ Upgrade: stop this installation's service, then refuse while other programs of the target
+  folder run (no file has been touched yet; the service is started again on refusal). }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
+  { One service per machine: never take over another installation's one. }
+  if OtherServicePath() <> '' then
+  begin
+    Result := FmtMessage(CustomMessage('ServiceOther'), [OtherServicePath()]);
+    exit;
+  end;
+  if not StopOurService() then
+  begin
+    Result := CustomMessage('ServiceStopFailed');
+    exit;
+  end;
   if RunningFrom(ExpandConstant('{app}')) > 0 then
+  begin
     Result := CustomMessage('StillRunning');
+    RestoreService();
+  end;
 end;
 
 function InitializeUninstall(): Boolean;
 begin
+  Result := StopOurService();
+  if not Result then
+  begin
+    SuppressibleMsgBox(CustomMessage('ServiceStopFailed'), mbError, MB_OK, IDOK);
+    exit;
+  end;
   Result := RunningFrom(ExpandConstant('{app}')) = 0;
   if not Result then
+  begin
     SuppressibleMsgBox(CustomMessage('StillRunning'), mbError, MB_OK, IDOK);
+    RestoreService();
+  end;
 end;
 
 { Uninstall: remove the per-user start-at-login entry only when it starts this installation's
@@ -171,4 +313,17 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usUninstall) and AutostartIsOurs() then
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'BaradWatchU-Tray');
+  { Before any file is deleted: remove this installation's service (registrations in
+    %ProgramData%\BaradWatchU\service and user identities are kept). }
+  if (CurUninstallStep = usUninstall) and OurServiceInstalled() then
+  begin
+    ServiceStepDone := True;
+    if not ServiceScript('-Uninstall') then
+      SuppressibleMsgBox(CustomMessage('ServiceRemoveFailed'), mbError, MB_OK, IDOK);
+  end;
+end;
+
+procedure DeinitializeUninstall();
+begin
+  RestoreService();
 end;

@@ -436,6 +436,31 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
         ("POST", "/api/consent/simulate") => api(crate::consent::dashboard_simulate(
             std::str::from_utf8(body).unwrap_or(""),
         )),
+        // Identity and trust store: local operator actions only. Imports carry the content of
+        // a file the operator picked; nothing here accepts a key offered by a remote party.
+        ("GET", "/api/identity") => api(crate::identity::dashboard_view_json()),
+        ("POST", "/api/identity/generate") => api(crate::identity::dashboard_generate(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("POST", "/api/identity/reset") => api(crate::identity::dashboard_reset(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("POST", "/api/trust/preview") => api(crate::identity::dashboard_trust_preview(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("POST", "/api/trust/import") => api(crate::identity::dashboard_trust_import(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("POST", "/api/trust/clear") => api(crate::identity::dashboard_trust_clear(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("POST", path) if path.starts_with("/api/trust/revoke/") => {
+            let id = &path["/api/trust/revoke/".len()..];
+            api(crate::identity::dashboard_trust_revoke(
+                id,
+                std::str::from_utf8(body).unwrap_or_default(),
+            ))
+        }
         ("GET", "/api/requirements") => api(requirements::dashboard_data_json()),
         ("POST", "/api/refresh") => api(requirements::dashboard_refresh_json()),
         ("GET", "/api/status") => api(requirements::dashboard_status_json()),
@@ -629,6 +654,125 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "application/pdf");
         assert_eq!(response.body, pdf_bytes);
+    }
+
+    /// Sends one raw request through the real `handle` (token, Host, Origin, Content-Type).
+    fn exchange(request: &str, token: &str) -> String {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let token = token.to_owned();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(stream, &origin, port, &token, Path::new("/does/not/exist")).unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(request.replace("{port}", &port.to_string()).as_bytes())
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        server.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn identity_and_trust_api_need_token_origin_and_json() {
+        let _env = requirements::TestEnv::new("dashboard-identity");
+        let token = "d".repeat(64);
+        let body = r#"{"confirm":true}"#;
+        let post = |path: &str, headers: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let good_origin = "Origin: http://127.0.0.1:{port}\r\n";
+        let json = "Content-Type: application/json\r\n";
+        let auth = format!("X-BaradWatchU-Token: {token}\r\n");
+        let identity_dir = crate::identity::identity_dir().unwrap();
+        for path in [
+            "/api/identity/generate",
+            "/api/identity/reset",
+            "/api/trust/clear",
+            "/api/trust/import",
+        ] {
+            // No token.
+            let response = exchange(&post(path, &format!("{good_origin}{json}")), &token);
+            assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+            // Foreign origin (cross-site page).
+            let response = exchange(
+                &post(
+                    path,
+                    &format!("Origin: http://evil.example\r\n{json}{auth}"),
+                ),
+                &token,
+            );
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            // Missing Origin or non-JSON content type (simple cross-origin form posts).
+            let response = exchange(&post(path, &format!("{json}{auth}")), &token);
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            let response = exchange(
+                &post(
+                    path,
+                    &format!("{good_origin}Content-Type: text/plain\r\n{auth}"),
+                ),
+                &token,
+            );
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+            // Wrong Host (DNS rebinding).
+            let response = exchange(
+                &post(path, &format!("{good_origin}{json}{auth}"))
+                    .replace("Host: 127.0.0.1:{port}", "Host: attacker.example"),
+                &token,
+            );
+            assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+        }
+        assert!(
+            !identity_dir.exists(),
+            "a refused request changed local state"
+        );
+        let get = "GET /api/identity HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n".to_owned();
+        assert!(exchange(&get, &token).starts_with("HTTP/1.1 401"));
+        // Authorized local dashboard request.
+        let response = exchange(
+            &post(
+                "/api/identity/generate",
+                &format!("{good_origin}{json}{auth}"),
+            ),
+            &token,
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"CONFIGURED\""));
+        assert!(!response.contains("seed"));
+        assert_eq!(
+            route("GET", "/api/identity", &[], Path::new("/x")).status,
+            200
+        );
+        assert_eq!(
+            route(
+                "POST",
+                "/api/identity/generate",
+                body.as_bytes(),
+                Path::new("/x")
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            route(
+                "POST",
+                "/api/trust/revoke/SRV-0000-0000-0000-0000",
+                body.as_bytes(),
+                Path::new("/x")
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            route("DELETE", "/api/identity", &[], Path::new("/x")).status,
+            405
+        );
     }
 
     #[test]

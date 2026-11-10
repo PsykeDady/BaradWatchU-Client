@@ -16,7 +16,7 @@ use std::{
 const THEME_SCHEMA: &str = "baradwatchu.report-theme.v1";
 const DEFAULT_THEME_ID: &str = "default";
 const THEME_SELECTION_SCHEMA: &str = "baradwatchu.report-theme-selection.v1";
-const TEMPLATE_VERSION: &str = "1.2.1";
+const TEMPLATE_VERSION: &str = "1.3.0";
 const PAGE_W: f32 = 595.28;
 const PAGE_H: f32 = 841.89;
 const MARGIN: f32 = 38.0;
@@ -994,6 +994,25 @@ fn draw_summary(
             .unwrap_or(baradwatchu_messages::message("pdf.not_available", language)),
     ));
     let mut bottom = top - 147.0;
+    let attribution = match &report.initiator {
+        Some(req::AuditInitiator::Local) => "LOCAL".to_owned(),
+        Some(req::AuditInitiator::Remote {
+            operator_display_name,
+            server_id,
+            server_display_name,
+            ..
+        }) => format!(
+            "REMOTE: {} / {} ({})",
+            operator_display_name.as_deref().unwrap_or("?"),
+            server_display_name,
+            server_id
+        ),
+        None => baradwatchu_messages::message("pdf.origin_unknown", language).to_owned(),
+    };
+    for line in wrap(&attribution, 100) {
+        ops.push(text_op(MARGIN, bottom, 7.4, false, text, &line));
+        bottom -= 11.0;
+    }
     if let Some(error) = &report.client.sha256_error {
         for line in wrap(error, 105) {
             ops.push(text_op(MARGIN, bottom, 7.4, false, text, &line));
@@ -1103,7 +1122,7 @@ fn draw_result(
     const LEADING: f32 = 11.5;
     let left = left_lines(result, disabled);
     let middle = middle_lines(result, providers);
-    let badges = badge_lines(result, providers);
+    let badges = badge_lines(result);
     let max_lines = left.len().max(middle.len()).max(badges.len() * 2).max(1);
     let full_height = max_lines as f32 * LEADING + 29.0;
     // Keep ordinary requirements together; only exceptionally long rows span pages.
@@ -1157,7 +1176,7 @@ fn draw_result(
                 );
             }
         }
-        // Place badges on the same pagination grid without truncating provider badges.
+        // Place badges on the same pagination grid as the text columns.
         if continuation {
             draw_badge(ops, 490.0, top - 15.0, &badges[0]);
         }
@@ -1606,10 +1625,10 @@ fn status_badge(status: ResultStatus) -> (String, [u8; 3], [u8; 3]) {
     (label, background, foreground)
 }
 
-fn badge_lines(
-    result: &ResultRecord,
-    providers: &[&ProviderResult],
-) -> Vec<(String, [u8; 3], [u8; 3])> {
+/// Badges of the requirement itself: its outcome, then override/custom markers. Provider
+/// outcomes are not badges: an unlabeled second PASS/FAIL reads as a duplicate of the
+/// requirement's outcome; each provider's status, role and origin are in the details column.
+fn badge_lines(result: &ResultRecord) -> Vec<(String, [u8; 3], [u8; 3])> {
     let language = baradwatchu_messages::configured_language();
     let mut out = vec![status_badge(result.status)];
     if let Some(p) = &result.provenance {
@@ -1621,26 +1640,6 @@ fn badge_lines(
             ));
         }
         if p.origin == crate::requirements::ControlOrigin::Custom {
-            out.push((
-                baradwatchu_messages::message("pdf.badge.custom", language).to_uppercase(),
-                [62, 72, 91],
-                [255, 255, 255],
-            ));
-        }
-    }
-    for provider in providers {
-        out.push(status_badge(provider.status));
-        out.push((
-            if provider.required {
-                baradwatchu_messages::message("pdf.provider.required", language)
-            } else {
-                baradwatchu_messages::message("pdf.provider.optional", language)
-            }
-            .to_uppercase(),
-            [62, 72, 91],
-            [255, 255, 255],
-        ));
-        if provider.origin == crate::requirements::ControlOrigin::Custom {
             out.push((
                 baradwatchu_messages::message("pdf.badge.custom", language).to_uppercase(),
                 [62, 72, 91],
@@ -2151,6 +2150,27 @@ mod tests {
     }
 
     #[test]
+    fn only_the_requirement_outcome_is_a_status_badge() {
+        // Regression: provider outcomes were drawn as extra unlabeled PASS/FAIL badges,
+        // which read as the requirement's outcome shown twice.
+        let result = ResultRecord {
+            id: "REQ-002".into(),
+            name: "Antivirus".into(),
+            description: String::new(),
+            priority: req::Priority::Highest,
+            status: req::ResultStatus::Fail,
+            compliance_status: None,
+            summary: String::new(),
+            details: Vec::new(),
+            completed_at_unix_ms: 0,
+            provenance: None,
+        };
+        let badges = badge_lines(&result);
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].0, "FAIL");
+    }
+
+    #[test]
     fn column_wrapping_keeps_wide_glyphs_inside_the_column() {
         for style in [LineStyle::Title, LineStyle::Body, LineStyle::Mono] {
             let value = "W".repeat(140);
@@ -2273,6 +2293,7 @@ mod tests {
     #[test]
     fn renderer_emits_valid_pdf_objects_and_summary_data() {
         let report = AuditReport {
+            initiator: Some(crate::requirements::AuditInitiator::Local),
             installation: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: 1_784_000_000_000,

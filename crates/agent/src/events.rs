@@ -108,6 +108,15 @@ impl Default for NotificationPreferences {
 pub(crate) struct DirLock(#[allow(dead_code)] File);
 
 pub(crate) fn lock_dir(dir: &Path, name: &str) -> Result<DirLock, CliError> {
+    lock_dir_with(dir, name, true)?.ok_or_else(|| CliError("Cannot lock local data".into()))
+}
+
+/// Non-blocking variant: `Ok(None)` when another holder has the lock.
+pub(crate) fn try_lock_dir(dir: &Path, name: &str) -> Result<Option<DirLock>, CliError> {
+    lock_dir_with(dir, name, false)
+}
+
+fn lock_dir_with(dir: &Path, name: &str, wait: bool) -> Result<Option<DirLock>, CliError> {
     req::ensure_private_dir(dir)?;
     let mut options = OpenOptions::new();
     options.create(true).truncate(false).write(true);
@@ -132,6 +141,14 @@ pub(crate) fn lock_dir(dir: &Path, name: &str) -> Result<DirLock, CliError> {
                     if matches!(
                         error.raw_os_error(),
                         Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                    ) && !wait =>
+                {
+                    return Ok(None);
+                }
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
                     ) && std::time::Instant::now() < deadline =>
                 {
                     std::thread::sleep(std::time::Duration::from_millis(25));
@@ -147,12 +164,34 @@ pub(crate) fn lock_dir(dir: &Path, name: &str) -> Result<DirLock, CliError> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        let operation = if wait {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_EX | libc::LOCK_NB
+        };
         // SAFETY: valid descriptor owned by `file`; the lock is released when it is closed.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+            if !wait && io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) {
+                return Ok(None);
+            }
             return Err(CliError("Cannot lock local data".into()));
         }
     }
-    Ok(DirLock(file))
+    Ok(Some(DirLock(file)))
+}
+
+/// Milestone 2 exclusion: one audit at a time per user, whoever starts it (CLI, tray,
+/// dashboard, remote request). A remote request holds it from the consent prompt to the
+/// end of its audit. Never waits: `Ok(None)` means busy.
+pub(crate) fn try_audit_lock() -> Result<Option<DirLock>, CliError> {
+    try_lock_dir(&req::state_home()?, ".audit.lock")
+}
+
+/// Same, for local audits: busy is an error explained to the user.
+pub(crate) fn audit_lock() -> Result<DirLock, CliError> {
+    try_audit_lock()?.ok_or_else(|| {
+        CliError("Another audit or a remote audit request is in progress: try again later".into())
+    })
 }
 
 fn events_path() -> Result<PathBuf, CliError> {
@@ -637,6 +676,7 @@ mod tests {
 
     fn report(stamp: u64, results: Vec<ResultRecord>) -> AuditReport {
         AuditReport {
+            initiator: Some(crate::requirements::AuditInitiator::Local),
             installation: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: stamp,
@@ -650,6 +690,9 @@ mod tests {
 
     #[test]
     fn one_event_per_audit_classified_by_most_serious_aspect() {
+        // Pins the language (Italian) through an isolated config: without it the text
+        // depended on the host locale and on other tests' environments (flaky en_US runs).
+        let _env = req::TestEnv::new("events-classified");
         let clean = audit_event(&report(
             1,
             vec![result("REQ-001", ResultStatus::Pass, "ok")],

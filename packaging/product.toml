@@ -13,7 +13,7 @@ config_path = "/etc/baradwatchu/client"
 data_path = "/var/lib/baradwatchu/client"
 custom_checks_path = "/var/lib/baradwatchu/client/custom-checks"
 service_unit = "baradwatchu-agent.service"
-service_status = "deferred"
+service_status = "part of the system installation (install.sh system mode, Windows all-users setup); per-user mode has none; namespace-tested, not run under real systemd; packages: deferred"
 package_artifact_status = "planned-not-built-or-tested"
 
 [desktop]

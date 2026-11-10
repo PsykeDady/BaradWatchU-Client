@@ -11,9 +11,17 @@ LOCAL=0 UNINSTALL=0 DRY=0 NO_BUILD=0 BUILD_ONLY=0 MISSING=0 PREFIX_SET=0 BUILD_S
 # Start at login: enabled by default on a first installation (FRESH: no manifest yet); a
 # reinstall keeps the user's choice; --tray-autostart forces it, --no-tray-autostart skips it.
 WITH_TRAY=1 TRAY_AUTOSTART=0 NO_TRAY_AUTOSTART=0 TRAY_SET=0 FRESH=0
+# Two modes. System installation (root-owned prefix, default /usr/local): the complete
+# Client, system service included (packaging/service/install-service.sh, run in the step that
+# already uses sudo). Per-user installation (--local, or a prefix writable without root):
+# everything usable without privileges, no system service, no remote communication.
+SYSTEM_INSTALL=1
+SERVICE_SCRIPT="$ROOT/packaging/service/install-service.sh"
+SERVICE_ACTION=none SERVICE_NOTE='' SERVICE_CURRENT='' SERVICE_ACTIVE=0 SERVICE_STOPPED=0 SERVICE_PHASE=0
 STAGE_DIR='' WEB_BUILD_DIR=''
 cleanup() {
     local path
+    restore_service
     for path in "$STAGE_DIR" "$WEB_BUILD_DIR"; do
         if [[ -n "$path" && -d "$path" && ! -L "$path" ]]; then find "$path" -depth -delete 2>/dev/null || true; fi
     done
@@ -40,10 +48,22 @@ Usage: ./install.sh [OPTIONS]
       --no-tray-autostart  Do not enable it on a first installation. By
                        default a first installation enables start at login and
                        a reinstall keeps the user's choice (tray menu: Avvia al login)
-User-local installation is a limited development copy, not a system-wide agent.
+Two installation modes:
+  system (default; a prefix that needs root, such as /usr/local): the complete
+    Client - agent, dashboard, tray and the system service (systemd unit
+    baradwatchu-agent.service, root) that serves the remote mTLS API. Install,
+    update and uninstall always include the service.
+  per-user (--local, or a --prefix writable without root): agent, dashboard,
+    tray, identity, trust store, local audits and reports, without privileges;
+    no system service and no remote communication.
 Run as a normal user: build without root, then use sudo only to copy files into
-a protected system prefix. Failed sudo authentication leaves the build cache
-available for retry. No package, systemd unit, or service restart is performed.
+a protected system prefix and, in that same step, to install, update or remove
+the system service with packaging/service/install-service.sh. Failed sudo
+authentication leaves the build cache available for retry. No package is
+installed. The service is stopped before its files change and restarted on the
+new executable afterwards (checked); if the installation fails it is restarted
+on the files in place. Nothing generates keys, enables the remote listener
+(service.json) or changes firewall rules.
 Before files are replaced or removed, a running baradwatchu-agent of the same
 installation (matched by executable path, e.g. an open dashboard) gets SIGTERM
 and up to BARADWATCHU_STOP_TIMEOUT seconds (default 10); it is never killed.
@@ -281,11 +301,15 @@ running_instances() { # "PID UID START" for each process running $PREFIX/bin/$BI
     done
 }
 describe_instances() {
-    local pid uid start found=0 will='will be'
+    local pid uid start found=0 will='will be' service_pid=''
     ((DRY)) && will='would be'
+    if [[ $SERVICE_CURRENT == "$PREFIX/bin/$BIN" ]]; then service_pid=$(systemctl show -p MainPID --value baradwatchu-agent.service 2>/dev/null || true); fi
     while read -r pid uid start; do
         found=1
-        if [[ $uid == "$REAL_UID" ]]; then option 'running' "PID $pid, $will closed (SIGTERM, up to ${STOP_TIMEOUT} s) before files change"
+        if [[ $pid == "$service_pid" ]]; then
+            if [[ $SERVICE_ACTION == none ]]; then option 'running' "PID $pid, system service of this installation (left running)"
+            else option 'running' "PID $pid, system service: $will stopped through systemd before files change"; fi
+        elif [[ $uid == "$REAL_UID" ]]; then option 'running' "PID $pid, $will closed (SIGTERM, up to ${STOP_TIMEOUT} s) before files change"
         else option 'running' "PID $pid of user $uid, left running (not yours)"; fi
     done < <(running_instances)
     ((found)) || option 'running' 'no instance of this installation'
@@ -314,11 +338,13 @@ print_options() { # every run starts with the effective plan
     ((UNINSTALL)) && action=uninstall
     ((BUILD_ONLY)) && action='build only'
     ((MISSING)) && action='dependency check'
-    prefix_writable || privileges='sudo, only for copying/removing files'
+    prefix_writable || privileges='sudo, only for copying/removing files and the system service'
     printf '%sBaradWatchU Client %s installer%s\n' "$C_BOLD" "$VERSION" "$C_RST"
     option 'action' "$action$( ((DRY)) && echo ' (dry run: nothing changes)')"
     if ((MISSING == 0)); then
-        if ((LOCAL)); then option 'scope' "current user only ($PREFIX)"; else option 'scope' "system-wide ($PREFIX)"; fi
+        if ((BUILD_ONLY)); then :
+        elif ((SYSTEM_INSTALL)); then option 'mode' "system installation ($PREFIX): complete Client with the system service for remote requests"
+        else option 'mode' "per-user installation ($PREFIX): no system service, no remote communication; local audits, dashboard, tray, identity and reports work"; fi
         if ((UNINSTALL == 0)); then
             if ((NO_BUILD)); then option 'build' "reuse $BUILD_DIR (--no-build)"; else option 'build' "compile in $BUILD_DIR"; fi
         fi
@@ -327,8 +353,9 @@ print_options() { # every run starts with the effective plan
         elif ((WITH_TRAY)); then option 'tray' "$PREFIX/bin/$TRAY_BIN + menu entry; start at login: $(if ((TRAY_AUTOSTART)); then echo 'enabled for the invoking user'; elif ((NO_TRAY_AUTOSTART)); then echo 'not enabled; a reinstall keeps the current choice'; else echo 'enabled on first install for the invoking user; a reinstall keeps the current choice'; fi)"
         else option 'tray' 'not installed (--without-tray)'; fi
         option 'manifest' "$manifest"
+        ((BUILD_ONLY)) || option 'service' "$SERVICE_NOTE"
         ((BUILD_ONLY)) || option 'privileges' "$privileges"
-        option 'user data' "kept: \$XDG_CONFIG_HOME/baradwatchu (settings, custom-checks), \$XDG_STATE_HOME/baradwatchu (events, consent) and \$XDG_CACHE_HOME/baradwatchu/audit (audit history)"
+        option 'user data' "kept: \$XDG_CONFIG_HOME/baradwatchu (settings, custom-checks, identity, trust store), \$XDG_STATE_HOME/baradwatchu (events, consent) and \$XDG_CACHE_HOME/baradwatchu/audit (audit history); no key is generated and no listener is enabled"
         ((BUILD_ONLY)) || describe_instances
     fi
     option 'distribution' "$(os_family)"
@@ -530,6 +557,65 @@ post_install_user() {
     fi
     echo "Tray companion: start it with $PREFIX/bin/$TRAY_BIN (or the application menu); closing it does not stop the agent."
 }
+# --- system service (packaging/service/install-service.sh does the work) ----------------
+# Invariant: whenever $PREFIX/bin/$BIN is replaced or removed, a service running that file is
+# stopped first and then either restarted on the new file (and checked) or removed.
+plan_service() {
+    local agent="$PREFIX/bin/$BIN" state='' path='' active=''
+    SERVICE_ACTION=none SERVICE_CURRENT='' SERVICE_ACTIVE=0
+    if command -v systemctl >/dev/null 2>&1 && [[ -f "$SERVICE_SCRIPT" && ! -L "$SERVICE_SCRIPT" ]]; then
+        read -r state path active < <(bash "$SERVICE_SCRIPT" --status) || true
+        if [[ $state == installed ]]; then SERVICE_CURRENT=$path; [[ $active != active ]] || SERVICE_ACTIVE=1; fi
+    fi
+    if ((SYSTEM_INSTALL == 0)); then
+        # Files belong to this user: a root service must never run them.
+        [[ $SERVICE_CURRENT != "$agent" ]] || fail "the system service runs $agent but $PREFIX is writable without root; run the installer with sudo"
+        SERVICE_NOTE='none (per-user installation; remote requests need the system installation)'
+        return 0
+    fi
+    if ((UNINSTALL)); then
+        if [[ $SERVICE_CURRENT == "$agent" ]]; then SERVICE_ACTION=remove SERVICE_NOTE="stopped and removed before the files (registrations in /var/lib/baradwatchu are kept)"
+        elif [[ -n $SERVICE_CURRENT ]]; then SERVICE_NOTE="left unchanged: it runs $SERVICE_CURRENT, not this installation"
+        else SERVICE_NOTE='not installed'; fi
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || fail 'the system installation includes the system service and needs systemd (systemctl); for a per-user installation use --local'
+    [[ -f "$SERVICE_SCRIPT" && ! -L "$SERVICE_SCRIPT" ]] || fail "missing $SERVICE_SCRIPT"
+    # One system service per machine: never take over another installation's one silently.
+    [[ -z $SERVICE_CURRENT || $SERVICE_CURRENT == "$agent" ]] || fail "the system service belongs to another BaradWatchU installation ($SERVICE_CURRENT); uninstall that installation first (or remove its service: sudo $SERVICE_SCRIPT --uninstall). Nothing was changed."
+    SERVICE_ACTION=install
+    if [[ -n $SERVICE_CURRENT ]]; then SERVICE_NOTE='updated: stopped before the files change, restarted on the new executable (checked)'
+    else SERVICE_NOTE='installed: systemd unit baradwatchu-agent.service, root, started now and at boot'; fi
+    SERVICE_NOTE+='; remote listener stays off until service.json is written'
+}
+# Before files change: stop this installation's service so nothing keeps running the old file.
+service_before_files() {
+    [[ $SERVICE_ACTION != none && $SERVICE_CURRENT == "$PREFIX/bin/$BIN" ]] || return 0
+    bash "$SERVICE_SCRIPT" --stop --agent="$PREFIX/bin/$BIN" || fail 'could not stop the system service; nothing was changed'
+    SERVICE_STOPPED=1
+}
+service_after_files() {
+    local agent="$PREFIX/bin/$BIN"
+    case $SERVICE_ACTION in
+        install)
+            SERVICE_PHASE=1
+            if ! bash "$SERVICE_SCRIPT" --agent="$agent"; then
+                bash "$SERVICE_SCRIPT" --stop --agent="$agent" >/dev/null 2>&1 || true
+                fail "BaradWatchU Client $VERSION files are installed, but the system service could not be installed or started (see above); it is stopped, so no old executable is running. Fix the cause, then run: $ROOT/install.sh --no-build --build-dir='$BUILD_DIR'"
+            fi ;;
+        remove)
+            SERVICE_PHASE=1
+            bash "$SERVICE_SCRIPT" --uninstall --agent="$agent" || fail "could not remove the system service; run: sudo $SERVICE_SCRIPT --uninstall" ;;
+    esac
+    SERVICE_STOPPED=0
+}
+# EXIT trap: the installation failed after stopping the service and before touching it again.
+restore_service() {
+    ((SERVICE_STOPPED && ! SERVICE_PHASE && SERVICE_ACTIVE)) || return 0
+    SERVICE_STOPPED=0
+    echo "Installation interrupted: restarting the system service on the files in place ..." >&2
+    bash "$SERVICE_SCRIPT" --start --agent="$PREFIX/bin/$BIN" >&2 || echo "Warning: the system service is stopped; start it with: sudo systemctl start baradwatchu-agent.service" >&2
+}
 manifest="$PREFIX/share/baradwatchu-source/$BIN.manifest"
 load_manifest() {
     local line k h p
@@ -570,14 +656,18 @@ uninstall() {
         o=$(owner "$path"); [[ -z "$o" ]] || fail "package manager owns $path ($o)"
         if [[ -e "$path" || -L "$path" ]]; then hash_ok "$path" "$h" || fail "changed file preserved: $path"; fi
     done < <(tail -n +5 "$manifest")
-    ((DRY)) || stop_running_instances
+    if ((DRY)); then
+        [[ $SERVICE_ACTION != remove ]] || echo "Would stop and remove the system service of $PREFIX/bin/$BIN"
+    else
+        service_before_files; stop_running_instances; service_after_files
+    fi
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue; IFS=$'\t' read -r k h p <<< "$line"; path="$PREFIX/$p"
         parent=$(canonical "$(dirname -- "$path")"); [[ "$parent" == "$PREFIX"/* ]] || fail "manifest path escapes prefix: $path"
         o=$(owner "$path"); [[ -z "$o" ]] || fail "package manager owns $path ($o)"
         if [[ -e "$path" || -L "$path" ]]; then hash_ok "$path" "$h" || fail "changed file preserved: $path"; if ((DRY)); then echo "Would remove $path"; else unlink -- "$path"; fi; ((count+=1)); fi
     done < <(tail -n +5 "$manifest")
-    if ((DRY)); then echo "Would remove $manifest"; else unlink -- "$manifest"; echo 'Manifest removed; configuration and user data preserved.'; fi
+    if ((DRY)); then echo "Would remove $manifest"; else unlink -- "$manifest"; echo 'Manifest removed; configuration, identities, trust stores, history and service registrations preserved.'; fi
     echo "Uninstall complete; $count files processed. Empty directories remain."
 }
 install_source() {
@@ -635,7 +725,9 @@ install_source() {
     safe_parent "$(dirname -- "$manifest")"
     manifest_owner=$(owner "$manifest"); [[ -z "$manifest_owner" ]] || fail "package manager owns source manifest path ($manifest_owner)"
     echo "Staged ${#files[@]} files before modifying $PREFIX."
-    # Last step before any file changes: close this installation's running agent.
+    # Last steps before any file changes: stop this installation's system service, then close
+    # its running agent, tray and remote links.
+    service_before_files
     stop_running_instances
     for i in "${!files[@]}"; do
         rel=${rels[$i]}; dest="$PREFIX/$rel"; mkdir -p -- "$(dirname -- "$dest")"
@@ -650,7 +742,8 @@ install_source() {
     { printf 'BaradWatchU source manifest v1\nclient\n%s\n%s\n' "$PREFIX" "$VERSION"; cat "$STAGE_DIR/manifest-entries"; } > "$STAGE_DIR/final-manifest"
     if ! install -m 0644 "$STAGE_DIR/final-manifest" "$tmp"; then unlink -- "$tmp"; fail 'could not stage source manifest'; fi
     if ! mv -f -- "$tmp" "$manifest"; then unlink -- "$tmp"; fail 'could not replace source manifest'; fi
-    echo "Installed BaradWatchU Client $VERSION. No packages/services were changed; configuration and user data were preserved."
+    echo "Installed BaradWatchU Client $VERSION. No package was changed; configuration, identities, trust stores and history were preserved."
+    service_after_files
     ((REEXEC)) || post_install_user
 }
 
@@ -680,6 +773,9 @@ PREFIX=$(canonical "$PREFIX"); BUILD_DIR=$(canonical "$BUILD_DIR")
 [[ "$PREFIX" != / ]] || badarg '--prefix resolves to /; choose a dedicated prefix'
 case "$BUILD_DIR/" in "$ROOT/"*) badarg '--build-dir must be outside source tree';; esac
 manifest="$PREFIX/share/baradwatchu-source/$BIN.manifest"
+if [[ -e "$manifest" || -L "$manifest" ]]; then FRESH=0; else FRESH=1; fi
+if ((LOCAL)) || { ((EUID != 0)) && prefix_writable; }; then SYSTEM_INSTALL=0; fi
+((BUILD_ONLY)) || plan_service
 ((REEXEC)) || print_options
 if ((BUILD_ONLY)); then build; echo "Build-only complete; validated cache at $BUILD_DIR. No prefix files or services changed."; exit 0; fi
 if ((UNINSTALL && DRY == 0)) && ! prefix_writable; then

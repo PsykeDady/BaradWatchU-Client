@@ -59,7 +59,12 @@ Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [OPTION
                      installing (with -OutputDir DIR, default BUILDDIR\dist)
 Everything runs as the current user: files go to a per-user folder and Start
 menu entries to the user's Start menu. No service, scheduled task or system
-setting is changed; settings, custom checks and history are never touched.
+setting is changed; settings, identities, trust stores, custom checks and
+history are never touched. This is the per-user installation mode: local
+audits, dashboard, tray, identity and reports work; there is no system service
+and no remote communication. The complete system installation (with the
+service for remote audit requests) is the setup built with -Package, run as an
+administrator for all users (its default; see the README).
 Before files are replaced or removed, a running baradwatchu-agent or
 baradwatchu-tray of the same installation (matched by executable path, e.g. an
 open dashboard) is asked to close (Ctrl+C / close request) and gets up to

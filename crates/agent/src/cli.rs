@@ -41,6 +41,10 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
         Some("events") => Some(crate::events::run_events(&args[1..])),
         Some("history") => Some(crate::history::run(&args[1..])),
         Some("report-theme") => Some(crate::pdf::run_theme(&args[1..])),
+        Some("identity") => Some(crate::identity::run_identity(&args[1..])),
+        Some("trust") => Some(crate::identity::run_trust(&args[1..])),
+        Some("remote") => Some(crate::remote::run(&args[1..])),
+        Some("service") => Some(crate::service::run(&args[1..])),
         _ => None,
     };
     routed

@@ -1,8 +1,10 @@
-//! Local model of consent requests for a future remote report request.
+//! Local model of consent requests.
 //!
-//! M7 scope: requests can only be *simulated* locally (`source = LOCAL_SIMULATION`); there
-//! is no remote channel, account authentication or cryptographic contract yet. Rules that
-//! later milestones must keep:
+//! Sources: `LOCAL_SIMULATION` (M7, nothing is sent anywhere) and, from Milestone 2,
+//! `REMOTE_SERVER`: an audit request from a Server authenticated by mutual TLS and present
+//! in the trust store (`remote.rs`). For remote requests `serverId` is the derived
+//! `SRV-…` ID, `accountName` the name the user gave the Server at import time, `accountId`
+//! its key fingerprint and `declaredDevice` this Client's Device ID. Rules:
 //! - consent refers to one identified request (`requestId`) and is never a standing grant;
 //! - only an explicit Accept authorizes; Reject, timeout, a closed window or a notification
 //!   that was merely shown never authorize anything;
@@ -31,11 +33,13 @@ pub enum ConsentOperation {
     AuditReport,
 }
 
-/// Where the request came from. A future `REMOTE_SERVER` variant must carry verified identity.
+/// Where the request came from. `RemoteServer` is only created by the user agent for a
+/// Server whose key it verified against its own trust store.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ConsentSource {
     LocalSimulation,
+    RemoteServer,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,6 +70,8 @@ pub struct ConsentRequest {
     pub declared_device: String,
     pub operation: ConsentOperation,
     pub source: ConsentSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<crate::remote::Requester>,
     pub created_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub state: ConsentState,
@@ -145,8 +151,33 @@ pub fn prompt(request: &ConsentRequest) -> String {
         text.push_str(baradwatchu_messages::message("consent.simulated", language));
         text.push_str("\n\n");
     }
+    let template = if request.source == ConsentSource::RemoteServer {
+        if request.requester.is_some() {
+            "consent.prompt_remote_operator"
+        } else {
+            "consent.prompt_remote"
+        }
+    } else {
+        "consent.prompt"
+    };
     text.push_str(
-        &baradwatchu_messages::message("consent.prompt", language)
+        &baradwatchu_messages::message(template, language)
+            .replace(
+                "{operator}",
+                request
+                    .requester
+                    .as_ref()
+                    .map(|r| r.operator_display_name.as_str())
+                    .unwrap_or(""),
+            )
+            .replace(
+                "{server_name}",
+                request
+                    .requester
+                    .as_ref()
+                    .and_then(|r| r.server_display_name.as_deref())
+                    .unwrap_or(&request.account_name),
+            )
             .replace("{server}", &request.server_id)
             .replace("{account}", &request.account_name)
             .replace("{account_id}", &request.account_id)
@@ -316,6 +347,7 @@ pub fn create_simulated(params: SimulationParams) -> Result<ConsentView, CliErro
         declared_device: clean_text("Dispositivo", &params.declared_device)?,
         operation: ConsentOperation::AuditReport,
         source: ConsentSource::LocalSimulation,
+        requester: None,
         created_at_unix_ms: now,
         expires_at_unix_ms: now + params.ttl_seconds * 1000,
         state: ConsentState::Pending,
@@ -370,6 +402,100 @@ pub fn decide(id: &str, accept: bool, via: DecisionChannel) -> Result<ConsentVie
     })?;
     let _ = events::append_event(close_event(&request));
     Ok(view(request, req::now_ms()))
+}
+
+/// Expires every pending request (identity reset): no request presented before the reset
+/// can still be accepted. Returns how many requests were closed.
+pub(crate) fn expire_pending() -> Result<usize, CliError> {
+    expire_where(|_| true)
+}
+
+/// Revocation (`Some(server ID)`) or `trust clear` (`None`): pending remote requests of
+/// the affected Servers can no longer be accepted.
+pub(crate) fn expire_remote_pending(server_id: Option<&str>) -> Result<usize, CliError> {
+    expire_where(|request| {
+        request.source == ConsentSource::RemoteServer
+            && server_id.map_or(true, |id| request.server_id.eq_ignore_ascii_case(id))
+    })
+}
+
+/// Withdraws one pending request (remote request abandoned: service gone, Server revoked).
+pub(crate) fn expire_request(id: &str) -> Result<usize, CliError> {
+    expire_where(|request| request.request_id == id)
+}
+
+/// Current state of one request (overdue requests are expired first). None if unknown.
+pub(crate) fn state_of(id: &str) -> Result<Option<ConsentState>, CliError> {
+    locked(|dir| {
+        Ok(load_all(dir)?
+            .into_iter()
+            .find(|request| request.request_id == id)
+            .map(|request| request.state))
+    })
+}
+
+/// Milestone 2: consent request for an audit asked by a verified, trusted Server. The
+/// 120-second timer starts now, when the request becomes visible to the user.
+pub(crate) fn create_remote(
+    server: &crate::identity::TrustedServer,
+    device_id: &str,
+    requester: Option<&crate::remote::Requester>,
+) -> Result<ConsentView, CliError> {
+    if requester.is_some_and(|r| !r.valid()) {
+        return Err(CliError("Invalid requester metadata".into()));
+    }
+    let language = baradwatchu_messages::configured_language();
+    let now = req::now_ms();
+    let request = ConsentRequest {
+        schema_version: SCHEMA.into(),
+        request_id: random_hex(16)?,
+        server_id: clean_text("Server", &server.server_id)?,
+        account_name: clean_text("Server", &server.name)?,
+        account_id: clean_text("Fingerprint", &server.fingerprint)?,
+        declared_device: clean_text("Device", device_id)?,
+        operation: ConsentOperation::AuditReport,
+        source: ConsentSource::RemoteServer,
+        requester: requester.cloned(),
+        created_at_unix_ms: now,
+        expires_at_unix_ms: now + DEFAULT_TTL_SECONDS * 1000,
+        state: ConsentState::Pending,
+        decided_at_unix_ms: None,
+        decided_via: None,
+    };
+    locked(|dir| save(dir, &request))?;
+    let _ = events::append_event(NewEvent {
+        kind: EventKind::ConsentRequested,
+        severity: Severity::Action,
+        title: baradwatchu_messages::message("consent.remote_title", language).into(),
+        body: baradwatchu_messages::message("consent.remote_body", language)
+            .replace("{server}", &request.server_id)
+            .replace("{account}", &request.account_name)
+            .replace("{seconds}", &DEFAULT_TTL_SECONDS.to_string()),
+        audit_completed_at_unix_ms: None,
+        request_id: Some(request.request_id.clone()),
+        fingerprint: None,
+    });
+    Ok(view(request, now))
+}
+
+fn expire_where(matches: impl Fn(&ConsentRequest) -> bool) -> Result<usize, CliError> {
+    let closed = locked(|dir| {
+        let now = req::now_ms();
+        let mut closed = vec![];
+        for mut request in load_all(dir)? {
+            if request.state == ConsentState::Pending && matches(&request) {
+                request.state = ConsentState::Expired;
+                request.decided_at_unix_ms = Some(now);
+                save(dir, &request)?;
+                closed.push(request);
+            }
+        }
+        Ok(closed)
+    })?;
+    for request in &closed {
+        let _ = events::append_event(close_event(request));
+    }
+    Ok(closed.len())
 }
 
 pub(crate) fn dashboard_simulate(text: &str) -> Result<String, CliError> {
@@ -531,6 +657,55 @@ mod tests {
         let events = events::read_events().unwrap();
         assert_eq!(events.last().unwrap().kind, EventKind::ConsentRequested);
         assert_eq!(events.last().unwrap().severity, Severity::Action);
+    }
+
+    fn remote_server(id: &str) -> crate::identity::TrustedServer {
+        crate::identity::TrustedServer {
+            server_id: id.into(),
+            name: "Server Test".into(),
+            algorithm: "Ed25519".into(),
+            public_key: "AAAA".into(),
+            fingerprint: format!("SHA256:{}", "a".repeat(64)),
+            imported_at_unix_ms: 1,
+            status: crate::identity::TrustStatus::Trusted,
+            revoked_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn remote_requests_last_120_seconds_and_name_the_server() {
+        let _env = TestEnv::new("consent-remote");
+        let view = create_remote(&remote_server("SRV-AAAA-BBBB-CCCC-DDDD"), "BWU-1", None).unwrap();
+        let request = &view.request;
+        assert_eq!(request.source, ConsentSource::RemoteServer);
+        assert_eq!(
+            request.expires_at_unix_ms - request.created_at_unix_ms,
+            120_000
+        );
+        assert!(
+            view.prompt.contains("Server Test") && view.prompt.contains("SRV-AAAA-BBBB-CCCC-DDDD")
+        );
+        assert!(view.prompt.contains(&"a".repeat(64)) && !view.prompt.contains("SIMULAZIONE"));
+        // Revoking another Server leaves it; revoking this one withdraws it.
+        assert_eq!(expire_remote_pending(Some("SRV-OTHER")).unwrap(), 0);
+        let simulated = simulate(60);
+        assert_eq!(
+            expire_remote_pending(Some("srv-aaaa-bbbb-cccc-dddd")).unwrap(),
+            1
+        );
+        assert_eq!(
+            state_of(&request.request_id).unwrap(),
+            Some(ConsentState::Expired)
+        );
+        assert!(decide(&request.request_id, true, DecisionChannel::ConsentWindow).is_err());
+        // Simulations are not remote requests.
+        assert_eq!(expire_remote_pending(None).unwrap(), 0);
+        assert_eq!(
+            state_of(&simulated.request.request_id).unwrap(),
+            Some(ConsentState::Pending)
+        );
+        assert_eq!(expire_request(&simulated.request.request_id).unwrap(), 1);
+        assert_eq!(state_of("0".repeat(32).as_str()).unwrap(), None);
     }
 
     #[test]

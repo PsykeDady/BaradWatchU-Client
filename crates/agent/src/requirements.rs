@@ -363,9 +363,26 @@ pub struct ResultRecord {
     pub provenance: Option<ControlProvenance>,
 }
 
+/// Missing in historical reports: leave unknown instead of inventing an origin.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "origin", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuditInitiator {
+    Local,
+    #[serde(rename_all = "camelCase")]
+    Remote {
+        operator_display_name: Option<String>,
+        server_id: String,
+        server_display_name: String,
+        server_trusted_name: String,
+        server_fingerprint: String,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiator: Option<AuditInitiator>,
     pub schema_version: String,
     pub completed_at_unix_ms: u64,
     pub results: Vec<ResultRecord>,
@@ -3786,6 +3803,7 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
         }
         [command, options @ ..] if command == "audit" => {
             let (json, notify, include_log) = parse_audit_options(options)?;
+            let _exclusive = crate::events::audit_lock()?;
             run_audit(&catalog, &settings, json, notify, include_log)
         }
         [command] if command == "status" => match load_last_audit()? {
@@ -3902,6 +3920,7 @@ fn run_check(
     };
     attach_provenance(&mut result, requirement);
     let mut report = AuditReport {
+        initiator: Some(AuditInitiator::Local),
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results: vec![result.clone()],
@@ -3938,6 +3957,24 @@ fn run_audit(
     json: bool,
     notify: bool,
     include_log: bool,
+) -> Result<CliOutput, CliError> {
+    run_audit_with_initiator(
+        catalog,
+        settings,
+        json,
+        notify,
+        include_log,
+        AuditInitiator::Local,
+    )
+}
+
+fn run_audit_with_initiator(
+    catalog: &Catalog,
+    settings: &Settings,
+    json: bool,
+    notify: bool,
+    include_log: bool,
+    initiator: AuditInitiator,
 ) -> Result<CliOutput, CliError> {
     let mut results = Vec::with_capacity(catalog.requirements.len());
     let mut disabled_requirements = Vec::new();
@@ -3983,6 +4020,7 @@ fn run_audit(
         results.push(result);
     }
     let mut report = AuditReport {
+        initiator: Some(initiator),
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results,
@@ -4287,6 +4325,19 @@ pub(crate) fn update_dashboard_settings(text: &str) -> Result<String, CliError> 
 }
 
 pub(crate) fn dashboard_audit_json() -> Result<String, CliError> {
+    let _exclusive = crate::events::audit_lock()?;
+    unlocked_audit_json()
+}
+
+/// Full audit as JSON, recorded in history and events like any audit. The caller holds
+/// the audit lock (`events::audit_lock` / `try_audit_lock`).
+pub(crate) fn remote_audit_json(initiator: AuditInitiator) -> Result<String, CliError> {
+    let catalog = catalog()?;
+    let settings = load_settings(&catalog)?;
+    Ok(run_audit_with_initiator(&catalog, &settings, true, false, false, initiator)?.text)
+}
+
+pub(crate) fn unlocked_audit_json() -> Result<String, CliError> {
     let catalog = catalog()?;
     let settings = load_settings(&catalog)?;
     // Desktop notifications are owned by the tray companion (it reads the event log).
@@ -4330,6 +4381,7 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
     };
     attach_provenance(&mut result, requirement);
     let mut report = AuditReport {
+        initiator: Some(AuditInitiator::Local),
         schema_version: "baradwatchu.audit.v1".into(),
         completed_at_unix_ms: now_ms(),
         results: vec![result],
@@ -6151,6 +6203,7 @@ mod tests {
         let env = TestEnv::new("log-option");
         let directory = env.root.join("audits");
         let mut report = AuditReport {
+            initiator: Some(AuditInitiator::Local),
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: now_ms(),
             results: vec![],
@@ -6238,6 +6291,7 @@ mod tests {
         fs::create_dir_all(&reports).unwrap();
         for (stamp, status) in [(100, ResultStatus::Pass), (200, ResultStatus::Warn)] {
             let report = AuditReport {
+                initiator: Some(AuditInitiator::Local),
                 schema_version: "baradwatchu.audit.v1".into(),
                 completed_at_unix_ms: stamp,
                 results: vec![ResultRecord {

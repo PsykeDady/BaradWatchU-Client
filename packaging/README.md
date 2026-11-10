@@ -10,7 +10,7 @@ Status: package channels remain planning only. The source installer was exercise
 
 | Channel | Planned payload / ownership | Configuration and data | Service / privileges |
 |---|---|---|---|
-| Source | `bin/baradwatchu-agent`, `bin/baradwatchu-tray` (unless `--without-tray`), `share/applications/baradwatchu-tray.desktop`, `share/baradwatchu-client/web`; source manifest owns only unchanged listed files | Preserve `/etc/baradwatchu/client`, `/var/lib/baradwatchu/client` and custom-check data; source installer creates none | No service/helper yet. User-local install is development-only and offers no system auditing |
+| Source | `bin/baradwatchu-agent`, `bin/baradwatchu-tray` (unless `--without-tray`), `share/applications/baradwatchu-tray.desktop`, `share/baradwatchu-client/web`; source manifest owns only unchanged listed files | Preserve user identities, trust stores, settings, history and `/var/lib/baradwatchu` (service registrations); source installer creates none | System mode (root-owned prefix): systemd unit `baradwatchu-agent.service` always installed/updated by `install.sh` through `packaging/service/install-service.sh` in the sudo step; uninstall removes it. Per-user mode (`--local` or user-writable prefix): no service, no remote communication; local features complete |
 | Arch `pacman` | `/usr/bin/baradwatchu-agent`, `/usr/share/baradwatchu-client/web`; PKGBUILD/pacman owns files | `/etc/baradwatchu/client`, `/var/lib/baradwatchu/client`; preserve enrollment identity and audit data | Future systemd system service, installed/enabled only by explicit package/operator policy; no privileged helper in this checkpoint |
 | Debian/Ubuntu `.deb` | `/usr/bin`, `/usr/share/baradwatchu-client`; dpkg owns files | `/etc` conffiles and `/var/lib`; uninstall preserves device identity and audit history | Future unit; no implicit start/restart from package scripts |
 | Fedora `.rpm` | `/usr/bin`, `/usr/share/baradwatchu-client`; rpm owns files | `/etc` and `/var/lib`; preserve data on update/erase | Future unit; service state changes require explicit policy |
@@ -18,6 +18,8 @@ Status: package channels remain planning only. The source installer was exercise
 | macOS `.dmg` | Planned DMG containing a signed/notarized installer package and local viewer | `/Library/Application Support/BaradWatchU/Client`; preserve identity and audit data on uninstall | Admin-authorized `launchd` LaunchDaemon; Developer ID signing and notarization required; no helper until separately reviewed |
 
 The tray companion is a per-user desktop-session process, never a system service: packages may ship its binary and menu entry, but start at login stays a per-user choice (XDG autostart, `HKCU\…\Run`, per-user LaunchAgent). Its Windows/macOS code is compile-checked only.
+
+Current Windows setup (before the planned WiX bundle): `install.ps1 -Package` compiles `packaging/windows/baradwatchu-client.iss` (Inno Setup 6); all users by default (system mode: administrator, Program Files, Windows service always installed through `packaging/service/install-service.ps1`) or only for me (per-user mode, no service) (stop before files, verified restart, removal on uninstall, data kept). Not compiled or run on Windows yet. macOS has no Client installer: `packaging/service/install-service.sh` is run by hand there.
 
 Package-manager installs must refuse source-installer overwrite/uninstall. Source uninstall uses its own hash manifest and leaves config/data. Windows/macOS installers must remove only package-owned files and preserve machine identity by default.
 
