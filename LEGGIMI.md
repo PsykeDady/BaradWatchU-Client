@@ -298,6 +298,8 @@ I nuovi audit JSON, cronologia, dashboard locale e PDF distinguono `LOCAL` e `RE
 con nome del richiedente e riferimento al Server per gli audit remoti. I report storici
 privi di attribuzione restano leggibili senza inventare un'origine.
 
+L’intestazione PDF indica `CLIENT · REMOTE AUDIT` per i risultati remoti, `CLIENT · LOCAL AUDIT` per quelli locali e `CLIENT · ORIGIN UNKNOWN` per i report storici senza origine.
+
 Aggiornare sia il servizio Client sia l'agente utente prima di collegare il Server MVP:
 i vecchi lettori strict del protocollo v1 rifiutano il campo opzionale `requester`; quelli
 aggiornati accettano ancora richieste precedenti senza metadati. Il consenso rimane di

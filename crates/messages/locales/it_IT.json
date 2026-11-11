@@ -17,6 +17,8 @@
     "pdf.execution_summary": "RIASSUNTO ESECUZIONE",
     "pdf.report_title": "REPORT DI SICUREZZA",
     "pdf.report_subtitle": "CLIENT  ·  AUDIT LOCALE",
+    "pdf.report_subtitle_remote": "CLIENT  ·  AUDIT REMOTO",
+    "pdf.report_subtitle_unknown": "CLIENT  ·  ORIGINE SCONOSCIUTA",
     "pdf.disabled_heading": "REQUISITI DISABILITATI",
     "pdf.empty_report": "Nessun requisito presente nel report.",
     "pdf.disabled_count": "DISABILITATI / N.A.",

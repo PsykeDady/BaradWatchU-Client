@@ -298,6 +298,8 @@ New audit JSON/history, the local dashboard and PDF distinguish `LOCAL` and `REM
 with the requester name and Server reference for remote audits. Historical reports that
 lack attribution remain readable without inventing an origin.
 
+The PDF header labels remote results `CLIENT · REMOTE AUDIT`, local results `CLIENT · LOCAL AUDIT`, and legacy reports without origin `CLIENT · ORIGIN UNKNOWN`.
+
 Upgrade both the Client service and user agent before connecting the Server MVP: old
 strict protocol-v1 readers reject the optional `requester` field; upgraded readers still
 accept legacy requests without it. Consent remains 120 seconds; completed remote results

@@ -779,6 +779,14 @@ fn render_pdf(
 }
 
 #[allow(clippy::too_many_arguments)] // Renderer state is explicit to keep PDF output deterministic.
+fn report_subtitle_key(report: &AuditReport) -> &'static str {
+    match &report.initiator {
+        Some(req::AuditInitiator::Local) => "pdf.report_subtitle",
+        Some(req::AuditInitiator::Remote { .. }) => "pdf.report_subtitle_remote",
+        None => "pdf.report_subtitle_unknown",
+    }
+}
+
 fn draw_header(
     ops: &mut Vec<String>,
     cursor: &mut f32,
@@ -833,7 +841,7 @@ fn draw_header(
                 true,
                 [166, 60, 22],
                 baradwatchu_messages::message(
-                    "pdf.report_subtitle",
+                    report_subtitle_key(report),
                     baradwatchu_messages::configured_language(),
                 ),
             ));
@@ -2118,6 +2126,16 @@ fn stream_object(dictionary: &str, data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pdf_subtitle_identifies_remote_local_and_legacy_origin() {
+        let mut report: AuditReport = serde_json::from_value(serde_json::json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1,"results":[]})).unwrap();
+        assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle_unknown");
+        report.initiator=Some(req::AuditInitiator::Local);
+        assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle");
+        report.initiator=Some(req::AuditInitiator::Remote{operator_display_name:Some("Mario Rossi".into()),server_id:"SRV-1".into(),server_display_name:"Server".into(),server_trusted_name:"Trusted".into(),server_fingerprint:"SHA256:test".into()});
+        assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle_remote");
+    }
 
     #[test]
     fn badges_fit_font_advances_and_do_not_inherit_wordmark_tracking() {
