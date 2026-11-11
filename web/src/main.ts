@@ -210,6 +210,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <div><p class="eyebrow">{{ t('ui.custom.eyebrow') }}</p><h1>{{ t('ui.nav.custom') }}</h1><p class="intro-copy">{{ t('ui.custom.intro') }}</p></div>
           <div class="intro-actions">
             <button class="button secondary" type="button" (click)="forceRefreshChecks()" [disabled]="busy || saving">{{ t('ui.custom.rescan') }}</button>
+            <label class="button secondary file-button">{{ t('ui.custom.import_package') }}<input type="file" accept="application/json,.json" (change)="selectImportPackage($event)" [disabled]="saving || busy"></label>
             <button class="button primary" type="button" (click)="openForm()" [disabled]="showForm">{{ t('ui.custom.new') }}</button>
           </div>
         </section>
@@ -736,6 +737,50 @@ class AppComponent implements OnInit {
   upper(event: Event): string { return this.inputValue(event).toUpperCase(); }
   formatSize(bytes: number): string { return bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KiB`; }
   selectImportFile(event: Event): void { this.importFile = (event.target as HTMLInputElement).files?.[0] ?? null; }
+
+  async selectImportPackage(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      if (file.size > 2 * 1024 * 1024) throw new Error(this.t('ui.custom.package_too_large'));
+      const value: unknown = JSON.parse(await file.text());
+      if (!value || typeof value !== 'object') throw new Error(this.t('ui.custom.package_invalid'));
+      const check = value as Record<string, unknown>;
+      const id = check['id'];
+      const name = check['name'];
+      const description = check['description'];
+      const priority = check['priority'];
+      const fileName = check['fileName'];
+      const fileBase64 = check['fileBase64'];
+      const args = check['arguments'];
+      if (typeof id !== 'string' || typeof name !== 'string' || typeof description !== 'string'
+          || typeof priority !== 'string' || typeof fileName !== 'string' || typeof fileBase64 !== 'string'
+          || !Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) {
+        throw new Error(this.t('ui.custom.package_invalid'));
+      }
+      if (!PRIORITIES.includes(priority as Priority)) throw new Error(this.t('ui.custom.package_invalid'));
+      const binary = atob(fileBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      this.form = {
+        id,
+        name,
+        description,
+        priority: priority as Priority,
+        timeout: typeof check['timeoutSeconds'] === 'number' ? String(check['timeoutSeconds']) : '',
+        arguments: JSON.stringify(args),
+        cloneFrom: typeof check['cloneFrom'] === 'string' ? check['cloneFrom'] : '',
+        overrideBuiltinId: typeof check['overrideBuiltinId'] === 'string' ? check['overrideBuiltinId'] : ''
+      };
+      this.importFile = new File([bytes], fileName, { type: 'application/octet-stream' });
+      this.showForm = true;
+      this.message = this.t('ui.custom.package_loaded');
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : this.t('ui.custom.package_invalid');
+    }
+  }
 
   openForm(): void { this.form = this.emptyForm(); this.form.id = this.nextCustomId(); this.importFile = null; this.showForm = true; }
   closeForm(): void { this.showForm = false; this.importFile = null; }
