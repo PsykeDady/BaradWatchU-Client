@@ -2,7 +2,7 @@
 # BaradWatchU system service (Milestone 2) on Linux (systemd) and macOS (launchd).
 # Internal component: install.sh calls it during installation, update and uninstall (in
 # the step that already runs as root); it can also be run by hand. It installs nothing but
-# the service definition. It never generates keys, never enables the remote listener,
+# the service definition. It never generates keys, starts a Server connection,
 # never changes firewall rules and never removes registrations or user data.
 set -euo pipefail
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
@@ -35,8 +35,8 @@ Normally run by install.sh: every system installation, update and uninstall incl
   --status      Print "absent" or "installed PATH active|inactive" (no root needed).
   --dry-run     Print the plan only.
 
-The remote listener stays disabled until the operator writes service.json (see the
-README, "Remote audit requests"). Firewall rules are left to the operator/IT.
+Each user enables remote requests and starts trusted Server connections from the
+Client dashboard. Firewall rules are left to the operator/IT.
 EOF
 }
 
@@ -201,7 +201,7 @@ echo "  agent:    $AGENT"
 [[ -z $current || $current == "$AGENT" ]] || echo "  replaces: service that ran $current"
 if [[ $OS == linux ]]; then
     echo "  unit:     $UNIT (enabled at boot, restarted on failure)"
-    echo "  data:     /var/lib/baradwatchu (listener off until service.json is written)"
+    echo "  data:     /var/lib/baradwatchu (user connections start only when enabled)"
     rendered=$(sed "s#@AGENT@#$AGENT#" "$HERE/baradwatchu-agent.service")
     if ((DRY_RUN)); then echo "  would write $UNIT"; else
         tmp=$(mktemp "$UNIT.XXXXXX")
@@ -227,4 +227,4 @@ else
     run launchctl bootstrap system "$PLIST"
 fi
 verify_running "$AGENT"
-echo "Service ready. Remote listener: off until service.json is written. Each user enables remote requests with: baradwatchu-agent remote enable (after identity generate)"
+echo "Service ready. Each user enables remote requests and starts trusted Server connections from the Client dashboard (after identity generate)."

@@ -1,14 +1,13 @@
 //! Milestone 2: remote audit requests from trusted BaradWatchU Servers.
 //!
 //! Architecture (README "Remote audit requests", `docs/remote-protocol.md`):
-//! - `service run` (service.rs) is the always-on system component: mTLS listener,
+//! - `service run` (service.rs) is the always-on system component: outbound mTLS tunnels,
 //!   availability, concurrency, request records. It never audits.
 //! - `remote link` (this file) is the per-user agent, started by the tray companion. It
 //!   asks the user through the existing consent flow and runs the existing audit engine.
 //! - `remote enable|disable|status` are the user's explicit controls.
 //!
-//! The protocol types and TLS helpers below are public so that the future Server (and the
-//! test harness that stands in for it) uses exactly the same contract.
+//! The protocol types and TLS helpers are shared with the outbound service connection.
 use crate::consent::{self, ConsentState};
 use crate::events;
 use crate::identity::{self, IdentityStatus, ProtectionState};
@@ -216,12 +215,11 @@ pub mod tls {
         }
     }
 
-    /// Requester side (the Server, or the test harness): accepts exactly one Client key,
-    /// the one recorded when the Client's public identity was imported out of band.
+    /// Accepts exactly the Server key imported out of band by this user.
     #[derive(Debug)]
-    struct PinnedClientKey([u8; 32]);
+    struct PinnedServerKey([u8; 32]);
 
-    impl ServerCertVerifier for PinnedClientKey {
+    impl ServerCertVerifier for PinnedServerKey {
         fn verify_server_cert(
             &self,
             end_entity: &CertificateDer<'_>,
@@ -266,17 +264,17 @@ pub mod tls {
         }
     }
 
-    /// TLS configuration for a requester holding `requester_key` that talks to the Client
-    /// whose public key is `client_public_key`. Connect with server name = Device ID.
+    /// TLS configuration for the Client identity connecting to a trusted Server.
+    /// Connect with server name = Server ID; the imported key is pinned.
     pub fn requester_config(
         requester_key: ed25519_dalek::SigningKey,
-        client_public_key: [u8; 32],
+        server_public_key: [u8; 32],
     ) -> Result<Arc<rustls::ClientConfig>, Error> {
         let certified = Arc::new(Ed25519Key::new(requester_key).certified());
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedClientKey(client_public_key)))
+            .with_custom_certificate_verifier(Arc::new(PinnedServerKey(server_public_key)))
             .with_client_cert_resolver(Arc::new(
                 rustls::client::AlwaysResolvesClientRawPublicKeys::new(certified),
             ));
@@ -315,11 +313,15 @@ fn update(
         protocol,
         intent,
         identity_dir: None,
+        client_name: None,
         job_id: Some(job_id.into()),
         state: Some(state),
         consent_expires_at_unix_ms: expires,
         reason: reason.map(str::to_owned),
         result,
+        server_id: None,
+        endpoint: None,
+        action: None,
     };
     matches!(ipc::call(&message), Ok(ToAgent::Reply { ok: true, .. }))
 }
@@ -589,14 +591,14 @@ fn yes_no(value: bool) -> String {
 fn status_text(status: &RemoteStatus) -> String {
     let unknown = msg("remote.unknown");
     let service = status.service.as_ref();
-    let listener = match service {
-        Some(s) if s.listener_running => msg("remote.listener.running")
-            .replace("{address}", s.listener_address.as_deref().unwrap_or("")),
-        Some(s) if s.listener_configured => msg("remote.listener.failed")
-            .replace("{error}", s.listener_error.as_deref().unwrap_or("")),
-        Some(_) => msg("remote.listener.disabled"),
-        None => unknown.clone(),
-    };
+    let connected = service.map_or(unknown.clone(), |service| {
+        service
+            .connections
+            .iter()
+            .filter(|connection| connection.connected)
+            .count()
+            .to_string()
+    });
     let registered = match service {
         Some(s) if s.registered => match &s.registration_problem {
             Some(problem) => msg("remote.registered.stale").replace(
@@ -618,7 +620,7 @@ fn status_text(status: &RemoteStatus) -> String {
             &status.service_installed.map_or(unknown.clone(), yes_no),
         )
         .replace("{running}", &yes_no(status.service_running))
-        .replace("{listener}", &listener)
+        .replace("{connections}", &connected)
         .replace(
             "{identity}",
             &status
@@ -681,11 +683,18 @@ fn enable() -> Result<CliOutput, CliError> {
         protocol,
         intent,
         identity_dir: Some(dir.to_string_lossy().into_owned()),
+        client_name: view
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.name.clone()),
         job_id: None,
         state: None,
         consent_expires_at_unix_ms: None,
         reason: None,
         result: None,
+        server_id: None,
+        endpoint: None,
+        action: None,
     }))?;
     Ok(CliOutput {
         text: msg("remote.enabled").replace(
@@ -724,6 +733,37 @@ pub(crate) fn dashboard_set_registration(text: &str) -> Result<String, CliError>
         disable()?;
     }
     crate::requirements::output_json(&status())
+}
+
+/// Changes only the connection belonging to this authenticated local user.
+pub(crate) fn dashboard_connection(text: &str) -> Result<String, CliError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Change {
+        server_id: String,
+        action: String,
+        endpoint: Option<String>,
+    }
+    let change: Change = serde_json::from_str(text)
+        .map_err(|_| CliError("Invalid Server connection request".into()))?;
+    let ToService::Hello {
+        protocol, intent, ..
+    } = ToService::hello(Intent::Connection);
+    reply_result(ipc::call(&ToService::Hello {
+        protocol,
+        intent,
+        identity_dir: None,
+        client_name: None,
+        job_id: None,
+        state: None,
+        consent_expires_at_unix_ms: None,
+        reason: None,
+        result: None,
+        server_id: Some(change.server_id),
+        endpoint: change.endpoint,
+        action: Some(change.action),
+    }))?;
+    req::output_json(&status())
 }
 
 fn usage() -> String {

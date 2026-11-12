@@ -1,7 +1,7 @@
-# BaradWatchU Client system service (Milestone 2): mutual-TLS listener for remote audit
-# requests and local IPC endpoint for the per-user agents. It never audits by itself.
+# BaradWatchU Client system service (Milestone 2): outbound mutual-TLS connections
+# to trusted Servers and local IPC endpoint for the per-user agents. It never audits by itself.
 # Installed by packaging/service/install-service.sh (@AGENT@ is replaced there).
-# The remote listener stays off until the operator writes /var/lib/baradwatchu/service.json.
+# Each user enables their own Server connection from the Client dashboard.
 [Unit]
 Description=BaradWatchU Client service (remote audit requests)
 After=network-online.target
@@ -19,7 +19,7 @@ StateDirectoryMode=0700
 UMask=0077
 # Root only to read the owner-only identity files of users who registered; everything
 # else is taken away.
-CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

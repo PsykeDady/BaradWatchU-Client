@@ -6,7 +6,7 @@ import { APP_VERSION } from './app-version';
 type Priority = 'HIGHEST' | 'HIGH' | 'MEDIUM' | 'LOW' | 'OPTIONAL';
 type ResultStatus = 'PASS' | 'FAIL' | 'WARN' | 'ERROR' | 'DISABLED' | 'NOT_APPLICABLE';
 type Integrity = 'VERIFIED' | 'MISMATCH' | 'UNKNOWN';
-type View = 'overview' | 'custom' | 'notifications' | 'settings';
+type View = 'overview' | 'custom' | 'notifications' | 'connections' | 'settings';
 type StatusFilter = 'ALL' | 'FAIL' | 'WARN' | 'ERROR' | 'PASS' | 'PENDING';
 interface Provenance { toolId: string; toolVersion?: number; origin: 'BUILTIN' | 'CUSTOM'; toolPath?: string; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; integrityScope: string; isOverride: boolean; overrideBuiltinId?: string; builtinToolPath?: string; builtinExpectedSha256?: string; }
 interface Requirement { id: string; name: string; description: string; enabled: boolean; priority: Priority; parameters: Record<string, unknown>; arguments: string[]; timeoutSeconds: number; tools: Record<string, string>; configurationError?: string; origin: 'BUILTIN' | 'CUSTOM'; expectedSha256?: string; actualSha256?: string; integrityStatus: Integrity; replacesBuiltin?: string; customToolId?: string; customToolVersion?: number; configurationOverride?: boolean; }
@@ -30,7 +30,8 @@ interface NotificationPreferences { schemaVersion?: string; enabled: boolean; in
 interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
 interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
 interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
-interface RemoteStatus { serviceInstalled: boolean | null; serviceRunning: boolean; service?: { listenerConfigured: boolean; listenerAddress?: string; listenerRunning: boolean; listenerError?: string; registered: boolean; registeredDeviceId?: string; registrationProblem?: string; sessionLinked: boolean; requestInProgress: boolean }; identityConfigured: boolean; deviceId?: string; trustedServers: number; trayRunning: boolean | null; }
+interface ServerConnection { serverId: string; endpoint: string; enabled: boolean; connected: boolean; error?: string; }
+interface RemoteStatus { serviceInstalled: boolean | null; serviceRunning: boolean; service?: { registered: boolean; registeredDeviceId?: string; registrationProblem?: string; sessionLinked: boolean; requestInProgress: boolean; connections: ServerConnection[] }; identityConfigured: boolean; deviceId?: string; trustedServers: number; trayRunning: boolean | null; }
 interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; }
 interface TrustedServer { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; importedAtUnixMs: number; status: 'TRUSTED' | 'REVOKED'; revokedAtUnixMs?: number; }
 interface IdentityView { schemaVersion: string; status: 'NOT_CONFIGURED' | 'CONFIGURED' | 'DAMAGED'; identity?: PublicIdentity; problem?: string; protection?: { state: 'RESTRICTED' | 'TOO_OPEN' | 'NOT_VERIFIED'; detail?: string }; trust: { damaged: boolean; problem?: string; trusted: number; revoked: number; servers: TrustedServer[] }; directory: string; }
@@ -62,6 +63,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <button type="button" role="tab" class="tab" [class.active]="view === 'overview'" [attr.aria-selected]="view === 'overview'" (click)="go('overview')">{{ t('ui.nav.status') }}</button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'custom'" [attr.aria-selected]="view === 'custom'" (click)="go('custom')">{{ t('ui.nav.custom') }}<span class="tab-count" *ngIf="customs.length">{{ customs.length }}</span><span class="tab-alert" *ngIf="customProblems > 0" [attr.aria-label]="customProblems + ' ' + t('ui.alert.custom_issues')">!</span></button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'notifications'" [attr.aria-selected]="view === 'notifications'" (click)="go('notifications')">{{ t('ui.nav.notifications') }}<span class="tab-alert" *ngIf="pendingConsents > 0" [attr.aria-label]="pendingConsents + ' ' + t('ui.alert.pending_requests')">{{ pendingConsents }}</span></button>
+          <button type="button" role="tab" class="tab" [class.active]="view === 'connections'" [attr.aria-selected]="view === 'connections'" (click)="go('connections')">{{ t('ui.nav.connections') }}</button>
           <button type="button" role="tab" class="tab" [class.active]="view === 'settings'" [attr.aria-selected]="view === 'settings'" (click)="go('settings')">{{ t('ui.nav.settings') }}</button>
         </nav>
         <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? t('ui.audit.running') : t('ui.audit.run') }}</button>
@@ -329,6 +331,13 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
         </div>
       </ng-container>
 
+      <ng-container *ngIf="!loading && view === 'connections'">
+        <section class="intro"><div><p class="eyebrow">BaradWatchU</p><h1>{{ t('ui.nav.connections') }}</h1><p class="intro-copy">{{ t('ui.connections.intro') }}</p></div><button class="button secondary" type="button" (click)="loadConnections()">{{ t('ui.refresh') }}</button></section>
+        <section class="form-panel"><div class="form-head"><h2>{{ t('ui.connections.service') }}</h2></div><p>{{ t(remoteStatus?.service?.registered ? 'ui.remote.registered' : 'ui.remote.unregistered') }} · {{ t(remoteStatus?.service?.sessionLinked ? 'ui.remote.linked' : 'ui.remote.unlinked') }}</p><button class="button secondary small" type="button" [disabled]="saving || !remoteStatus?.serviceRunning || (!remoteStatus?.service?.registered && !remoteStatus?.identityConfigured)" (click)="setRemoteRegistration(!remoteStatus?.service?.registered)">{{ t(remoteStatus?.service?.registered ? 'ui.remote.disable' : 'ui.remote.enable') }}</button><p *ngIf="remoteError" class="problem">{{remoteError}}</p></section>
+        <section class="form-panel" *ngFor="let server of trustedConnectionServers"><div class="form-head"><h2>{{server.name}}</h2><span class="tag" [class.muted]="!serverConnection(server.serverId)?.connected">{{t(serverConnection(server.serverId)?.connected ? 'ui.connections.connected' : 'ui.connections.disconnected')}}</span></div><p><code>{{server.serverId}}</code></p><label class="wide">{{t('ui.connections.address')}}<input [value]="connectionAddress(server.serverId)" (input)="connectionDrafts[server.serverId]=inputValue($event)" placeholder="server.example.org:7445" [disabled]="saving"></label><p *ngIf="serverConnection(server.serverId)?.error" class="problem">{{serverConnection(server.serverId)?.error}}</p><div class="settings-row"><button class="button secondary small" type="button" (click)="changeConnection(server.serverId,'start')" [disabled]="saving || !remoteStatus?.service?.registered">{{t('ui.connections.start')}}</button><button class="button secondary small" type="button" (click)="changeConnection(server.serverId,'stop')" [disabled]="saving || !serverConnection(server.serverId)?.enabled">{{t('ui.connections.stop')}}</button><button class="button secondary small" type="button" (click)="changeConnection(server.serverId,'refresh')" [disabled]="saving || !remoteStatus?.service?.registered">{{t('ui.connections.repair')}}</button></div></section>
+        <p *ngIf="!trustedConnectionServers.length" class="empty-card">{{t('ui.connections.empty')}}</p><p *ngIf="connectionError" class="problem">{{connectionError}}</p>
+      </ng-container>
+
       <!-- ============================== IMPOSTAZIONI ============================== -->
       <ng-container *ngIf="!loading && view === 'settings'">
         <section class="intro">
@@ -359,28 +368,6 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             <div class="form-panel">
               <div class="form-head"><h2>{{ t('ui.settings.notifications') }}</h2></div>
               <p class="hint">{{ t('ui.settings.notifications_hint') }} <a href="#/notifiche" (click)="go('notifications', $event)">{{ t('ui.nav.notifications') }}</a>.</p>
-            </div>
-            <div class="form-panel">
-              <div class="form-head"><h2>{{ t('ui.remote.title') }}</h2><span class="tag" [class.muted]="!remoteStatus?.service?.listenerRunning">{{ t(remoteStatus?.service?.listenerRunning ? 'ui.remote.running' : 'ui.remote.stopped') }}</span></div>
-              <p class="hint">{{ t('ui.remote.intro') }}</p>
-              <button class="button secondary small" type="button" (click)="loadRemoteStatus()" [disabled]="saving">{{ t('ui.refresh') }}</button>
-              <dl class="facts" *ngIf="remoteStatus as remote">
-                <dt>{{ t('ui.remote.service') }}</dt><dd>{{ t(remote.serviceRunning ? 'ui.remote.running' : 'ui.remote.stopped') }}</dd>
-                <dt>{{ t('ui.remote.listener') }}</dt><dd>{{ t(remote.service?.listenerRunning ? 'ui.remote.running' : remote.service?.listenerConfigured ? 'ui.remote.failed' : 'ui.remote.unconfigured') }}</dd>
-                <dt>{{ t('ui.remote.address') }}</dt><dd><code>{{ remote.service?.listenerAddress || '—' }}</code></dd>
-                <dt>{{ t('ui.remote.registration') }}</dt><dd>{{ t(remote.service?.registered ? 'ui.remote.registered' : 'ui.remote.unregistered') }} <code *ngIf="remote.service?.registeredDeviceId">{{ remote.service?.registeredDeviceId }}</code></dd>
-                <dt>{{ t('ui.remote.session') }}</dt><dd>{{ t(remote.service?.sessionLinked ? 'ui.remote.linked' : 'ui.remote.unlinked') }}</dd>
-                <dt>{{ t('ui.remote.trust') }}</dt><dd>{{ remote.trustedServers }}</dd>
-              </dl>
-              <p class="problem" *ngIf="remoteStatus?.service?.listenerError">{{ remoteStatus?.service?.listenerError }}</p>
-              <p class="problem" *ngIf="remoteStatus?.service?.registrationProblem">{{ remoteStatus?.service?.registrationProblem }}</p>
-              <label class="wide">{{ t('ui.remote.listen_address') }}<input [value]="listenerAddressInput" (input)="listenerAddressInput=$any($event.target).value" placeholder="192.0.2.10:7443" [disabled]="saving || !!remoteStatus?.service?.listenerRunning"></label>
-              <div class="settings-row"><button class="button secondary small" type="button" [disabled]="saving || remoteStatus?.serviceInstalled === false" (click)="setListener(!remoteStatus?.service?.listenerRunning)">{{ t(remoteStatus?.service?.listenerRunning ? 'ui.remote.stop_listener' : 'ui.remote.start_listener') }}</button></div>
-              <p class="hint">{{ t('ui.remote.restart_note') }}</p>
-              <p class="problem" *ngIf="listenerError">{{ listenerError }}</p>
-              <div class="settings-row" *ngIf="remoteStatus as remote"><button class="button secondary small" type="button" [disabled]="saving || !remote.serviceRunning || (!remote.service?.registered && !remote.identityConfigured)" (click)="setRemoteRegistration(!remote.service?.registered)">{{ t(remote.service?.registered ? 'ui.remote.disable' : 'ui.remote.enable') }}</button></div>
-              <p class="problem" *ngIf="remoteError">{{ remoteError }}</p>
-              <p class="hint">{{ t('ui.remote.admin_note') }}</p>
             </div>
             <div class="form-panel" *ngIf="reportTheme as catalog">
               <div class="form-head"><h2>{{ t('ui.settings.pdf_theme') }}</h2></div>
@@ -521,6 +508,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
   styleUrl: './styles.css'
 })
 class AppComponent implements OnInit {
+  private connectionTimer: ReturnType<typeof setInterval> | undefined;
   readonly version = APP_VERSION;
   readonly priorities = PRIORITIES;
   get filterOptions(): { value: StatusFilter; label: string }[] { return [
@@ -557,9 +545,9 @@ class AppComponent implements OnInit {
   notifications: NotificationsView | null = null;
   configuration: ConfigurationView | null = null;
   remoteStatus: RemoteStatus | null = null;
+  connectionDrafts: Record<string,string> = {};
+  connectionError = '';
   remoteError = '';
-  listenerError = '';
-  listenerAddressInput = '';
   reportTheme: ReportThemeCatalog | null = null;
   identity: IdentityView | null = null;
   showPublicKey = false;
@@ -595,11 +583,12 @@ class AppComponent implements OnInit {
     }).sort((a, b) => this.visibleReport ? (SEVERITY[this.statusOf(a)] ?? 9) - (SEVERITY[this.statusOf(b)] ?? 9) : 0);
   }
 
-  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); }
+  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); this.connectionTimer = setInterval(() => { if (this.view === 'connections') void this.loadRemoteStatus().catch(() => undefined); }, 5000); }
+  ngOnDestroy(): void { clearInterval(this.connectionTimer); }
   @HostListener('window:hashchange') onHashChange(): void {
     const view = this.viewFromHash();
     // Links and back/forward reach Settings without go(): load its data the same way.
-    if (view === 'settings' && this.view !== 'settings') { this.go('settings'); return; }
+    if ((view === 'settings' || view === 'connections') && this.view !== view) { this.go(view); return; }
     this.view = view;
     this.scrollToHistory();
   }
@@ -607,8 +596,9 @@ class AppComponent implements OnInit {
   go(view: View, event?: Event): void {
     event?.preventDefault();
     this.view = view;
-    const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : view === 'settings' ? '#/impostazioni' : '#/';
+    const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : view === 'connections' ? '#/connessioni' : view === 'settings' ? '#/impostazioni' : '#/';
     if (view === 'settings') void Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity(), this.loadRemoteStatus()]).catch(error => { this.error = `${this.t('ui.section.settings')} ${this.errorText(error)}`; });
+    if (view === 'connections') void this.loadConnections().catch(error => { this.connectionError = this.errorText(error); });
     if (location.hash !== hash) window.history.replaceState(null, '', hash);
     window.scrollTo({ top: 0 });
   }
@@ -623,7 +613,7 @@ class AppComponent implements OnInit {
       this.request<AuditReport | null>('/api/status'),
       this.loadHistory(),
       this.loadNotifications(),
-      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity(), this.loadRemoteStatus()]) : Promise.resolve()
+      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity(), this.loadRemoteStatus()]) : this.view === 'connections' ? this.loadConnections() : Promise.resolve()
     ]);
     const errors: string[] = [];
     if (outcomes[0].status === 'fulfilled') this.setData(outcomes[0].value);
@@ -859,8 +849,12 @@ class AppComponent implements OnInit {
   }
 
   async loadConfiguration(): Promise<void> { this.configuration = await this.request<ConfigurationView>('/api/configuration'); }
-  async loadRemoteStatus(): Promise<void> { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/status'); if (this.remoteStatus.service?.listenerAddress && !this.listenerAddressInput) this.listenerAddressInput = this.remoteStatus.service.listenerAddress; }
-  async setListener(enabled: boolean): Promise<void> { this.saving = true; this.listenerError = ''; try { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/listener', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, address: enabled ? this.listenerAddressInput.trim() : undefined }) }); this.listenerAddressInput = this.remoteStatus.service?.listenerAddress || this.listenerAddressInput; this.flash(this.t(enabled ? 'ui.remote.listener_started' : 'ui.remote.listener_stopped')); } catch (error: unknown) { this.listenerError = this.errorText(error); await this.loadRemoteStatus().catch(() => undefined); } finally { this.saving = false; } }
+  async loadRemoteStatus(): Promise<void> { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/status'); for (const connection of this.remoteStatus.service?.connections ?? []) if (!(connection.serverId in this.connectionDrafts)) this.connectionDrafts[connection.serverId] = connection.endpoint; }
+  async loadConnections(): Promise<void> { await Promise.all([this.loadIdentity(), this.loadRemoteStatus()]); }
+  get trustedConnectionServers(): TrustedServer[] { return this.identity?.trust.servers.filter(server => server.status === 'TRUSTED') ?? []; }
+  serverConnection(serverId: string): ServerConnection | undefined { return this.remoteStatus?.service?.connections.find(connection => connection.serverId === serverId); }
+  connectionAddress(serverId: string): string { return Object.prototype.hasOwnProperty.call(this.connectionDrafts, serverId) ? this.connectionDrafts[serverId] : this.serverConnection(serverId)?.endpoint || ''; }
+  async changeConnection(serverId: string, action: 'start' | 'stop' | 'refresh'): Promise<void> { this.saving = true; this.connectionError = ''; try { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/connection', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ serverId, action, endpoint: action === 'stop' ? undefined : this.connectionAddress(serverId) }) }); } catch (error: unknown) { this.connectionError = this.errorText(error); } finally { this.saving = false; } }
   async setRemoteRegistration(enabled: boolean): Promise<void> { this.saving = true; this.remoteError = ''; try { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/registration', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }); this.flash(this.t(enabled ? 'ui.remote.enabled' : 'ui.remote.disabled')); } catch (error: unknown) { this.remoteError = this.errorText(error); await this.loadRemoteStatus().catch(() => undefined); } finally { this.saving = false; } }
   async loadUiMessages(): Promise<void> {
     this.uiMessages = await this.request<UiMessages>('/api/messages');
@@ -1001,7 +995,7 @@ class AppComponent implements OnInit {
     const used = this.customs.map(item => /^CUSTOM-(\d+)$/.exec(item.customToolId ?? item.id)?.[1]).filter((n): n is string => !!n).map(Number);
     return `CUSTOM-${String((used.length ? Math.max(...used) : 0) + 1).padStart(3, '0')}`;
   }
-  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : location.hash.startsWith('#/notifiche') ? 'notifications' : location.hash.startsWith('#/impostazioni') ? 'settings' : 'overview'; }
+  private viewFromHash(): View { return location.hash.startsWith('#/custom') ? 'custom' : location.hash.startsWith('#/notifiche') ? 'notifications' : location.hash.startsWith('#/connessioni') ? 'connections' : location.hash.startsWith('#/impostazioni') ? 'settings' : 'overview'; }
   private scrollToHistory(): void {
     if (location.hash.startsWith('#/history')) setTimeout(() => document.getElementById('history-title')?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0);
   }

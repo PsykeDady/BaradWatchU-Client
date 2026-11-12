@@ -2,8 +2,7 @@
 
 Contract between a BaradWatchU Server (the *requester*) and a BaradWatchU Client
 (Milestone 2). The Server MVP uses this contract; the Client ships the reference types and
-TLS helpers (`baradwatchu_agent::remote`) and an executable harness that plays
-the Server role (`crates/agent/tests/remote_service.rs`).
+TLS helpers (`baradwatchu_agent::remote`) and the existing consent and report contracts.
 
 **Rule zero: a trusted Server may *ask* for an audit; only the user's explicit acceptance,
 given locally on the workstation, runs it.** There is no automatic acceptance, no
@@ -16,45 +15,30 @@ standing grant and no way for a Server to run commands, change keys or the trust
    the Device ID `BWU-XXXX-XXXX-XXXX-XXXX` and the Ed25519 public key.
 2. The user imports the Server public key file after checking its fingerprint
    (`trust import FILE`). The Server imports the Client file the same way.
-3. An administrator installs the system service and configures the listener (§6); the
-   user runs `baradwatchu-agent remote enable` (explicit, per user).
+3. An administrator installs the system service; the user runs `baradwatchu-agent remote enable` and configures a Server DNS name or IP and port in **Active connections**. Start is explicit per trusted Server.
 
 No discovery, pairing, TOFU or key import from the network exists.
 
-## 2. Transport: TLS 1.3, mutual authentication with raw Ed25519 keys
+## 2. Transport: outbound mutual TLS tunnel
 
-- TLS 1.3 only (rustls). Certificate type: **raw public key** (RFC 7250) on both sides;
-  signature scheme `ed25519` only. Session tickets and resumption are disabled: every
-  connection authenticates from scratch, so a revocation applies to the next connection.
-- **The TLS keys are the Milestone 1 identity keys themselves.** The key that proves
-  possession in the handshake (CertificateVerify) is the key compared with the trust
-  store; there is no X.509 certificate, CA or second chain of trust.
-- **SNI = the Client's Device ID** (any case). One service can serve several registered
-  users on one port; an unknown or stale Device ID aborts the handshake.
-- The Client accepts the handshake only if the Server's key is `TRUSTED` (not revoked) in
-  the trust store of the user who owns that Device ID. Unknown keys, revoked keys,
-  another user's Server, TLS 1.2 or certificate chains are refused **before any HTTP
-  byte is read**.
-- The Server must pin the Client key it imported (helper:
-  `remote::tls::requester_config(server_signing_key, client_public_key)`).
-- Encodings: SubjectPublicKeyInfo DER = `302a300506032b6570032100` + 32 key bytes.
+- The Client system service opens an outbound TCP connection to each enabled Server address. The Server listens for tunnels on `0.0.0.0:7445` by default (`BARADWATCHU_SERVER_TUNNEL_ADDR` overrides it). Its LOCAL dashboard remains loopback-only on port 3000.
+- TLS 1.3 uses the existing RFC 7250 raw Ed25519 public identity keys on both sides. The Client pins the imported Server key; the Server accepts only an imported Client key and matches the authenticated key to the Device ID in the hello frame. Session tickets/resumption are disabled on the Server.
+- The Client sends `{"schemaVersion":"baradwatchu.tunnel.v1","deviceId":"BWU-…","name":"…"}`. The name is informational. The Server acknowledges only after checking reciprocal trust. The Server holds this connection open and sends a ping frame every 10 seconds. Loss is reflected in the fleet badge; enabled Clients retry after five seconds. Stop disables retry persistently; Start and Refresh/repair replace the active connection.
+- Frames contain a four-byte big-endian JSON length followed by that many JSON bytes, at most 9 MiB each. Requests are `{schemaVersion,sequence,method,path,body}`; replies are `{schemaVersion,sequence,code,body}`. Sequence numbers bind replies to requests. One exchange at a time per Client. Network errors close the channel and trigger reconnection.
+- SNI is the Server ID. The TLS key is the identity/trust-store key, not a new credential. Addresses and the hello name never authorize a request. Neither a Client listener nor LAN discovery is used.
 
-Authorization never relies on IP address, hostname or identifiers in the payload.
+## 3. Audit operations on the tunnel
 
-## 3. HTTP API
-
-HTTP/1.1, one request per connection (`Connection: close`), JSON bodies
-(`Content-Type: application/json`), request body ≤ 16 KiB, no chunked encoding.
-Only these endpoints exist; the local dashboard API is never reachable here.
+The Server sends the existing audit operations as request frames. The local dashboard API is never reachable on this channel.
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/audit-requests` | Ask for an audit (asynchronous: returns immediately) |
-| `GET /v1/audit-requests/{requestId}` | Status of one of *your* requests |
-| `GET /v1/audit-requests/{requestId}/result` | Report of one of *your* completed requests |
+| `POST /v1/audit-requests` | Ask for an audit (asynchronous) |
+| `GET /v1/audit-requests/{requestId}` | Status of this Server's request |
+| `GET /v1/audit-requests/{requestId}/result` | Client-produced report |
+| `GET /v1/ping` | Connection liveness only |
 
-A Server only ever sees requests it created (matched on its key and the Device ID); others
-answer 404.
+A Server only sees requests it created (matched on its TLS key and the Device ID); others answer 404.
 
 ### 3.1 Create
 
@@ -83,14 +67,14 @@ answer 404.
   using the Server MVP. The Server never silently strips attribution to bypass rejection.
 - `issuedAtUnixMs`: must be within ±5 minutes of the Client clock (`STALE_REQUEST`).
 
-| HTTP | `state` | Meaning |
+| Code | `state` | Meaning |
 |---|---|---|
 | 202 | `PENDING_CONSENT` | Consent window shown; `consentExpiresAtUnixMs` = now + 120 s |
 | 200 | any | **Duplicate**: this `requestId` already exists for this Server; its current status is returned, nothing is executed again |
 | 409 | `BUSY` | A request is waiting for consent or an audit is running (any origin: CLI, tray, dashboard, remote). No queue |
 | 503 | `UNAVAILABLE` | Nobody can be asked: no linked user session (`NO_USER_SESSION`), tray not running (`TRAY_NOT_RUNNING`), session not answering, identity changed |
 | 200 | `REJECTED`/`FAILED` | Refused on the Client before the prompt (e.g. `SERVER_NOT_TRUSTED`) |
-| 400 | — | `INVALID_REQUEST`, `STALE_REQUEST`, `INVALID_HTTP` |
+| 400 | — | `INVALID_REQUEST`, `STALE_REQUEST` |
 
 `BUSY` and `UNAVAILABLE` answers are **not stored**: the Server may retry later with the
 same `requestId`. Every other outcome is stored and makes the `requestId` final.
@@ -132,9 +116,8 @@ memory only, for one hour, and are lost on restart).
 
 ### 3.4 Polling, retries, replay
 
-- Poll the status every few seconds; the HTTP connection is never held during consent
-  or audit.
-- Network errors on `POST`: resend **the same** `requestId`. The Client answers with the
+- Poll the status every few seconds; the tunnel remains open during consent and audit; each request frame gets a prompt response.
+- Tunnel errors on `POST`: resend **the same** `requestId`. The Client answers with the
   stored request (200) instead of starting a new one.
 - Records (without results) are kept 24 hours, longer than the accepted clock skew: a
   replayed request is either a duplicate (200, no execution) or stale (400).
@@ -154,36 +137,23 @@ memory only, for one hour, and are lost on restart).
 - The audit runs as the user, with the standard engine; it is also recorded in the user's
   local history and events.
 
-## 5. Local architecture (for reference)
+## 5. Local architecture
 
 ```
-Server ──mTLS (SNI=Device ID)──► service run (root/LocalSystem, always on)
-                                   │  registrations: user ⇄ identity folder ⇄ Device ID
-                                   │  reads the user's owner-only key + trust store
-                                   ▼  local IPC (Unix socket / named pipe, peer = OS account)
-                                 remote link (user, started by the tray)
-                                   │  consent request (REMOTE_SERVER) ─► tray window
-                                   ▼  accepted → requirements::run_audit
+service run (root/LocalSystem) ──outbound mTLS──► Server tunnel listener
+  │ registered user identity and trusted Server key       │ fleet badge / audit requests
+  │ Client-owned DNS or IP:port, enabled state             │ no Client endpoint stored
+  ▼ local IPC (OS peer credentials)
+remote link (user, started by tray) ─► local consent ─► user audit engine
 ```
 
-IPC `baradwatchu.ipc.v1`: newline-delimited JSON, ≤ 8 MiB per message; `Hello{intent}`
-with intents `REGISTER`, `UNREGISTER`, `STATUS`, `LINK`, `UPDATE`; the service answers
-`Reply`, then pushes `Job`/`Ping` on `LINK` connections. The service learns the caller's
-account from the OS (`SO_PEERCRED`, `getpeereid`, pipe impersonation) and acts only for
-that account. The agent accepts only a service running as root/LocalSystem.
+IPC `baradwatchu.ipc.v1` carries registration, connection control/status, linked agent jobs and updates. The service learns the caller's account from the OS and changes only that account's registration. It reads the registered user's owner-only identity and trust store, never invents a key, never runs an audit, and stores no report on disk. The per-user connection configuration is persisted in the service's `users/<principal>.json`; it survives service restarts. The Server stores only Client identity keys and names in SQLite, not Client addresses.
 
-## 6. Service configuration
+## 6. Connection controls
 
-`service.json` in the service data folder (`/var/lib/baradwatchu`, macOS
-`/Library/Application Support/BaradWatchU/service`, Windows
-`%ProgramData%\BaradWatchU\service`), written by an administrator:
+The Client dashboard's **Active connections** tab lists trusted Servers. The user supplies the Server's DNS name or IP and port, then selects **Start**. **Stop** closes the channel and suppresses automatic retry until a later Start. **Refresh / repair** restarts it immediately and can apply a changed address. These controls require the user's local dashboard session; they do not require administrator elevation. The system service must be installed/running and this user must have enabled remote requests. The tray remains necessary for consent, but the connection itself can remain up while no tray session is linked.
 
-```json
-{ "schemaVersion": "baradwatchu.service-config.v1", "remote": { "listen": "10.20.30.40:7443" } }
-```
-
-Without the file, or without `remote`, the listener is **disabled**. Restart the service
-after a change. Firewall rules are managed by the operator/IT.
+The Server's tunnel port must be reachable from the Client. The Server dashboard in LOCAL mode remains bound to loopback. Only a Client with a key that the Server already trusts can register a tunnel, and the Client verifies the Server key it imported. Audit requests still require the user's 120-second local consent.
 
 ## 7. Report attribution (Server MVP)
 

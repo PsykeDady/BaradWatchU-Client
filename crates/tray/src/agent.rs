@@ -14,7 +14,6 @@ use std::{
 
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 const DECISION_TIMEOUT: Duration = Duration::from_secs(20);
-const LISTENER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Upper bound for a full audit (each check has its own timeout, REQ-001 up to 90 s).
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_OUTPUT: u64 = 4 * 1024 * 1024;
@@ -87,40 +86,6 @@ impl Agent {
             return Err(failure("stato non disponibile", &stderr));
         }
         model::parse_snapshot(&stdout)
-    }
-
-    pub fn toggle_listener(&self) -> Result<bool, String> {
-        let mut status_command = self.command()?;
-        status_command.args(["remote", "status", "--json"]);
-        let (code, stdout, stderr) = run(status_command, SNAPSHOT_TIMEOUT)?;
-        if code != Some(0) {
-            return Err(failure("listener status unavailable", &stderr));
-        }
-        let value: serde_json::Value =
-            serde_json::from_str(&stdout).map_err(|_| "invalid listener status")?;
-        let running = value["service"]["listenerRunning"]
-            .as_bool()
-            .unwrap_or(false);
-        if !running
-            && !value["service"]["listenerConfigured"]
-                .as_bool()
-                .unwrap_or(false)
-        {
-            return Err("Configure the listener IP:port in the Client dashboard first".into());
-        }
-        let mut command = self.command()?;
-        command.args([
-            "service",
-            "listener",
-            "request",
-            if running { "stop" } else { "start" },
-        ]);
-        let (code, _, stderr) = run(command, LISTENER_TIMEOUT)?;
-        if code == Some(0) {
-            Ok(!running)
-        } else {
-            Err(failure("listener change failed", &stderr))
-        }
     }
 
     /// Runs a full audit through the agent; the agent records the result and its event.

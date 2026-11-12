@@ -51,7 +51,7 @@ Usage: ./install.sh [OPTIONS]
 Two installation modes:
   system (default; a prefix that needs root, such as /usr/local): the complete
     Client - agent, dashboard, tray and the system service (systemd unit
-    baradwatchu-agent.service, root) that serves the remote mTLS API. Install,
+    baradwatchu-agent.service, root) that opens outbound remote mTLS tunnels. Install,
     update and uninstall always include the service.
   per-user (--local, or a --prefix writable without root): agent, dashboard,
     tray, identity, trust store, local audits and reports, without privileges;
@@ -62,8 +62,9 @@ the system service with packaging/service/install-service.sh. Failed sudo
 authentication leaves the build cache available for retry. No package is
 installed. The service is stopped before its files change and restarted on the
 new executable afterwards (checked); if the installation fails it is restarted
-on the files in place. Nothing generates keys, enables the remote listener
-(service.json) or changes firewall rules.
+on the files in place. Nothing generates keys, starts a Server connection
+or changes firewall rules. Each user enables remote requests and starts a
+trusted Server connection from the Client dashboard.
 Before files are replaced or removed, a running baradwatchu-agent of the same
 installation (matched by executable path, e.g. an open dashboard) gets SIGTERM
 and up to BARADWATCHU_STOP_TIMEOUT seconds (default 10); it is never killed.
@@ -355,7 +356,7 @@ print_options() { # every run starts with the effective plan
         option 'manifest' "$manifest"
         ((BUILD_ONLY)) || option 'service' "$SERVICE_NOTE"
         ((BUILD_ONLY)) || option 'privileges' "$privileges"
-        option 'user data' "kept: \$XDG_CONFIG_HOME/baradwatchu (settings, custom-checks, identity, trust store), \$XDG_STATE_HOME/baradwatchu (events, consent) and \$XDG_CACHE_HOME/baradwatchu/audit (audit history); no key is generated and no listener is enabled"
+        option 'user data' "kept: \$XDG_CONFIG_HOME/baradwatchu (settings, custom-checks, identity, trust store), \$XDG_STATE_HOME/baradwatchu (events, consent) and \$XDG_CACHE_HOME/baradwatchu/audit (audit history); no key is generated and no Server connection is started"
         ((BUILD_ONLY)) || describe_instances
     fi
     option 'distribution' "$(os_family)"
@@ -586,7 +587,7 @@ plan_service() {
     SERVICE_ACTION=install
     if [[ -n $SERVICE_CURRENT ]]; then SERVICE_NOTE='updated: stopped before the files change, restarted on the new executable (checked)'
     else SERVICE_NOTE='installed: systemd unit baradwatchu-agent.service, root, started now and at boot'; fi
-    SERVICE_NOTE+='; remote listener stays off until service.json is written'
+    SERVICE_NOTE+='; outbound Server connections start only when enabled by a registered user'
 }
 # Before files change: stop this installation's service so nothing keeps running the old file.
 service_before_files() {

@@ -421,7 +421,7 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
         ("PUT", "/api/remote/registration") => api(crate::remote::dashboard_set_registration(
             std::str::from_utf8(body).unwrap_or_default(),
         )),
-        ("PUT", "/api/remote/listener") => api(crate::service::dashboard_set_listener(
+        ("PUT", "/api/remote/connection") => api(crate::remote::dashboard_connection(
             std::str::from_utf8(body).unwrap_or_default(),
         )),
         ("GET", "/api/messages") => api(crate::configuration::dashboard_messages_json()),

@@ -95,6 +95,18 @@ pub(crate) enum Intent {
     Status,
     Link,
     Update,
+    Connection,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServerConnectionStatus {
+    pub server_id: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub connected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// The Server a job comes from, as verified by the service (mTLS key in the user's trust
@@ -119,6 +131,8 @@ pub(crate) enum ToService {
         /// `REGISTER`: the user's identity folder (the service checks it is theirs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_name: Option<String>,
         /// `UPDATE` fields.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_id: Option<String>,
@@ -130,6 +144,12 @@ pub(crate) enum ToService {
         reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
     },
 }
 
@@ -139,11 +159,15 @@ impl ToService {
             protocol: PROTOCOL.into(),
             intent,
             identity_dir: None,
+            client_name: None,
             job_id: None,
             state: None,
             consent_expires_at_unix_ms: None,
             reason: None,
             result: None,
+            server_id: None,
+            endpoint: None,
+            action: None,
         }
     }
 }
@@ -153,12 +177,6 @@ impl ToService {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceStatus {
     pub version: String,
-    pub listener_configured: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listener_address: Option<String>,
-    pub listener_running: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listener_error: Option<String>,
     pub registered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_device_id: Option<String>,
@@ -167,6 +185,8 @@ pub struct ServiceStatus {
     pub registration_problem: Option<String>,
     pub session_linked: bool,
     pub request_in_progress: bool,
+    #[serde(default)]
+    pub connections: Vec<ServerConnectionStatus>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

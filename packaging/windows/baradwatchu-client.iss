@@ -10,7 +10,7 @@
 ;   Start menu; agent, dashboard, tray, identity and local audits; no service, no remote
 ;   communication.
 ; An upgrade keeps the mode of the existing installation.
-; Setup never generates keys, never enables the remote listener, never changes the firewall.
+; Setup never generates keys, starts a Server connection or changes the firewall.
 ; Settings, identities, trust stores, custom checks and audit history live in
 ; %APPDATA% / %LOCALAPPDATA%\baradwatchu, service registrations in
 ; %ProgramData%\BaradWatchU\service: setup and uninstall never touch them.

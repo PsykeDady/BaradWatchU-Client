@@ -1,49 +1,39 @@
 //! Milestone 2 system service (`baradwatchu-agent service run`): always-on component that
-//! terminates mutual TLS for registered users and relays authorized requests to their
+//! opens mutual TLS connections for registered users and relays authorized requests to their
 //! agent. It never runs an audit, never writes in a user's folders, never chooses a user:
 //! - a user *registers* their own identity folder over the local IPC (the OS tells the
 //!   service who they are; every file must belong to them);
-//! - a Server connects with SNI = that user's Device ID; the service answers with that
-//!   user's Ed25519 key and accepts only Server keys in that user's trust store;
+//! - the service connects to each enabled trusted Server with that user's Ed25519 key;
 //! - requests are relayed to the user's linked agent (`remote link`, started by the tray);
 //!   with no linked agent the answer is `UNAVAILABLE`, while busy it is `BUSY`.
 //!
 //! Data (`BARADWATCHU_SERVICE_DIR` or the platform default, system-only):
-//! `service.json` (operator configuration, listener off when absent), `users/<principal>.json`
+//! `users/<principal>.json`
 //! (registrations), `requests/<job>.json` (request records without results, for duplicate
 //! and replay detection across restarts). Results stay in memory only.
-use crate::identity::{self, ServiceIdentity, TrustedServer};
-use crate::ipc::{self, Intent, JobServer, JobState, Principal, ServiceStatus, ToAgent, ToService};
-use crate::remote::{self, tls, AuditRequest, AuditResult, RequestStatus};
-use crate::requirements::{self as req, CliError, CliOutput};
-use rustls::{
-    client::danger::HandshakeSignatureValid,
-    pki_types::{CertificateDer, UnixTime},
-    server::{
-        danger::{ClientCertVerified, ClientCertVerifier},
-        ClientHello, ResolvesServerCert,
-    },
-    sign::CertifiedKey,
-    DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme,
+use crate::identity::{self, TrustedServer};
+use crate::ipc::{
+    self, Intent, JobServer, JobState, Principal, ServerConnectionStatus, ServiceStatus, ToAgent,
+    ToService,
 };
+use crate::remote::{self, AuditRequest, AuditResult, RequestStatus};
+use crate::requirements::{self as req, CliError, CliOutput};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     ffi::OsString,
     fs,
-    io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
+    io::{self, Read, Write},
+    net::{Shutdown, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-const CONFIG_FILE: &str = "service.json";
-const CONFIG_SCHEMA: &str = "baradwatchu.service-config.v1";
 const REGISTRATION_SCHEMA: &str = "baradwatchu.service-registration.v1";
 const RECORD_SCHEMA: &str = "baradwatchu.remote-request-record.v1";
 /// Request records (duplicate and replay protection) outlive the accepted clock skew.
@@ -53,12 +43,9 @@ const DISPATCH_TIMEOUT: Duration = Duration::from_secs(15);
 const CONSENT_GRACE_MS: u64 = 15_000;
 const RUN_LIMIT_MS: u64 = 35 * 60 * 1000;
 const PING_EVERY: Duration = Duration::from_secs(3);
-const MAX_CONNECTIONS: usize = 32;
-const MAX_HTTP_HEADERS: usize = 16 * 1024;
-const MAX_HTTP_BODY: usize = 16 * 1024;
 const MAX_RESULT: usize = 8 * 1024 * 1024;
-const DISCOVERY_PORT: u16 = 7444;
-const DISCOVERY_PREFIX: &str = "BARADWATCHU_DISCOVER_V1 ";
+const TUNNEL_SCHEMA: &str = "baradwatchu.tunnel.v1";
+const MAX_TUNNEL_FRAME: usize = 9 * 1024 * 1024;
 #[cfg(windows)]
 pub(crate) const WINDOWS_SERVICE_NAME: &str = "BaradWatchU";
 
@@ -87,69 +74,54 @@ fn private_dir(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Config {
-    schema_version: String,
-    #[serde(default)]
-    remote: Option<RemoteConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RemoteConfig {
-    /// `address:port`; the operator chooses the interface (e.g. a VPN address).
-    listen: String,
-    #[serde(default = "enabled_by_default")]
-    enabled: bool,
-}
-
-fn enabled_by_default() -> bool {
-    true
-}
-
-fn read_config(dir: &Path) -> Result<Option<Config>, String> {
-    let path = dir.join(CONFIG_FILE);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("Service configuration is not readable".into()),
-    };
-    let config: Config =
-        serde_json::from_str(&text).map_err(|_| "Service configuration is invalid".to_owned())?;
-    if config.schema_version != CONFIG_SCHEMA
-        || config
-            .remote
-            .as_ref()
-            .is_some_and(|r| r.listen.parse::<SocketAddr>().is_err())
-    {
-        return Err("Service configuration is invalid".into());
-    }
-    Ok(Some(config))
-}
-
-/// The configured listener address; None = remote listener disabled (default).
-fn load_config(dir: &Path) -> Result<Option<SocketAddr>, String> {
-    read_config(dir)?
-        .and_then(|config| config.remote)
-        .filter(|remote| remote.enabled)
-        .map(|remote| {
-            remote
-                .listen
-                .parse::<SocketAddr>()
-                .map_err(|_| "Service configuration is invalid".to_owned())
-        })
-        .transpose()
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Registration {
     schema_version: String,
     principal: Principal,
     device_id: String,
+    #[serde(default)]
+    name: String,
     identity_dir: String,
     registered_at_unix_ms: u64,
+    #[serde(default)]
+    connections: Vec<ConnectionConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectionConfig {
+    server_id: String,
+    endpoint: String,
+    enabled: bool,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectionRuntime {
+    generation: u64,
+    connected: bool,
+    error: Option<String>,
+    socket: Option<Arc<TcpStream>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TunnelRequest {
+    schema_version: String,
+    sequence: u64,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TunnelReply {
+    schema_version: &'static str,
+    sequence: u64,
+    code: u16,
+    body: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -191,20 +163,13 @@ struct Link {
     serial: u64,
 }
 
-#[derive(Default)]
-struct ListenerState {
-    address: Option<String>,
-    running: bool,
-    error: Option<String>,
-}
-
 struct Shared {
     dir: PathBuf,
     registrations: Mutex<Vec<Registration>>,
     links: Mutex<HashMap<Principal, Link>>,
     jobs: Mutex<HashMap<String, Job>>,
     changed: Condvar,
-    listener: Mutex<ListenerState>,
+    connections: Mutex<HashMap<String, ConnectionRuntime>>,
     serial: AtomicUsize,
 }
 
@@ -244,7 +209,7 @@ impl Shared {
             links: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
             changed: Condvar::new(),
-            listener: Mutex::new(ListenerState::default()),
+            connections: Mutex::new(HashMap::new()),
             serial: AtomicUsize::new(1),
         };
         private_dir(&shared.users_dir())?;
@@ -295,37 +260,6 @@ impl Shared {
         Ok(Arc::new(shared))
     }
 
-    fn registration_for_device(&self, device_id: &str) -> Option<Registration> {
-        lock(&self.registrations)
-            .iter()
-            .find(|r| r.device_id.eq_ignore_ascii_case(device_id))
-            .cloned()
-    }
-
-    /// The registered identity behind an SNI name, freshly read and still matching.
-    fn identity_for(&self, device_id: &str) -> Option<(Registration, ServiceIdentity)> {
-        let registration = self.registration_for_device(device_id)?;
-        let identity = identity::load_for_service(
-            Path::new(&registration.identity_dir),
-            &registration.principal,
-        )
-        .ok()?;
-        (identity.device_id == registration.device_id).then_some((registration, identity))
-    }
-
-    fn trusted_by_anyone(&self, key: &[u8; 32]) -> bool {
-        let registrations = lock(&self.registrations).clone();
-        registrations.iter().any(|registration| {
-            identity::load_for_service(
-                Path::new(&registration.identity_dir),
-                &registration.principal,
-            )
-            .is_ok_and(|identity| {
-                identity.device_id == registration.device_id && identity.trusted(key).is_some()
-            })
-        })
-    }
-
     fn status_for(&self, principal: &Principal) -> ServiceStatus {
         // One lock at a time (create_request holds jobs → links): no nested guards here.
         let registration = lock(&self.registrations)
@@ -345,18 +279,35 @@ impl Shared {
         let request_in_progress = lock(&self.jobs)
             .values()
             .any(|job| &job.record.principal == principal && job.active());
-        let listener = lock(&self.listener);
         ServiceStatus {
             version: env!("CARGO_PKG_VERSION").into(),
-            listener_configured: listener.address.is_some(),
-            listener_address: listener.address.clone(),
-            listener_running: listener.running,
-            listener_error: listener.error.clone(),
             registered: registration.is_some(),
-            registered_device_id: registration.map(|r| r.device_id),
+            registered_device_id: registration.as_ref().map(|r| r.device_id.clone()),
             registration_problem,
             session_linked,
             request_in_progress,
+            connections: registration.as_ref().map_or_else(Vec::new, |registration| {
+                registration
+                    .connections
+                    .iter()
+                    .map(|config| {
+                        let runtime = lock(&self.connections)
+                            .get(&connection_key(principal, &config.server_id))
+                            .cloned();
+                        ServerConnectionStatus {
+                            server_id: config.server_id.clone(),
+                            endpoint: config.endpoint.clone(),
+                            enabled: config.enabled,
+                            connected: runtime.as_ref().is_some_and(|runtime| {
+                                runtime.generation == config.generation && runtime.connected
+                            }),
+                            error: runtime
+                                .filter(|runtime| runtime.generation == config.generation)
+                                .and_then(|runtime| runtime.error),
+                        }
+                    })
+                    .collect()
+            }),
         }
     }
 }
@@ -373,11 +324,135 @@ fn json_files(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+fn connection_key(principal: &Principal, server_id: &str) -> String {
+    format!("{}:{server_id}", principal.0)
+}
+
+fn valid_server_endpoint(endpoint: &str) -> bool {
+    if endpoint.len() > 300
+        || endpoint
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b == b'/' || b == b'@')
+    {
+        return false;
+    }
+    let Some((host, port)) = endpoint.rsplit_once(':') else {
+        return false;
+    };
+    let valid_host = if host.starts_with('[') && host.ends_with(']') {
+        host[1..host.len() - 1]
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+    } else {
+        !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    };
+    valid_host && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
+fn connection_action(
+    shared: &Shared,
+    peer: &Principal,
+    server_id: Option<String>,
+    endpoint: Option<String>,
+    action: Option<String>,
+) -> ToAgent {
+    let Some(server_id) = server_id else {
+        return ToAgent::error("Server ID required");
+    };
+    let Some(action) = action else {
+        return ToAgent::error("Connection action required");
+    };
+    if !matches!(action.as_str(), "start" | "stop" | "refresh") {
+        return ToAgent::error("Invalid connection action");
+    }
+    let Some(stem) = peer.file_stem() else {
+        return ToAgent::error("Unsupported local account");
+    };
+    let mut registrations = lock(&shared.registrations);
+    let Some(registration) = registrations.iter_mut().find(|r| &r.principal == peer) else {
+        return ToAgent::error("Remote requests are not enabled for this account");
+    };
+    let identity = match identity::load_for_service(Path::new(&registration.identity_dir), peer) {
+        Ok(identity) if identity.device_id == registration.device_id => identity,
+        _ => return ToAgent::error("Registered identity unavailable"),
+    };
+    if !identity.servers.iter().any(|server| {
+        server.server_id == server_id && server.status == identity::TrustStatus::Trusted
+    }) {
+        return ToAgent::error("Server is not trusted");
+    }
+    let found = registration
+        .connections
+        .iter()
+        .position(|config| config.server_id == server_id);
+    let selected_endpoint =
+        endpoint.or_else(|| found.map(|index| registration.connections[index].endpoint.clone()));
+    if action != "stop"
+        && !selected_endpoint
+            .as_deref()
+            .is_some_and(valid_server_endpoint)
+    {
+        return ToAgent::error("Provide Server DNS or IP and port");
+    }
+    let Some(endpoint) = selected_endpoint else {
+        return ToAgent::error("Connection not configured");
+    };
+    if !valid_server_endpoint(&endpoint) {
+        return ToAgent::error("Invalid Server DNS or IP and port");
+    }
+    let previous = registration.connections.clone();
+    let previous_generation = found.map(|index| registration.connections[index].generation);
+    let runtime_key = connection_key(peer, &server_id);
+    let previous_socket = previous_generation.and_then(|generation| {
+        lock(&shared.connections)
+            .get(&runtime_key)
+            .filter(|state| state.generation == generation)
+            .and_then(|state| state.socket.clone())
+    });
+    match found {
+        Some(index) => {
+            let config = &mut registration.connections[index];
+            config.endpoint = endpoint;
+            config.enabled = action != "stop";
+            config.generation = config.generation.wrapping_add(1);
+        }
+        None => registration.connections.push(ConnectionConfig {
+            server_id,
+            endpoint,
+            enabled: action != "stop",
+            generation: 1,
+        }),
+    }
+    if req::atomic_json(
+        &shared.users_dir().join(format!("{stem}.json")),
+        registration,
+    )
+    .is_err()
+    {
+        registration.connections = previous;
+        return ToAgent::error("Cannot save Server connection");
+    }
+    if let Some(socket) = previous_socket {
+        let _ = socket.shutdown(Shutdown::Both);
+    }
+    drop(registrations);
+    ToAgent::ok(Some(shared.status_for(peer)))
+}
+
 // ---------------------------------------------------------------------------------------
 // Local IPC
 // ---------------------------------------------------------------------------------------
 
-fn register(shared: &Shared, peer: &Principal, identity_dir: Option<String>) -> ToAgent {
+fn register(
+    shared: &Shared,
+    peer: &Principal,
+    identity_dir: Option<String>,
+    client_name: Option<String>,
+) -> ToAgent {
     let Some(stem) = peer.file_stem() else {
         return ToAgent::error("Unsupported local account");
     };
@@ -392,8 +467,17 @@ fn register(shared: &Shared, peer: &Principal, identity_dir: Option<String>) -> 
         schema_version: REGISTRATION_SCHEMA.into(),
         principal: peer.clone(),
         device_id: identity.device_id.clone(),
+        name: client_name
+            .filter(|name| {
+                !name.is_empty() && name.len() <= 128 && !name.chars().any(|ch| ch.is_control() || matches!(ch, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+            })
+            .unwrap_or_else(|| identity.device_id.clone()),
         identity_dir: dir.to_string_lossy().into_owned(),
         registered_at_unix_ms: req::now_ms(),
+        connections: lock(&shared.registrations)
+            .iter()
+            .find(|r| &r.principal == peer && r.device_id == identity.device_id)
+            .map_or_else(Vec::new, |r| r.connections.clone()),
     };
     {
         let mut registrations = lock(&shared.registrations);
@@ -543,11 +627,15 @@ fn handle_ipc(shared: Arc<Shared>, mut connection: ipc::Connection) {
         protocol,
         intent,
         identity_dir,
+        client_name,
         job_id,
         state,
         consent_expires_at_unix_ms,
         reason,
         result,
+        server_id,
+        endpoint,
+        action,
     })) = connection.receive::<ToService>()
     else {
         return;
@@ -558,9 +646,10 @@ fn handle_ipc(shared: Arc<Shared>, mut connection: ipc::Connection) {
         return;
     }
     let reply = match intent {
-        Intent::Register => register(&shared, &peer, identity_dir),
+        Intent::Register => register(&shared, &peer, identity_dir, client_name),
         Intent::Unregister => unregister(&shared, &peer),
         Intent::Status => ToAgent::ok(Some(shared.status_for(&peer))),
+        Intent::Connection => connection_action(&shared, &peer, server_id, endpoint, action),
         Intent::Update => apply_update(
             &shared,
             &peer,
@@ -613,92 +702,6 @@ fn handle_ipc(shared: Arc<Shared>, mut connection: ipc::Connection) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Mutual TLS
-// ---------------------------------------------------------------------------------------
-
-/// Picks the registered user named by SNI and presents *their* Ed25519 key. Unknown or
-/// stale names abort the handshake: nothing is revealed about other users.
-#[derive(Debug)]
-struct Resolver(Arc<Shared>);
-
-impl ResolvesServerCert for Resolver {
-    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let (_, identity) = self.0.identity_for(hello.server_name()?)?;
-        Some(Arc::new(
-            tls::Ed25519Key::new(identity.signing_key).certified(),
-        ))
-    }
-
-    fn only_raw_public_keys(&self) -> bool {
-        true
-    }
-}
-
-/// Requires an Ed25519 raw public key that proves possession (CertificateVerify) and that
-/// a registered user trusts. The exact user is matched after the handshake (`serve`).
-#[derive(Debug)]
-struct Verifier(Arc<Shared>);
-
-impl ClientCertVerifier for Verifier {
-    fn root_hint_subjects(&self) -> &[DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
-    ) -> Result<ClientCertVerified, TlsError> {
-        let refused = || {
-            TlsError::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure)
-        };
-        let key = tls::key_from_spki(end_entity.as_ref()).ok_or_else(refused)?;
-        if !intermediates.is_empty() || !self.0.trusted_by_anyone(&key) {
-            return Err(refused());
-        }
-        Ok(ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        Err(TlsError::General("TLS 1.2 is not supported".into()))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TlsError> {
-        tls::verify_signature(message, cert, dss)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
-    }
-
-    fn requires_raw_public_keys(&self) -> bool {
-        true
-    }
-}
-
-fn tls_config(shared: &Arc<Shared>) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(tls::provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13])?
-        .with_client_cert_verifier(Arc::new(Verifier(shared.clone())))
-        .with_cert_resolver(Arc::new(Resolver(shared.clone())));
-    // Every connection is authenticated from scratch (revocation applies immediately).
-    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
-    config.send_tls13_tickets = 0;
-    Ok(Arc::new(config))
-}
-
-// ---------------------------------------------------------------------------------------
 // Remote HTTP API (only after mutual authentication)
 // ---------------------------------------------------------------------------------------
 
@@ -706,64 +709,6 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
-}
-
-fn read_http<R: BufRead>(reader: &mut R) -> Result<HttpRequest, u16> {
-    let mut head = Vec::new();
-    loop {
-        let mut line = Vec::new();
-        let read = reader
-            .by_ref()
-            .take((MAX_HTTP_HEADERS - head.len().min(MAX_HTTP_HEADERS)) as u64 + 1)
-            .read_until(b'\n', &mut line)
-            .map_err(|_| 400u16)?;
-        if read == 0 || !line.ends_with(b"\n") || head.len() + line.len() > MAX_HTTP_HEADERS {
-            return Err(400);
-        }
-        if line == b"\r\n" || line == b"\n" {
-            break;
-        }
-        head.extend_from_slice(&line);
-    }
-    let head = String::from_utf8(head).map_err(|_| 400u16)?;
-    let mut lines = head.lines();
-    let mut request_line = lines.next().ok_or(400u16)?.split(' ');
-    let (Some(method), Some(path), Some(version), None) = (
-        request_line.next(),
-        request_line.next(),
-        request_line.next(),
-        request_line.next(),
-    ) else {
-        return Err(400);
-    };
-    if version != "HTTP/1.1" {
-        return Err(400);
-    }
-    let mut length = None;
-    for line in lines {
-        let (name, value) = line.split_once(':').ok_or(400u16)?;
-        let value = value.trim();
-        if name.eq_ignore_ascii_case("transfer-encoding") {
-            return Err(400);
-        }
-        if name.eq_ignore_ascii_case("content-length") {
-            if length.is_some() {
-                return Err(400);
-            }
-            length = Some(value.parse::<usize>().map_err(|_| 400u16)?);
-        }
-    }
-    let length = length.unwrap_or(0);
-    if length > MAX_HTTP_BODY {
-        return Err(413);
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).map_err(|_| 400u16)?;
-    Ok(HttpRequest {
-        method: method.into(),
-        path: path.into(),
-        body,
-    })
 }
 
 struct HttpResponse {
@@ -783,29 +728,6 @@ fn error_response(status: u16, code: &str) -> HttpResponse {
         status,
         &serde_json::json!({"schemaVersion": remote::ERROR_SCHEMA, "error": code}),
     )
-}
-
-fn write_http<W: Write>(writer: &mut W, response: &HttpResponse) -> io::Result<()> {
-    let reason = match response.status {
-        200 => "OK",
-        202 => "Accepted",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        410 => "Gone",
-        413 => "Payload Too Large",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    write!(
-        writer,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        response.status,
-        response.body.len()
-    )?;
-    writer.write_all(&response.body)?;
-    writer.flush()
 }
 
 /// Who is asking, as established by mutual TLS for this connection.
@@ -1045,132 +967,301 @@ fn route(shared: &Shared, caller: &Caller, request: &HttpRequest) -> HttpRespons
     }
 }
 
-fn serve_connection(shared: Arc<Shared>, config: Arc<rustls::ServerConfig>, tcp: TcpStream) {
-    let _ = tcp.set_read_timeout(Some(Duration::from_secs(15)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(15)));
-    let Ok(connection) = rustls::ServerConnection::new(config) else {
-        return;
-    };
+fn write_tunnel_frame<T: Serialize>(stream: &mut impl Write, frame: &T) -> Result<(), String> {
+    let bytes = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_TUNNEL_FRAME {
+        return Err("Tunnel frame too large".into());
+    }
+    stream
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .and_then(|_| stream.write_all(&bytes))
+        .and_then(|_| stream.flush())
+        .map_err(|e| e.to_string())
+}
+
+fn read_tunnel_frame<T: serde::de::DeserializeOwned>(
+    stream: &mut impl Read,
+) -> Result<Option<T>, String> {
+    let mut length = [0u8; 4];
+    match stream.read(&mut length[..1]) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(0) => return Err("Server tunnel closed".into()),
+        Ok(_) => {}
+    }
+    stream
+        .read_exact(&mut length[1..])
+        .map_err(|e| e.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_TUNNEL_FRAME {
+        return Err("Invalid Server tunnel frame".into());
+    }
+    let mut bytes = vec![0u8; length];
+    stream.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| "Invalid Server tunnel JSON".into())
+}
+
+fn current_connection(
+    shared: &Shared,
+    registration: &Registration,
+    config: &ConnectionConfig,
+) -> bool {
+    lock(&shared.registrations).iter().any(|registered| {
+        registered.principal == registration.principal
+            && registered.device_id == registration.device_id
+            && registered.connections.iter().any(|connection| {
+                connection.server_id == config.server_id
+                    && connection.generation == config.generation
+                    && connection.enabled
+            })
+    })
+}
+
+fn set_connection_runtime(
+    shared: &Shared,
+    registration: &Registration,
+    config: &ConnectionConfig,
+    connected: bool,
+    error: Option<String>,
+) {
+    let key = connection_key(&registration.principal, &config.server_id);
+    let mut runtime = lock(&shared.connections);
+    if runtime
+        .get(&key)
+        .is_some_and(|state| state.generation == config.generation)
+    {
+        let socket = connected
+            .then(|| runtime.get(&key).and_then(|state| state.socket.clone()))
+            .flatten();
+        runtime.insert(
+            key,
+            ConnectionRuntime {
+                generation: config.generation,
+                connected,
+                error,
+                socket,
+            },
+        );
+    }
+}
+
+fn set_connection_socket(
+    shared: &Shared,
+    registration: &Registration,
+    config: &ConnectionConfig,
+    socket: TcpStream,
+) {
+    let key = connection_key(&registration.principal, &config.server_id);
+    let mut runtime = lock(&shared.connections);
+    if let Some(state) = runtime
+        .get_mut(&key)
+        .filter(|state| state.generation == config.generation)
+    {
+        state.socket = Some(Arc::new(socket));
+    }
+}
+
+fn connect_tunnel(
+    shared: &Shared,
+    registration: &Registration,
+    config: &ConnectionConfig,
+) -> Result<(), String> {
+    use base64::Engine as _;
+    let identity = identity::load_for_service(
+        Path::new(&registration.identity_dir),
+        &registration.principal,
+    )?;
+    if identity.device_id != registration.device_id {
+        return Err("Registered identity changed".into());
+    }
+    let server = identity
+        .servers
+        .iter()
+        .find(|server| {
+            server.server_id == config.server_id && server.status == identity::TrustStatus::Trusted
+        })
+        .ok_or("Server is no longer trusted")?
+        .clone();
+    let public: [u8; 32] = base64::engine::general_purpose::STANDARD
+        .decode(&server.public_key)
+        .map_err(|_| "Invalid trusted Server key")?
+        .try_into()
+        .map_err(|_| "Invalid trusted Server key")?;
+    let tls =
+        remote::tls::requester_config(identity.signing_key, public).map_err(|e| e.to_string())?;
+    let mut tcp = None;
+    for address in config
+        .endpoint
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .take(8)
+    {
+        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_secs(5)) {
+            tcp = Some(stream);
+            break;
+        }
+    }
+    let tcp = tcp.ok_or("Server unreachable")?;
+    set_connection_socket(
+        shared,
+        registration,
+        config,
+        tcp.try_clone().map_err(|e| e.to_string())?,
+    );
+    tcp.set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    tcp.set_write_timeout(Some(Duration::from_secs(20)))
+        .map_err(|e| e.to_string())?;
+    let name = rustls::pki_types::ServerName::try_from(config.server_id.clone())
+        .map_err(|_| "Invalid Server ID")?;
+    let connection = rustls::ClientConnection::new(tls, name).map_err(|e| e.to_string())?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     while stream.conn.is_handshaking() {
-        if stream.conn.complete_io(&mut stream.sock).is_err() {
-            return;
-        }
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|e| e.to_string())?;
     }
-    // Mutual authentication is complete; bind it to the exact user named by SNI.
-    let Some(device_id) = stream.conn.server_name().map(str::to_owned) else {
-        return;
-    };
-    let Some(peer_key) = stream
-        .conn
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .and_then(|cert| tls::key_from_spki(cert.as_ref()))
-    else {
-        return;
-    };
-    let Some((registration, identity)) = shared.identity_for(&device_id) else {
-        return;
-    };
-    let Some(server) = identity.trusted(&peer_key).cloned() else {
-        // Trusted by another local user, not by this one: closed without an answer.
-        stream.conn.send_close_notify();
-        let _ = stream.flush();
-        return;
-    };
-    drop(identity);
-    let caller = Caller {
-        registration,
-        server,
-    };
-    let response = {
-        let mut reader = BufReader::new(&mut stream);
-        match read_http(&mut reader) {
-            Ok(request) => route(&shared, &caller, &request),
-            Err(status) => error_response(status, "INVALID_HTTP"),
+    write_tunnel_frame(
+        &mut stream,
+        &serde_json::json!({"schemaVersion":TUNNEL_SCHEMA,"deviceId":registration.device_id,"name":if registration.name.is_empty() { &registration.device_id } else { &registration.name }}),
+    )?;
+    let ack_deadline = Instant::now() + Duration::from_secs(10);
+    let ack: serde_json::Value = loop {
+        if !current_connection(shared, registration, config) || Instant::now() > ack_deadline {
+            return Err("Server tunnel acknowledgement timed out".into());
+        }
+        if let Some(ack) = read_tunnel_frame(&mut stream)? {
+            break ack;
         }
     };
-    let _ = write_http(&mut stream, &response);
+    if ack["schemaVersion"] != TUNNEL_SCHEMA || ack["connected"] != true {
+        return Err("Server refused tunnel".into());
+    }
+    set_connection_runtime(shared, registration, config, true, None);
+    let mut last_frame = Instant::now();
+    while current_connection(shared, registration, config) {
+        let Some(frame): Option<TunnelRequest> = read_tunnel_frame(&mut stream)? else {
+            if last_frame.elapsed() > Duration::from_secs(40) {
+                return Err("Server heartbeat timed out".into());
+            }
+            continue;
+        };
+        last_frame = Instant::now();
+        if frame.schema_version != TUNNEL_SCHEMA {
+            return Err("Unsupported tunnel protocol".into());
+        }
+        let current_identity = identity::load_for_service(
+            Path::new(&registration.identity_dir),
+            &registration.principal,
+        )?;
+        if current_identity.device_id != registration.device_id
+            || !current_identity.trusted(&public).is_some_and(|entry| {
+                entry.server_id == config.server_id && entry.public_key == server.public_key
+            })
+        {
+            return Err("Server trust removed".into());
+        }
+        let response = if frame.method == "GET" && frame.path == "/v1/ping" {
+            json_response(200, &serde_json::json!({"ok":true}))
+        } else {
+            let caller = Caller {
+                registration: registration.clone(),
+                server: server.clone(),
+            };
+            route(
+                shared,
+                &caller,
+                &HttpRequest {
+                    method: frame.method,
+                    path: frame.path,
+                    body: frame
+                        .body
+                        .map(|v| v.to_string().into_bytes())
+                        .unwrap_or_default(),
+                },
+            )
+        };
+        let body =
+            serde_json::from_slice(&response.body).map_err(|_| "Invalid local tunnel response")?;
+        write_tunnel_frame(
+            &mut stream,
+            &TunnelReply {
+                schema_version: TUNNEL_SCHEMA,
+                sequence: frame.sequence,
+                code: response.status,
+                body,
+            },
+        )?;
+    }
     stream.conn.send_close_notify();
     let _ = stream.flush();
+    Ok(())
 }
 
-fn run_remote_listener(shared: Arc<Shared>, address: SocketAddr) {
-    let fail = |error: String| {
-        let mut listener = lock(&shared.listener);
-        listener.running = false;
-        listener.error = Some(error);
-    };
-    let config = match tls_config(&shared) {
-        Ok(config) => config,
-        Err(error) => return fail(error.to_string()),
-    };
-    let listener = match TcpListener::bind(address) {
-        Ok(listener) => listener,
-        Err(error) => return fail(error.to_string()),
-    };
+fn run_connection(shared: Arc<Shared>, registration: Registration, config: ConnectionConfig) {
+    let key = connection_key(&registration.principal, &config.server_id);
+    while current_connection(&shared, &registration, &config) {
+        let error = connect_tunnel(&shared, &registration, &config).err();
+        if !current_connection(&shared, &registration, &config) {
+            break;
+        }
+        set_connection_runtime(&shared, &registration, &config, false, error);
+        thread::sleep(Duration::from_secs(5));
+    }
+    let mut runtime = lock(&shared.connections);
+    if runtime
+        .get(&key)
+        .is_some_and(|state| state.generation == config.generation)
     {
-        let mut state = lock(&shared.listener);
-        state.running = true;
-        state.address = listener
-            .local_addr()
-            .ok()
-            .map(|a| a.to_string())
-            .or(state.address.take());
-    }
-    if address.is_ipv4() {
-        let shared = shared.clone();
-        thread::spawn(move || run_discovery(shared, address));
-    }
-    let active = Arc::new(AtomicUsize::new(0));
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
-            continue;
-        }
-        let (shared, config, active) = (shared.clone(), config.clone(), active.clone());
-        thread::spawn(move || {
-            serve_connection(shared, config, stream);
-            active.fetch_sub(1, Ordering::SeqCst);
-        });
+        runtime.remove(&key);
     }
 }
 
-/// Discovery reveals only the endpoint of an already named, locally registered identity.
-/// The Server must still authenticate the imported key through mutual TLS.
-fn run_discovery(shared: Arc<Shared>, address: SocketAddr) {
-    // Limited broadcasts are delivered to wildcard UDP sockets on common Linux stacks.
-    // Keep a loopback-only TCP listener's discovery endpoint loopback-only as well.
-    let discovery_ip = if address.ip().is_loopback() {
-        address.ip()
-    } else {
-        "0.0.0.0".parse().expect("valid IPv4 wildcard")
-    };
-    let bind = SocketAddr::new(discovery_ip, DISCOVERY_PORT);
-    let Ok(socket) = UdpSocket::bind(bind) else {
-        return;
-    };
-    let mut packet = [0u8; 256];
+fn run_connections(shared: Arc<Shared>) {
     loop {
-        let Ok((length, peer)) = socket.recv_from(&mut packet) else {
-            continue;
-        };
-        let Ok(query) = std::str::from_utf8(&packet[..length]) else {
-            continue;
-        };
-        let Some(device_id) = query.strip_prefix(DISCOVERY_PREFIX) else {
-            continue;
-        };
-        if device_id.len() > 80 || shared.identity_for(device_id).is_none() {
-            continue;
+        let registrations = lock(&shared.registrations).clone();
+        for registration in registrations {
+            for config in registration
+                .connections
+                .iter()
+                .filter(|config| config.enabled)
+            {
+                let key = connection_key(&registration.principal, &config.server_id);
+                let mut runtime = lock(&shared.connections);
+                if runtime
+                    .get(&key)
+                    .is_some_and(|state| state.generation == config.generation)
+                {
+                    continue;
+                }
+                runtime.insert(
+                    key,
+                    ConnectionRuntime {
+                        generation: config.generation,
+                        connected: false,
+                        error: None,
+                        socket: None,
+                    },
+                );
+                let (shared, registration, config) =
+                    (shared.clone(), registration.clone(), config.clone());
+                thread::spawn(move || run_connection(shared, registration, config));
+            }
         }
-        let reply = format!("BARADWATCHU_FOUND_V1 {device_id} {}", address.port());
-        let _ = socket.send_to(reply.as_bytes(), peer);
+        thread::sleep(Duration::from_secs(2));
     }
 }
 
-// ---------------------------------------------------------------------------------------
 // Supervision
 // ---------------------------------------------------------------------------------------
 
@@ -1221,19 +1312,15 @@ fn watchdog(shared: Arc<Shared>) {
 
 fn serve() -> Result<(), CliError> {
     let shared = Shared::load(service_dir())?;
-    let address = load_config(&shared.dir).map_err(CliError)?;
-    lock(&shared.listener).address = read_config(&shared.dir)
-        .map_err(CliError)?
-        .and_then(|config| config.remote.map(|remote| remote.listen));
     let ipc_listener = ipc::Listener::bind()
         .map_err(|_| CliError("Cannot open the local service endpoint".into()))?;
-    if let Some(address) = address {
-        let shared = shared.clone();
-        thread::spawn(move || run_remote_listener(shared, address));
-    }
     {
         let shared = shared.clone();
         thread::spawn(move || watchdog(shared));
+    }
+    {
+        let shared = shared.clone();
+        thread::spawn(move || run_connections(shared));
     }
     loop {
         match ipc_listener.accept() {
@@ -1366,271 +1453,8 @@ pub(crate) fn windows_service_installed() -> bool {
     }
 }
 
-fn restart_system_service() -> Result<(), CliError> {
-    #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("systemctl");
-    #[cfg(target_os = "linux")]
-    command.args(["restart", "baradwatchu-agent.service"]);
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("launchctl");
-    #[cfg(target_os = "macos")]
-    command.args(["kickstart", "-k", "system/io.baradwatchu.agent"]);
-    #[cfg(windows)]
-    let mut command = std::process::Command::new("powershell.exe");
-    #[cfg(windows)]
-    command.args(["-NoProfile", "-Command", "$s=Get-Service -Name BaradWatchU -ErrorAction Stop; if ($s.Status -eq 'Running') { Restart-Service -Name BaradWatchU -Force -ErrorAction Stop } else { Start-Service -Name BaradWatchU -ErrorAction Stop }"]);
-    let output = command
-        .output()
-        .map_err(|e| CliError(format!("Cannot restart the system service: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError(format!(
-            "Cannot restart the system service: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
-}
-
-fn wait_for_listener(enable: bool) -> Result<(), CliError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(ToAgent::Reply {
-            ok: true,
-            status: Some(status),
-            ..
-        }) = ipc::call(&ToService::hello(Intent::Status))
-        {
-            if status.listener_running == enable {
-                return Ok(());
-            }
-            if let Some(error) = status.listener_error {
-                return Err(CliError(format!("Listener failed to start: {error}")));
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(CliError(
-                "Listener did not reach the requested state".into(),
-            ));
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn configure_listener(enable: bool, address: Option<&str>) -> Result<CliOutput, CliError> {
-    #[cfg(unix)]
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(CliError("Administrator privileges are required".into()));
-    }
-    let dir = service_dir();
-    if !dir.is_dir() {
-        return Err(CliError("System service is not installed".into()));
-    }
-    let previous = read_config(&dir).map_err(CliError)?;
-    let chosen = address.map(str::to_owned).or_else(|| {
-        previous
-            .as_ref()
-            .and_then(|config| config.remote.as_ref().map(|remote| remote.listen.clone()))
-    });
-    let Some(listen) = chosen else {
-        return Err(CliError("Provide an IP:port for the listener".into()));
-    };
-    let socket = listen
-        .parse::<SocketAddr>()
-        .map_err(|_| CliError("Provide a valid IP:port for the listener".into()))?;
-    if socket.port() == 0 {
-        return Err(CliError("Listener port cannot be zero".into()));
-    }
-    let updated = Config {
-        schema_version: CONFIG_SCHEMA.into(),
-        remote: Some(RemoteConfig {
-            listen,
-            enabled: enable,
-        }),
-    };
-    let path = dir.join(CONFIG_FILE);
-    req::atomic_json(&path, &updated)?;
-    if let Err(error) = restart_system_service().and_then(|_| wait_for_listener(enable)) {
-        if let Some(previous) = previous {
-            let _ = req::atomic_json(&path, &previous);
-        } else {
-            let _ = fs::remove_file(&path);
-        }
-        let _ = restart_system_service();
-        return Err(error);
-    }
-    Ok(CliOutput {
-        text: if enable {
-            "Remote listener started"
-        } else {
-            "Remote listener stopped"
-        }
-        .into(),
-        code: 0,
-    })
-}
-
-/// Ask the operating system for administrator elevation, then run the fixed listener
-/// command in the installed agent. No arbitrary command or path comes from the dashboard.
-pub(crate) fn request_listener(enable: bool, address: Option<&str>) -> Result<CliOutput, CliError> {
-    if let Some(value) = address {
-        let parsed = value
-            .parse::<SocketAddr>()
-            .map_err(|_| CliError("Provide a valid IP:port for the listener".into()))?;
-        if parsed.port() == 0 {
-            return Err(CliError("Listener port cannot be zero".into()));
-        }
-    }
-    let exe = std::env::current_exe().map_err(|e| CliError(e.to_string()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let mut item = exe.as_path();
-        loop {
-            let metadata = fs::metadata(item).map_err(|e| CliError(e.to_string()))?;
-            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-                return Err(CliError(
-                    "The installed agent must be root-owned before elevation".into(),
-                ));
-            }
-            let Some(parent) = item.parent() else { break };
-            if parent == item {
-                break;
-            }
-            item = parent;
-        }
-    }
-    let operation = if enable { "start" } else { "stop" };
-    #[cfg(target_os = "linux")]
-    let mut command = {
-        let mut command = std::process::Command::new("pkexec");
-        command.arg(&exe).args(["service", "listener", operation]);
-        command
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let escaped = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
-        let mut script = format!(
-            "{} service listener {operation}",
-            escaped(&exe.to_string_lossy())
-        );
-        if let Some(value) = address {
-            script.push(' ');
-            script.push_str(&escaped(value));
-        }
-        let apple = format!(
-            "do shell script \"{}\" with administrator privileges",
-            script.replace('\\', "\\\\").replace('"', "\\\"")
-        );
-        let mut command = std::process::Command::new("osascript");
-        command.args(["-e", &apple]);
-        command
-    };
-    #[cfg(windows)]
-    let mut command = {
-        use base64::Engine;
-        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
-        let mut args = vec!["service", "listener", operation];
-        if let Some(value) = address {
-            args.push(value);
-        }
-        let script = format!("$ErrorActionPreference='Stop'; $p=Start-Process -Verb RunAs -FilePath {} -ArgumentList @({}) -Wait -PassThru; exit $p.ExitCode", quote(&exe.to_string_lossy()), args.into_iter().map(quote).collect::<Vec<_>>().join(","));
-        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
-        let mut command = std::process::Command::new("powershell.exe");
-        command.args(["-NoProfile", "-EncodedCommand", &encoded]);
-        command
-    };
-    #[cfg(target_os = "linux")]
-    if let Some(value) = address {
-        command.arg(value);
-    }
-    let output = command
-        .output()
-        .map_err(|e| CliError(format!("Administrator prompt failed: {e}")))?;
-    if !output.status.success() {
-        return Err(CliError(format!(
-            "Listener change was not completed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(CliOutput {
-        text: if enable {
-            "Remote listener started"
-        } else {
-            "Remote listener stopped"
-        }
-        .into(),
-        code: 0,
-    })
-}
-
-pub(crate) fn dashboard_set_listener(text: &str) -> Result<String, CliError> {
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|_| CliError("Invalid listener request".into()))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| CliError("Invalid listener request".into()))?;
-    if object.len() > 2
-        || object
-            .keys()
-            .any(|key| key != "enabled" && key != "address")
-    {
-        return Err(CliError("Invalid listener request".into()));
-    }
-    let enabled = object
-        .get("enabled")
-        .and_then(serde_json::Value::as_bool)
-        .ok_or_else(|| CliError("Invalid listener request".into()))?;
-    let address = object
-        .get("address")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    request_listener(enabled, if enabled { address } else { None })?;
-    std::thread::sleep(Duration::from_millis(300));
-    req::output_json(&crate::remote::status())
-}
-
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     match args {
-        [command, operation] if command == "listener" && operation == "start" => {
-            configure_listener(true, None)
-        }
-        [command, operation, address] if command == "listener" && operation == "start" => {
-            configure_listener(
-                true,
-                Some(
-                    address
-                        .to_str()
-                        .ok_or_else(|| CliError("Invalid listener address".into()))?,
-                ),
-            )
-        }
-        [command, operation] if command == "listener" && operation == "stop" => {
-            configure_listener(false, None)
-        }
-        [command, request, operation]
-            if command == "listener" && request == "request" && operation == "start" =>
-        {
-            request_listener(true, None)
-        }
-        [command, request, operation, address]
-            if command == "listener" && request == "request" && operation == "start" =>
-        {
-            request_listener(
-                true,
-                Some(
-                    address
-                        .to_str()
-                        .ok_or_else(|| CliError("Invalid listener address".into()))?,
-                ),
-            )
-        }
-        [command, request, operation]
-            if command == "listener" && request == "request" && operation == "stop" =>
-        {
-            request_listener(false, None)
-        }
         [command] if command == "run" => {
             #[cfg(windows)]
             match windows_scm::dispatch() {
@@ -1677,59 +1501,5 @@ mod tests {
                 assert!(!allowed(true, closed, next), "{closed:?} -> {next:?}");
             }
         }
-    }
-
-    #[test]
-    fn http_parser_is_strict_and_bounded() {
-        let ok = b"POST /v1/audit-requests HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}";
-        let request = read_http(&mut &ok[..]).unwrap();
-        assert_eq!(
-            (request.method.as_str(), request.path.as_str()),
-            ("POST", "/v1/audit-requests")
-        );
-        assert_eq!(request.body, b"{}");
-        for bad in [
-            &b"GET / HTTP/1.0\r\n\r\n"[..],
-            b"GET /\r\n\r\n",
-            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
-            b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
-            b"GET / HTTP/1.1\r\nbroken\r\n\r\n",
-        ] {
-            assert!(read_http(&mut &bad[..]).is_err());
-        }
-        let huge = format!(
-            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
-            MAX_HTTP_BODY + 1
-        );
-        assert_eq!(read_http(&mut huge.as_bytes()).err(), Some(413));
-    }
-
-    #[test]
-    fn listener_is_disabled_until_configured() {
-        let dir = std::env::temp_dir().join(format!("bwu-service-config-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        assert_eq!(load_config(&dir).unwrap(), None);
-        fs::write(
-            dir.join(CONFIG_FILE),
-            r#"{"schemaVersion":"baradwatchu.service-config.v1"}"#,
-        )
-        .unwrap();
-        assert_eq!(load_config(&dir).unwrap(), None);
-        fs::write(
-            dir.join(CONFIG_FILE),
-            r#"{"schemaVersion":"baradwatchu.service-config.v1","remote":{"listen":"10.0.0.5:7443"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            load_config(&dir).unwrap(),
-            Some("10.0.0.5:7443".parse().unwrap())
-        );
-        fs::write(
-            dir.join(CONFIG_FILE),
-            r#"{"schemaVersion":"x","remote":{"listen":"nope"}}"#,
-        )
-        .unwrap();
-        assert!(load_config(&dir).is_err());
-        let _ = fs::remove_dir_all(dir);
     }
 }

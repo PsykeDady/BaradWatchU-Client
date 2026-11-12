@@ -9,7 +9,7 @@ an elevated PowerShell.
 
 Registers "BaradWatchU" (LocalSystem, automatic start, restart on failure) running
 "baradwatchu-agent.exe service run", then checks that the running service process is
-exactly that executable. It never generates keys, never enables the remote listener,
+exactly that executable. It never generates keys, starts a Server connection,
 never changes firewall rules and never removes registrations or user data.
 
 The agent must be installed for all users (Program Files): a LocalSystem service must not
@@ -17,8 +17,8 @@ run a binary that a user can replace, so per-user copies under %LOCALAPPDATA% ar
 
 -Uninstall, -Stop and -Start act only when the installed service runs -Agent.
 
-The remote listener stays disabled until an administrator writes
-%ProgramData%\BaradWatchU\service\service.json (see the README).
+Each user enables remote requests and starts trusted Server connections from the
+Client dashboard. Firewall rules are left to the operator/IT.
 
 STATUS: written for Windows 10/11; not executed on a Windows host yet.
 #>
@@ -113,7 +113,7 @@ Write-Host 'BaradWatchU Windows service'
 Write-Host "  agent:   $full"
 if ($current -and -not [string]::Equals($current, $full, [StringComparison]::OrdinalIgnoreCase)) { Write-Host "  replaces: service that ran $current" }
 Write-Host '  account: LocalSystem, automatic start, restart on failure'
-Write-Host '  data:    %ProgramData%\BaradWatchU\service (listener off until service.json is written)'
+Write-Host '  data:    %ProgramData%\BaradWatchU\service (user connections start only when enabled)'
 $binPath = "`"$full`" service run"
 if ($current) {
     Invoke-Step "update service $Name" {
@@ -134,4 +134,4 @@ Invoke-Step 'set description and restart-on-failure actions' {
 # Restart, not just start: a service still running must load the new executable.
 Invoke-Step "(re)start service $Name" { Restart-Service -Name $Name -Force }
 Confirm-Running $full
-Write-Host 'Service ready. Remote listener: off until service.json is written. Each user enables remote requests with: baradwatchu-agent remote enable (after identity generate)'
+Write-Host 'Service ready. Each user enables remote requests and starts trusted Server connections from the Client dashboard (after identity generate).'
