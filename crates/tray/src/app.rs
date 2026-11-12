@@ -26,6 +26,7 @@ pub enum Msg {
     Snapshot(Result<Snapshot, String>),
     Menu(String),
     AuditDone(Result<(), String>),
+    ListenerDone(Result<bool, String>),
     ConsentClosed {
         request_id: String,
         outcome: DialogOutcome,
@@ -49,6 +50,7 @@ struct Items {
     pending: MenuItem,
     events: MenuItem,
     autostart: CheckMenuItem,
+    listener: MenuItem,
     about: MenuItem,
     quit: MenuItem,
 }
@@ -113,6 +115,7 @@ impl App {
                 platform::autostart_enabled(),
                 None,
             ),
+            listener: item("listener", &tr("tray.listener_toggle"), true),
             about: item("about", &tr("tray.about"), true),
             quit: item("quit", &tr("tray.quit"), true),
         };
@@ -131,6 +134,7 @@ impl App {
             &items.events,
             &separator(),
             &items.autostart,
+            &items.listener,
             &items.about,
             &items.quit,
         ])
@@ -209,6 +213,27 @@ impl App {
                 }
                 self.refresh_menu();
                 self.poll();
+            }
+            Msg::ListenerDone(result) => {
+                let (title, body, urgency) = match result {
+                    Ok(true) => ("tray.listener_title", "tray.listener_started", Urgency::Low),
+                    Ok(false) => ("tray.listener_title", "tray.listener_stopped", Urgency::Low),
+                    Err(ref error) => {
+                        platform::notify(note(
+                            baradwatchu_messages::message("tray.listener_error", self.language),
+                            error,
+                            Urgency::Normal,
+                        ));
+                        self.refresh_menu();
+                        return Control::Continue;
+                    }
+                };
+                platform::notify(note(
+                    baradwatchu_messages::message(title, self.language),
+                    baradwatchu_messages::message(body, self.language),
+                    urgency,
+                ));
+                self.refresh_menu();
             }
             Msg::ConsentClosed {
                 request_id,
@@ -313,6 +338,7 @@ impl App {
         self.items.about.set_text(text("tray.about"));
         self.items.quit.set_text(text("tray.quit"));
         self.items.autostart.set_text(text("tray.start_login"));
+        self.items.listener.set_text(text("tray.listener_toggle"));
         let pending = self
             .snapshot
             .as_ref()
@@ -361,6 +387,10 @@ impl App {
                     ));
                 }
                 self.refresh_menu();
+            }
+            "listener" => {
+                let agent = self.agent.clone();
+                self.spawn(move || Msg::ListenerDone(agent.toggle_listener()));
             }
             "about" => {
                 let agent_state = match &self.snapshot {

@@ -708,6 +708,24 @@ fn disable() -> Result<CliOutput, CliError> {
     })
 }
 
+/// Dashboard control for this OS-authenticated user's registration only.
+pub(crate) fn dashboard_set_registration(text: &str) -> Result<String, CliError> {
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| CliError("Invalid remote registration request".into()))?;
+    let enabled = value
+        .as_object()
+        .filter(|object| object.len() == 1)
+        .and_then(|object| object.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| CliError("Invalid remote registration request".into()))?;
+    if enabled {
+        enable()?;
+    } else {
+        disable()?;
+    }
+    crate::requirements::output_json(&status())
+}
+
 fn usage() -> String {
     msg("remote.usage")
 }

@@ -415,6 +415,15 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
         ("GET", "/api/ping") => Response::json(200, "{\"ok\":true}"),
         ("GET", "/api/notifications") => api(crate::events::dashboard_notifications_json()),
         ("GET", "/api/configuration") => api(crate::configuration::dashboard_configuration_json()),
+        ("GET", "/api/remote/status") => {
+            api(crate::requirements::output_json(&crate::remote::status()))
+        }
+        ("PUT", "/api/remote/registration") => api(crate::remote::dashboard_set_registration(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
+        ("PUT", "/api/remote/listener") => api(crate::service::dashboard_set_listener(
+            std::str::from_utf8(body).unwrap_or_default(),
+        )),
         ("GET", "/api/messages") => api(crate::configuration::dashboard_messages_json()),
         ("GET", "/api/report-theme") => api(crate::pdf::dashboard_theme_json()),
         ("PUT", "/api/report-theme") => api(crate::pdf::dashboard_update_theme(

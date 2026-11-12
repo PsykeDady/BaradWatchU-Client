@@ -30,6 +30,7 @@ interface NotificationPreferences { schemaVersion?: string; enabled: boolean; in
 interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
 interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
 interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
+interface RemoteStatus { serviceInstalled: boolean | null; serviceRunning: boolean; service?: { listenerConfigured: boolean; listenerAddress?: string; listenerRunning: boolean; listenerError?: string; registered: boolean; registeredDeviceId?: string; registrationProblem?: string; sessionLinked: boolean; requestInProgress: boolean }; identityConfigured: boolean; deviceId?: string; trustedServers: number; trayRunning: boolean | null; }
 interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; }
 interface TrustedServer { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; importedAtUnixMs: number; status: 'TRUSTED' | 'REVOKED'; revokedAtUnixMs?: number; }
 interface IdentityView { schemaVersion: string; status: 'NOT_CONFIGURED' | 'CONFIGURED' | 'DAMAGED'; identity?: PublicIdentity; problem?: string; protection?: { state: 'RESTRICTED' | 'TOO_OPEN' | 'NOT_VERIFIED'; detail?: string }; trust: { damaged: boolean; problem?: string; trusted: number; revoked: number; servers: TrustedServer[] }; directory: string; }
@@ -359,6 +360,28 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <div class="form-head"><h2>{{ t('ui.settings.notifications') }}</h2></div>
               <p class="hint">{{ t('ui.settings.notifications_hint') }} <a href="#/notifiche" (click)="go('notifications', $event)">{{ t('ui.nav.notifications') }}</a>.</p>
             </div>
+            <div class="form-panel">
+              <div class="form-head"><h2>{{ t('ui.remote.title') }}</h2><span class="tag" [class.muted]="!remoteStatus?.service?.listenerRunning">{{ t(remoteStatus?.service?.listenerRunning ? 'ui.remote.running' : 'ui.remote.stopped') }}</span></div>
+              <p class="hint">{{ t('ui.remote.intro') }}</p>
+              <button class="button secondary small" type="button" (click)="loadRemoteStatus()" [disabled]="saving">{{ t('ui.refresh') }}</button>
+              <dl class="facts" *ngIf="remoteStatus as remote">
+                <dt>{{ t('ui.remote.service') }}</dt><dd>{{ t(remote.serviceRunning ? 'ui.remote.running' : 'ui.remote.stopped') }}</dd>
+                <dt>{{ t('ui.remote.listener') }}</dt><dd>{{ t(remote.service?.listenerRunning ? 'ui.remote.running' : remote.service?.listenerConfigured ? 'ui.remote.failed' : 'ui.remote.unconfigured') }}</dd>
+                <dt>{{ t('ui.remote.address') }}</dt><dd><code>{{ remote.service?.listenerAddress || '—' }}</code></dd>
+                <dt>{{ t('ui.remote.registration') }}</dt><dd>{{ t(remote.service?.registered ? 'ui.remote.registered' : 'ui.remote.unregistered') }} <code *ngIf="remote.service?.registeredDeviceId">{{ remote.service?.registeredDeviceId }}</code></dd>
+                <dt>{{ t('ui.remote.session') }}</dt><dd>{{ t(remote.service?.sessionLinked ? 'ui.remote.linked' : 'ui.remote.unlinked') }}</dd>
+                <dt>{{ t('ui.remote.trust') }}</dt><dd>{{ remote.trustedServers }}</dd>
+              </dl>
+              <p class="problem" *ngIf="remoteStatus?.service?.listenerError">{{ remoteStatus?.service?.listenerError }}</p>
+              <p class="problem" *ngIf="remoteStatus?.service?.registrationProblem">{{ remoteStatus?.service?.registrationProblem }}</p>
+              <label class="wide">{{ t('ui.remote.listen_address') }}<input [value]="listenerAddressInput" (input)="listenerAddressInput=$any($event.target).value" placeholder="192.0.2.10:7443" [disabled]="saving || !!remoteStatus?.service?.listenerRunning"></label>
+              <div class="settings-row"><button class="button secondary small" type="button" [disabled]="saving || remoteStatus?.serviceInstalled === false" (click)="setListener(!remoteStatus?.service?.listenerRunning)">{{ t(remoteStatus?.service?.listenerRunning ? 'ui.remote.stop_listener' : 'ui.remote.start_listener') }}</button></div>
+              <p class="hint">{{ t('ui.remote.restart_note') }}</p>
+              <p class="problem" *ngIf="listenerError">{{ listenerError }}</p>
+              <div class="settings-row" *ngIf="remoteStatus as remote"><button class="button secondary small" type="button" [disabled]="saving || !remote.serviceRunning || (!remote.service?.registered && !remote.identityConfigured)" (click)="setRemoteRegistration(!remote.service?.registered)">{{ t(remote.service?.registered ? 'ui.remote.disable' : 'ui.remote.enable') }}</button></div>
+              <p class="problem" *ngIf="remoteError">{{ remoteError }}</p>
+              <p class="hint">{{ t('ui.remote.admin_note') }}</p>
+            </div>
             <div class="form-panel" *ngIf="reportTheme as catalog">
               <div class="form-head"><h2>{{ t('ui.settings.pdf_theme') }}</h2></div>
               <p class="hint">{{ t('ui.settings.pdf_hint') }}</p>
@@ -533,6 +556,10 @@ class AppComponent implements OnInit {
   importFile: File | null = null;
   notifications: NotificationsView | null = null;
   configuration: ConfigurationView | null = null;
+  remoteStatus: RemoteStatus | null = null;
+  remoteError = '';
+  listenerError = '';
+  listenerAddressInput = '';
   reportTheme: ReportThemeCatalog | null = null;
   identity: IdentityView | null = null;
   showPublicKey = false;
@@ -581,7 +608,7 @@ class AppComponent implements OnInit {
     event?.preventDefault();
     this.view = view;
     const hash = view === 'custom' ? '#/custom' : view === 'notifications' ? '#/notifiche' : view === 'settings' ? '#/impostazioni' : '#/';
-    if (view === 'settings') void Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity()]).catch(error => { this.error = `${this.t('ui.section.settings')} ${this.errorText(error)}`; });
+    if (view === 'settings') void Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity(), this.loadRemoteStatus()]).catch(error => { this.error = `${this.t('ui.section.settings')} ${this.errorText(error)}`; });
     if (location.hash !== hash) window.history.replaceState(null, '', hash);
     window.scrollTo({ top: 0 });
   }
@@ -596,7 +623,7 @@ class AppComponent implements OnInit {
       this.request<AuditReport | null>('/api/status'),
       this.loadHistory(),
       this.loadNotifications(),
-      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity()]) : Promise.resolve()
+      this.view === 'settings' ? Promise.all([this.loadConfiguration(), this.loadReportTheme(), this.loadIdentity(), this.loadRemoteStatus()]) : Promise.resolve()
     ]);
     const errors: string[] = [];
     if (outcomes[0].status === 'fulfilled') this.setData(outcomes[0].value);
@@ -832,6 +859,9 @@ class AppComponent implements OnInit {
   }
 
   async loadConfiguration(): Promise<void> { this.configuration = await this.request<ConfigurationView>('/api/configuration'); }
+  async loadRemoteStatus(): Promise<void> { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/status'); if (this.remoteStatus.service?.listenerAddress && !this.listenerAddressInput) this.listenerAddressInput = this.remoteStatus.service.listenerAddress; }
+  async setListener(enabled: boolean): Promise<void> { this.saving = true; this.listenerError = ''; try { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/listener', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, address: enabled ? this.listenerAddressInput.trim() : undefined }) }); this.listenerAddressInput = this.remoteStatus.service?.listenerAddress || this.listenerAddressInput; this.flash(this.t(enabled ? 'ui.remote.listener_started' : 'ui.remote.listener_stopped')); } catch (error: unknown) { this.listenerError = this.errorText(error); await this.loadRemoteStatus().catch(() => undefined); } finally { this.saving = false; } }
+  async setRemoteRegistration(enabled: boolean): Promise<void> { this.saving = true; this.remoteError = ''; try { this.remoteStatus = await this.request<RemoteStatus>('/api/remote/registration', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }); this.flash(this.t(enabled ? 'ui.remote.enabled' : 'ui.remote.disabled')); } catch (error: unknown) { this.remoteError = this.errorText(error); await this.loadRemoteStatus().catch(() => undefined); } finally { this.saving = false; } }
   async loadUiMessages(): Promise<void> {
     this.uiMessages = await this.request<UiMessages>('/api/messages');
     document.documentElement.lang = this.uiMessages.effectiveLanguage.startsWith('it') ? 'it' : 'en';

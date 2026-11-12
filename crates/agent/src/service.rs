@@ -32,7 +32,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream, UdpSocket},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -57,6 +57,8 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_HTTP_HEADERS: usize = 16 * 1024;
 const MAX_HTTP_BODY: usize = 16 * 1024;
 const MAX_RESULT: usize = 8 * 1024 * 1024;
+const DISCOVERY_PORT: u16 = 7444;
+const DISCOVERY_PREFIX: &str = "BARADWATCHU_DISCOVER_V1 ";
 #[cfg(windows)]
 pub(crate) const WINDOWS_SERVICE_NAME: &str = "BaradWatchU";
 
@@ -85,7 +87,7 @@ fn private_dir(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Config {
     schema_version: String,
@@ -93,15 +95,20 @@ struct Config {
     remote: Option<RemoteConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RemoteConfig {
     /// `address:port`; the operator chooses the interface (e.g. a VPN address).
     listen: String,
+    #[serde(default = "enabled_by_default")]
+    enabled: bool,
 }
 
-/// The configured listener address; None = remote listener disabled (default).
-fn load_config(dir: &Path) -> Result<Option<SocketAddr>, String> {
+fn enabled_by_default() -> bool {
+    true
+}
+
+fn read_config(dir: &Path) -> Result<Option<Config>, String> {
     let path = dir.join(CONFIG_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -110,11 +117,22 @@ fn load_config(dir: &Path) -> Result<Option<SocketAddr>, String> {
     };
     let config: Config =
         serde_json::from_str(&text).map_err(|_| "Service configuration is invalid".to_owned())?;
-    if config.schema_version != CONFIG_SCHEMA {
+    if config.schema_version != CONFIG_SCHEMA
+        || config
+            .remote
+            .as_ref()
+            .is_some_and(|r| r.listen.parse::<SocketAddr>().is_err())
+    {
         return Err("Service configuration is invalid".into());
     }
-    config
-        .remote
+    Ok(Some(config))
+}
+
+/// The configured listener address; None = remote listener disabled (default).
+fn load_config(dir: &Path) -> Result<Option<SocketAddr>, String> {
+    read_config(dir)?
+        .and_then(|config| config.remote)
+        .filter(|remote| remote.enabled)
         .map(|remote| {
             remote
                 .listen
@@ -1100,6 +1118,10 @@ fn run_remote_listener(shared: Arc<Shared>, address: SocketAddr) {
             .map(|a| a.to_string())
             .or(state.address.take());
     }
+    if address.is_ipv4() {
+        let shared = shared.clone();
+        thread::spawn(move || run_discovery(shared, address));
+    }
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -1112,6 +1134,39 @@ fn run_remote_listener(shared: Arc<Shared>, address: SocketAddr) {
             serve_connection(shared, config, stream);
             active.fetch_sub(1, Ordering::SeqCst);
         });
+    }
+}
+
+/// Discovery reveals only the endpoint of an already named, locally registered identity.
+/// The Server must still authenticate the imported key through mutual TLS.
+fn run_discovery(shared: Arc<Shared>, address: SocketAddr) {
+    // Limited broadcasts are delivered to wildcard UDP sockets on common Linux stacks.
+    // Keep a loopback-only TCP listener's discovery endpoint loopback-only as well.
+    let discovery_ip = if address.ip().is_loopback() {
+        address.ip()
+    } else {
+        "0.0.0.0".parse().expect("valid IPv4 wildcard")
+    };
+    let bind = SocketAddr::new(discovery_ip, DISCOVERY_PORT);
+    let Ok(socket) = UdpSocket::bind(bind) else {
+        return;
+    };
+    let mut packet = [0u8; 256];
+    loop {
+        let Ok((length, peer)) = socket.recv_from(&mut packet) else {
+            continue;
+        };
+        let Ok(query) = std::str::from_utf8(&packet[..length]) else {
+            continue;
+        };
+        let Some(device_id) = query.strip_prefix(DISCOVERY_PREFIX) else {
+            continue;
+        };
+        if device_id.len() > 80 || shared.identity_for(device_id).is_none() {
+            continue;
+        }
+        let reply = format!("BARADWATCHU_FOUND_V1 {device_id} {}", address.port());
+        let _ = socket.send_to(reply.as_bytes(), peer);
     }
 }
 
@@ -1167,7 +1222,9 @@ fn watchdog(shared: Arc<Shared>) {
 fn serve() -> Result<(), CliError> {
     let shared = Shared::load(service_dir())?;
     let address = load_config(&shared.dir).map_err(CliError)?;
-    lock(&shared.listener).address = address.map(|a| a.to_string());
+    lock(&shared.listener).address = read_config(&shared.dir)
+        .map_err(CliError)?
+        .and_then(|config| config.remote.map(|remote| remote.listen));
     let ipc_listener = ipc::Listener::bind()
         .map_err(|_| CliError("Cannot open the local service endpoint".into()))?;
     if let Some(address) = address {
@@ -1309,8 +1366,271 @@ pub(crate) fn windows_service_installed() -> bool {
     }
 }
 
+fn restart_system_service() -> Result<(), CliError> {
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("systemctl");
+    #[cfg(target_os = "linux")]
+    command.args(["restart", "baradwatchu-agent.service"]);
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("launchctl");
+    #[cfg(target_os = "macos")]
+    command.args(["kickstart", "-k", "system/io.baradwatchu.agent"]);
+    #[cfg(windows)]
+    let mut command = std::process::Command::new("powershell.exe");
+    #[cfg(windows)]
+    command.args(["-NoProfile", "-Command", "$s=Get-Service -Name BaradWatchU -ErrorAction Stop; if ($s.Status -eq 'Running') { Restart-Service -Name BaradWatchU -Force -ErrorAction Stop } else { Start-Service -Name BaradWatchU -ErrorAction Stop }"]);
+    let output = command
+        .output()
+        .map_err(|e| CliError(format!("Cannot restart the system service: {e}")))?;
+    if !output.status.success() {
+        return Err(CliError(format!(
+            "Cannot restart the system service: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn wait_for_listener(enable: bool) -> Result<(), CliError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(ToAgent::Reply {
+            ok: true,
+            status: Some(status),
+            ..
+        }) = ipc::call(&ToService::hello(Intent::Status))
+        {
+            if status.listener_running == enable {
+                return Ok(());
+            }
+            if let Some(error) = status.listener_error {
+                return Err(CliError(format!("Listener failed to start: {error}")));
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError(
+                "Listener did not reach the requested state".into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn configure_listener(enable: bool, address: Option<&str>) -> Result<CliOutput, CliError> {
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(CliError("Administrator privileges are required".into()));
+    }
+    let dir = service_dir();
+    if !dir.is_dir() {
+        return Err(CliError("System service is not installed".into()));
+    }
+    let previous = read_config(&dir).map_err(CliError)?;
+    let chosen = address.map(str::to_owned).or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|config| config.remote.as_ref().map(|remote| remote.listen.clone()))
+    });
+    let Some(listen) = chosen else {
+        return Err(CliError("Provide an IP:port for the listener".into()));
+    };
+    let socket = listen
+        .parse::<SocketAddr>()
+        .map_err(|_| CliError("Provide a valid IP:port for the listener".into()))?;
+    if socket.port() == 0 {
+        return Err(CliError("Listener port cannot be zero".into()));
+    }
+    let updated = Config {
+        schema_version: CONFIG_SCHEMA.into(),
+        remote: Some(RemoteConfig {
+            listen,
+            enabled: enable,
+        }),
+    };
+    let path = dir.join(CONFIG_FILE);
+    req::atomic_json(&path, &updated)?;
+    if let Err(error) = restart_system_service().and_then(|_| wait_for_listener(enable)) {
+        if let Some(previous) = previous {
+            let _ = req::atomic_json(&path, &previous);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+        let _ = restart_system_service();
+        return Err(error);
+    }
+    Ok(CliOutput {
+        text: if enable {
+            "Remote listener started"
+        } else {
+            "Remote listener stopped"
+        }
+        .into(),
+        code: 0,
+    })
+}
+
+/// Ask the operating system for administrator elevation, then run the fixed listener
+/// command in the installed agent. No arbitrary command or path comes from the dashboard.
+pub(crate) fn request_listener(enable: bool, address: Option<&str>) -> Result<CliOutput, CliError> {
+    if let Some(value) = address {
+        let parsed = value
+            .parse::<SocketAddr>()
+            .map_err(|_| CliError("Provide a valid IP:port for the listener".into()))?;
+        if parsed.port() == 0 {
+            return Err(CliError("Listener port cannot be zero".into()));
+        }
+    }
+    let exe = std::env::current_exe().map_err(|e| CliError(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut item = exe.as_path();
+        loop {
+            let metadata = fs::metadata(item).map_err(|e| CliError(e.to_string()))?;
+            if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+                return Err(CliError(
+                    "The installed agent must be root-owned before elevation".into(),
+                ));
+            }
+            let Some(parent) = item.parent() else { break };
+            if parent == item {
+                break;
+            }
+            item = parent;
+        }
+    }
+    let operation = if enable { "start" } else { "stop" };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = std::process::Command::new("pkexec");
+        command.arg(&exe).args(["service", "listener", operation]);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let escaped = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+        let mut script = format!(
+            "{} service listener {operation}",
+            escaped(&exe.to_string_lossy())
+        );
+        if let Some(value) = address {
+            script.push(' ');
+            script.push_str(&escaped(value));
+        }
+        let apple = format!(
+            "do shell script \"{}\" with administrator privileges",
+            script.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let mut command = std::process::Command::new("osascript");
+        command.args(["-e", &apple]);
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        use base64::Engine;
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let mut args = vec!["service", "listener", operation];
+        if let Some(value) = address {
+            args.push(value);
+        }
+        let script = format!("$ErrorActionPreference='Stop'; $p=Start-Process -Verb RunAs -FilePath {} -ArgumentList @({}) -Wait -PassThru; exit $p.ExitCode", quote(&exe.to_string_lossy()), args.into_iter().map(quote).collect::<Vec<_>>().join(","));
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
+        let mut command = std::process::Command::new("powershell.exe");
+        command.args(["-NoProfile", "-EncodedCommand", &encoded]);
+        command
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(value) = address {
+        command.arg(value);
+    }
+    let output = command
+        .output()
+        .map_err(|e| CliError(format!("Administrator prompt failed: {e}")))?;
+    if !output.status.success() {
+        return Err(CliError(format!(
+            "Listener change was not completed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(CliOutput {
+        text: if enable {
+            "Remote listener started"
+        } else {
+            "Remote listener stopped"
+        }
+        .into(),
+        code: 0,
+    })
+}
+
+pub(crate) fn dashboard_set_listener(text: &str) -> Result<String, CliError> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| CliError("Invalid listener request".into()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliError("Invalid listener request".into()))?;
+    if object.len() > 2
+        || object
+            .keys()
+            .any(|key| key != "enabled" && key != "address")
+    {
+        return Err(CliError("Invalid listener request".into()));
+    }
+    let enabled = object
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| CliError("Invalid listener request".into()))?;
+    let address = object
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    request_listener(enabled, if enabled { address } else { None })?;
+    std::thread::sleep(Duration::from_millis(300));
+    req::output_json(&crate::remote::status())
+}
+
 pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
     match args {
+        [command, operation] if command == "listener" && operation == "start" => {
+            configure_listener(true, None)
+        }
+        [command, operation, address] if command == "listener" && operation == "start" => {
+            configure_listener(
+                true,
+                Some(
+                    address
+                        .to_str()
+                        .ok_or_else(|| CliError("Invalid listener address".into()))?,
+                ),
+            )
+        }
+        [command, operation] if command == "listener" && operation == "stop" => {
+            configure_listener(false, None)
+        }
+        [command, request, operation]
+            if command == "listener" && request == "request" && operation == "start" =>
+        {
+            request_listener(true, None)
+        }
+        [command, request, operation, address]
+            if command == "listener" && request == "request" && operation == "start" =>
+        {
+            request_listener(
+                true,
+                Some(
+                    address
+                        .to_str()
+                        .ok_or_else(|| CliError("Invalid listener address".into()))?,
+                ),
+            )
+        }
+        [command, request, operation]
+            if command == "listener" && request == "request" && operation == "stop" =>
+        {
+            request_listener(false, None)
+        }
         [command] if command == "run" => {
             #[cfg(windows)]
             match windows_scm::dispatch() {

@@ -2,7 +2,7 @@
 # BaradWatchU Client installer for Windows: the Windows counterpart of install.sh.
 # Per-user installation, no administrator rights, no service. Run it with:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [options]
-# -Package builds the same artifacts into a per-user setup.exe with Inno Setup 6.
+# -Package builds the same artifacts into a dual-mode setup.exe with Inno Setup 6.
 param(
     [Alias('h')][switch]$Help,
     [Alias('V')][switch]$Version,
@@ -55,7 +55,7 @@ Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [OPTION
   -NoTrayAutostart   Do not enable it on a first installation. By default a first
                      installation enables start at login and a reinstall keeps the
                      user's choice (tray menu: Avvia al login)
-  -Package           Build a per-user setup.exe with Inno Setup 6 instead of
+  -Package           Build a setup.exe with Inno Setup 6 instead of
                      installing (with -OutputDir DIR, default BUILDDIR\dist)
 Everything runs as the current user: files go to a per-user folder and Start
 menu entries to the user's Start menu. No service, scheduled task or system

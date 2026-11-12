@@ -2131,9 +2131,15 @@ mod tests {
     fn pdf_subtitle_identifies_remote_local_and_legacy_origin() {
         let mut report: AuditReport = serde_json::from_value(serde_json::json!({"schemaVersion":"baradwatchu.audit.v1","completedAtUnixMs":1,"results":[]})).unwrap();
         assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle_unknown");
-        report.initiator=Some(req::AuditInitiator::Local);
+        report.initiator = Some(req::AuditInitiator::Local);
         assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle");
-        report.initiator=Some(req::AuditInitiator::Remote{operator_display_name:Some("Mario Rossi".into()),server_id:"SRV-1".into(),server_display_name:"Server".into(),server_trusted_name:"Trusted".into(),server_fingerprint:"SHA256:test".into()});
+        report.initiator = Some(req::AuditInitiator::Remote {
+            operator_display_name: Some("Mario Rossi".into()),
+            server_id: "SRV-1".into(),
+            server_display_name: "Server".into(),
+            server_trusted_name: "Trusted".into(),
+            server_fingerprint: "SHA256:test".into(),
+        });
         assert_eq!(report_subtitle_key(&report), "pdf.report_subtitle_remote");
     }
 
