@@ -12,7 +12,10 @@ standing grant and no way for a Server to run commands, change keys or the trust
 
 1. The user generates the Client identity (`baradwatchu-agent identity generate`) and
    exports it (`identity export`): `baradwatchu.public-identity.v1`, role `client`, with
-   the Device ID `BWU-XXXX-XXXX-XXXX-XXXX` and the Ed25519 public key.
+   the Device ID `BWU-XXXX-XXXX-XXXX-XXXX`, Ed25519 public key and
+   `executableSha256` calculated from the running Client binary at export time.
+   The Server pins that digest when importing the file and compares it with
+   `client.sha256` in later reports; it never learns an expected digest from a report.
 2. The user imports the Server public key file after checking its fingerprint
    (`trust import FILE`). The Server imports the Client file the same way.
 3. An administrator installs the system service; the user runs `baradwatchu-agent remote enable` and configures a Server DNS name or IP and port in **Active connections**. Start is explicit per trusted Server.

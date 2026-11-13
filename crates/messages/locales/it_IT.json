@@ -611,6 +611,8 @@
     "ui.identity.copied": "Chiave pubblica completa copiata negli appunti.",
     "ui.identity.copy_failed": "Copia non riuscita: mostra la chiave e copiala a mano.",
     "ui.identity.export": "Esporta identità pubblica (.json)",
+    "ui.identity.sha_unavailable": "Impossibile leggere il binario Client per calcolare lo SHA-256. Esportazione non eseguita.",
+    "ui.identity.executable_sha": "SHA-256 binario Client",
     "ui.identity.private_note": "La chiave privata resta solo su questo dispositivo, in un file protetto dal sistema operativo: non viene mai mostrata, copiata o esportata. Condividi solo la chiave pubblica, di persona o tramite canali sicuri.",
     "ui.identity.damaged_hint": "Nessuna chiave viene rigenerata automaticamente. Se i file non sono recuperabili, usa il reset completo.",
     "ui.identity.reset": "Reset completo…",
@@ -942,6 +944,7 @@
     "Invalid trust import request": "Richiesta di importazione non valida",
     "Confirmation required: run the command in a terminal or add --yes": "Serve una conferma: esegui il comando in un terminale o aggiungi --yes",
     "Cannot write the export file (it must not exist yet)": "Impossibile scrivere il file di esportazione (non deve esistere già)",
+    "Cannot read the current Client executable to compute its SHA-256": "Impossibile leggere il binario Client corrente per calcolarne lo SHA-256",
     "Cannot read the Server key file": "Impossibile leggere il file della chiave del Server",
     "Confirmation required: run in a terminal or pass --fingerprint with the verified value": "Serve una conferma: esegui in un terminale o passa --fingerprint con il valore verificato"
   },

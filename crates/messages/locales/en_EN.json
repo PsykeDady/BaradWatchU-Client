@@ -611,6 +611,8 @@
     "ui.identity.copied": "Full public key copied to the clipboard.",
     "ui.identity.copy_failed": "Copy failed: show the key and copy it by hand.",
     "ui.identity.export": "Export public identity (.json)",
+    "ui.identity.sha_unavailable": "Cannot read the Client executable to compute SHA-256. Export cancelled.",
+    "ui.identity.executable_sha": "Client executable SHA-256",
     "ui.identity.private_note": "The private key stays on this device only, in a file protected by the operating system: it is never shown, copied or exported. Share only the public key, in person or through secure channels.",
     "ui.identity.damaged_hint": "No key is regenerated automatically. If the files cannot be recovered, use the full reset.",
     "ui.identity.reset": "Full reset…",
@@ -942,6 +944,7 @@
     "Invalid trust import request": "Invalid trust import request",
     "Confirmation required: run the command in a terminal or add --yes": "Confirmation required: run the command in a terminal or add --yes",
     "Cannot write the export file (it must not exist yet)": "Cannot write the export file (it must not exist yet)",
+    "Cannot read the current Client executable to compute its SHA-256": "Cannot read the current Client executable to compute its SHA-256",
     "Cannot read the Server key file": "Cannot read the Server key file",
     "Confirmation required: run in a terminal or pass --fingerprint with the verified value": "Confirmation required: run in a terminal or pass --fingerprint with the verified value"
   },

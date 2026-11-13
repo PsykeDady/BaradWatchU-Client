@@ -32,7 +32,7 @@ interface NotificationsView { preferences: NotificationPreferences; events: AppE
 interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
 interface ServerConnection { serverId: string; endpoint: string; enabled: boolean; connected: boolean; error?: string; }
 interface RemoteStatus { serviceInstalled: boolean | null; serviceRunning: boolean; service?: { registered: boolean; registeredDeviceId?: string; registrationProblem?: string; sessionLinked: boolean; requestInProgress: boolean; connections: ServerConnection[] }; identityConfigured: boolean; deviceId?: string; trustedServers: number; trayRunning: boolean | null; }
-interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; }
+interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; executableSha256?:string; }
 interface TrustedServer { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; importedAtUnixMs: number; status: 'TRUSTED' | 'REVOKED'; revokedAtUnixMs?: number; }
 interface IdentityView { schemaVersion: string; status: 'NOT_CONFIGURED' | 'CONFIGURED' | 'DAMAGED'; identity?: PublicIdentity; problem?: string; protection?: { state: 'RESTRICTED' | 'TOO_OPEN' | 'NOT_VERIFIED'; detail?: string }; trust: { damaged: boolean; problem?: string; trusted: number; revoked: number; servers: TrustedServer[] }; directory: string; }
 interface ServerCandidate { serverId: string; name: string; algorithm: string; publicKey: string; fingerprint: string; conflict?: string; }
@@ -407,6 +407,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
                     </button>
                   </dd>
                   <dt>{{ t('ui.identity.created') }}</dt><dd>{{ pub.createdAtUnixMs ? formatDate(pub.createdAtUnixMs) : t('ui.value.unavailable') }}</dd>
+                  <dt>{{ t('ui.identity.executable_sha') }}</dt><dd><code>{{ pub.executableSha256 || t('ui.value.unavailable') }}</code></dd>
                   <dt>{{ t('ui.identity.private_key') }}</dt><dd [class.integrity-warning]="id.protection?.state === 'TOO_OPEN'">{{ protectionText(id) }}</dd>
                 </dl>
                 <p class="hint">{{ t('ui.identity.private_note') }}</p>
@@ -926,6 +927,7 @@ class AppComponent implements OnInit {
     if (copied) this.flash(this.t('ui.identity.copied')); else this.error = this.t('ui.identity.copy_failed');
   }
   exportIdentity(identity: PublicIdentity): void {
+    if (!identity.executableSha256) { this.error = this.t('ui.identity.sha_unavailable'); return; }
     const blob = new Blob([JSON.stringify(identity, null, 2) + '\n'], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
