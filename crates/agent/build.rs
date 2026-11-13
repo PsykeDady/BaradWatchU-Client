@@ -30,24 +30,41 @@ fn main() {
     println!("cargo:rerun-if-changed=../../catalog");
     println!("cargo:rerun-if-changed=../../catalog/checks");
     println!("cargo:rerun-if-changed=../../catalog/checks-windows");
+    println!("cargo:rerun-if-changed=../../catalog/checks-macos");
     println!("cargo:rerun-if-changed=../../web/src");
     println!("cargo:rerun-if-changed=../../web/dist/client-status/browser");
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let catalog = manifest.join("../../catalog");
     let web = manifest.join("../../web/dist/client-status/browser");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    // OUT_DIR is <profile>/build/<pkg>-<hash>/out (Cargo <= 1.99) or
+    // <profile>/build/<pkg>/<hash>/out (build-dir layout of Cargo 1.100): the profile folder is
+    // the parent of the nearest "build" ancestor in both.
     let profile = out
         .ancestors()
-        .nth(3)
+        .find(|path| path.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
         .expect("Cargo profile output directory");
+    // In-crate unit tests locate the staged installation through this path: with the Cargo
+    // 1.100 layout their executables no longer live in profile/deps/.
+    println!(
+        "cargo:rustc-env=BARADWATCHU_TEST_INSTALL_ROOT={}",
+        profile.display()
+    );
     // Main binaries live in profile/, test executables in profile/deps/.
     // Only the target OS's builtin checks are staged: Linux `catalog/checks`, Windows
-    // `catalog/checks-windows`. The hash manifest covers both and is staged as is.
-    let windows = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows");
-    let (own_checks, other_checks) = if windows {
-        ("checks-windows", "checks")
-    } else {
-        ("checks", "checks-windows")
+    // `catalog/checks-windows`, macOS `catalog/checks-macos`. The hash manifest covers all of
+    // them and is staged as is.
+    const CHECK_DIRS: [&str; 3] = ["checks", "checks-windows", "checks-macos"];
+    let own_checks = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => "checks-windows",
+        Ok("macos") => "checks-macos",
+        _ => "checks",
+    };
+    let is_other_checks = |name: &std::ffi::OsStr| {
+        CHECK_DIRS
+            .iter()
+            .any(|dir| *dir != own_checks && name == std::ffi::OsStr::new(dir))
     };
     for prefix in [profile.parent().unwrap(), profile] {
         let target = prefix.join("share/baradwatchu-client");
@@ -70,7 +87,7 @@ fn main() {
                 !metadata.file_type().is_symlink(),
                 "Symbolic links are not allowed in installed data"
             );
-            if name == other_checks {
+            if is_other_checks(&name) {
                 continue;
             }
             if metadata.is_dir() {
@@ -83,9 +100,13 @@ fn main() {
             staged_catalog.join(own_checks).is_dir(),
             "Builtin checks for the target OS are missing"
         );
-        let foreign = staged_catalog.join(other_checks);
-        if fs::symlink_metadata(&foreign).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
-            fs::remove_dir_all(&foreign).expect("Remove other-OS staged checks");
+        for foreign in CHECK_DIRS.iter().filter(|dir| **dir != own_checks) {
+            let foreign = staged_catalog.join(foreign);
+            if fs::symlink_metadata(&foreign)
+                .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            {
+                fs::remove_dir_all(&foreign).expect("Remove other-OS staged checks");
+            }
         }
         let obsolete_catalog = target.join("catalog/requirements.json");
         match fs::symlink_metadata(&obsolete_catalog) {

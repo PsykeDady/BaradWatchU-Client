@@ -526,7 +526,9 @@
     "consent.cli_expires": " · scade tra {seconds} s",
     "consent.effect.pending": "In attesa di una decisione esplicita: finché non accetti non esiste alcuna autorizzazione.",
     "consent.effect.accepted": "Consenso registrato solo per questa richiesta. Simulazione M7: nessun report è stato inviato.",
+    "consent.effect.accepted_remote": "Richiesta accettata, il tuo audit verrà inviato al Server richiedente.",
     "consent.effect.rejected": "Rifiuto registrato. Simulazione M7: nessuna comunicazione remota.",
+    "consent.effect.rejected_remote": "Rifiuto registrato: nessun audit viene eseguito; il Server riceve solo l'esito della richiesta (rifiutata).",
     "consent.effect.expired": "Scaduta senza risposta: nessuna autorizzazione.",
     "consent.title.accepted": "Richiesta di consenso accettata",
     "consent.title.rejected": "Richiesta di consenso rifiutata",
@@ -967,17 +969,20 @@
     "REQ-001": {
       "name": "Aggiornamenti software",
       "description": "Verifica se sono disponibili aggiornamenti per i pacchetti installati.",
-      "windows_description": "Verifica tramite Windows Update che non ci siano aggiornamenti software in sospeso."
+      "windows_description": "Verifica tramite Windows Update che non ci siano aggiornamenti software in sospeso.",
+      "macos_description": "Verifica con softwareupdate che Apple non segnali aggiornamenti di macOS, Command Line Tools o dati di sicurezza (XProtect) disponibili."
     },
     "REQ-002": {
       "name": "Protezione antivirus",
       "description": "Verifica che un antivirus supportato (provider: ClamAV, Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori.",
-      "windows_description": "Verifica che un antivirus supportato (provider: Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori."
+      "windows_description": "Verifica che un antivirus supportato (provider: Microsoft Defender, Bitdefender GravityZone, Centro sicurezza Windows) sia attivo con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori.",
+      "macos_description": "Verifica che una protezione antimalware supportata (provider: Apple XProtect, Bitdefender GravityZone) sia attiva con firme aggiornate. Con acceptedProviders vuoto basta un provider conforme; i provider elencati diventano obbligatori."
     },
     "REQ-003": {
       "name": "Protezione firewall",
       "description": "Verifica che almeno uno tra UFW, firewalld e nftables fornisca evidenze di filtraggio operativo.",
-      "windows_description": "Verifica che Windows Defender Firewall (o un firewall registrato nel Centro sicurezza) blocchi il traffico in ingresso su tutti i profili."
+      "windows_description": "Verifica che Windows Defender Firewall (o un firewall registrato nel Centro sicurezza) blocchi il traffico in ingresso su tutti i profili.",
+      "macos_description": "Verifica che il firewall applicativo di macOS sia attivo (Packet Filter riportato come evidenza)."
     },
     "REQ-004": {
       "name": "Filtro DNS",
@@ -992,7 +997,8 @@
     "REQ-006": {
       "name": "Cifratura dei dati",
       "description": "Rileva i metodi di cifratura supportati: LUKS e eCryptfs.",
-      "windows_description": "Verifica che BitLocker protegga l’unità di sistema e le altre unità fisse."
+      "windows_description": "Verifica che BitLocker protegga l’unità di sistema e le altre unità fisse.",
+      "macos_description": "Verifica che FileVault sia attivo sul volume di avvio."
     },
     "REQ-007": {
       "name": "Blocco schermo",
@@ -1001,12 +1007,14 @@
     "REQ-008": {
       "name": "Sicurezza delle password",
       "description": "Verifica scadenza, lunghezza e varietà minima richieste per le password degli account locali.",
-      "windows_description": "Verifica scadenza, preavviso, lunghezza e complessità richieste per le password degli account locali."
+      "windows_description": "Verifica scadenza, preavviso, lunghezza e complessità richieste per le password degli account locali.",
+      "macos_description": "Verifica scadenza, lunghezza e complessità richieste per le password degli account locali (policy pwpolicy e profili di configurazione)."
     },
     "REQ-009": {
       "name": "Sicurezza di avvio",
       "description": "Verifica le protezioni della piattaforma che contribuiscono all’avvio sicuro.",
-      "windows_description": "Verifica avvio UEFI con Secure Boot attivo e presenza di un TPM 2.0."
+      "windows_description": "Verifica avvio UEFI con Secure Boot attivo e presenza di un TPM 2.0.",
+      "macos_description": "Verifica avvio sicuro con Sicurezza totale, System Integrity Protection e volume di sistema firmato (non applicabile ai Mac Intel senza chip T2)."
     }
   },
   "cli_help": "BaradWatchU Client {version}\n\nUso:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID | disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent history [--json]\n  baradwatchu-agent history delete STAMP | history clear --yes\n  baradwatchu-agent report-theme list | report-theme use ID\n  baradwatchu-agent identity generate|show|export|reset …   (identity --help)\n  baradwatchu-agent trust list|import|show|revoke|clear …   (trust --help)\n  baradwatchu-agent remote enable|disable|status [--json]   (richieste di audit remote)\n  baradwatchu-agent service run   (servizio di sistema)\n  baradwatchu-agent custom accept ID | custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open ROUTE]\n  baradwatchu-agent quit   (chiude dashboard e tray di questo utente; il servizio resta attivo)\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate|list|accept|reject …\n  baradwatchu-agent --version\n\nI controlli personalizzati si trovano in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool). `custom accept` registra lo SHA-256 del tool dopo una modifica intenzionale. I report sono salvati localmente nella cronologia; `history delete` elimina un audit e i relativi report, log e PDF, mentre `history clear --yes` li elimina tutti. Gli audit non richiedono la dashboard né il Server. REQ-001 può contattare i mirror Arch tramite checkupdates. I tool sono eseguiti come utente corrente. La tray opzionale fornisce notifiche desktop e la finestra di consenso; le richieste sono simulazioni locali e solo un'accettazione esplicita autorizza una singola richiesta.\nL'identità crittografica (identity) e il trust store dei Server (trust) sono facoltativi e locali: le chiavi si generano solo su richiesta esplicita e i Server si importano solo da file verificati fuori banda.\n",

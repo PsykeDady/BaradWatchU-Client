@@ -452,9 +452,26 @@ pub fn save_preferences(preferences: &NotificationPreferences) -> Result<(), Cli
     req::atomic_json(&dir.join("notifications.json"), &value)
 }
 
+/// Executable of a running process (macOS has no /proc: `proc_pidpath`), canonicalized.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_executable(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: the buffer is writable and its exact size is passed to the kernel.
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
+    buffer.truncate(length);
+    Path::new(std::ffi::OsStr::from_bytes(&buffer))
+        .canonicalize()
+        .ok()
+}
+
 /// Whether this user's tray companion holds its lock. Linux: the PID written by the tray is
-/// a live `baradwatchu-tray`. Windows: the tray keeps an exclusive lock on the file, so
-/// reading it fails with a lock violation while the tray runs. `None` elsewhere.
+/// a live `baradwatchu-tray` (macOS: through `proc_pidpath`). Windows: the tray keeps an
+/// exclusive lock on the file, so reading it fails with a lock violation while the tray runs.
+/// `None` elsewhere.
 pub fn tray_running() -> Option<bool> {
     #[cfg(windows)]
     {
@@ -464,6 +481,18 @@ pub fn tray_running() -> Option<bool> {
             Ok(_) => false,
             Err(error) => error.raw_os_error() == Some(ERROR_LOCK_VIOLATION),
         });
+    }
+    // macOS: the PID written by the tray runs an executable named baradwatchu-tray.
+    #[cfg(target_os = "macos")]
+    {
+        let path = req::runtime_dir().ok()?.join("tray.lock");
+        let pid = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        return Some(pid.and_then(process_executable).is_some_and(|exe| {
+            exe.file_name()
+                .is_some_and(|name| name == "baradwatchu-tray")
+        }));
     }
     #[allow(unreachable_code)]
     if !cfg!(target_os = "linux") {
@@ -782,5 +811,22 @@ mod tests {
             dashboard_update_preferences(r#"{"enabled":true,"informative":true,"x":1}"#).is_err()
         );
         assert!(run_notifications(&["set", "enabled", "maybe"].map(OsString::from)).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_tray_detection_requires_a_live_tray_executable() {
+        let _env = TestEnv::new("tray-macos");
+        let dir = req::runtime_dir().unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(tray_running(), Some(false));
+        // A live PID that is not baradwatchu-tray (this test binary) is not the tray.
+        fs::write(dir.join("tray.lock"), format!("{}\n", std::process::id())).unwrap();
+        assert_eq!(tray_running(), Some(false));
+        assert_eq!(
+            process_executable(std::process::id()),
+            std::env::current_exe().unwrap().canonicalize().ok()
+        );
+        assert_eq!(process_executable(u32::MAX), None);
     }
 }
