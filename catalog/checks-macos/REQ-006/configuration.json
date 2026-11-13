@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-006",
+  "name": "Cifratura dei dati",
+  "description": "Verifica che FileVault sia attivo sul volume di avvio.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "7d5473b32f97835784c59223b28cf22d5da19572086f879bbae4989820046eb5",
+  "version": 1,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

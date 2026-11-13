@@ -176,6 +176,8 @@ struct RequirementText {
     /// Windows wording when the built-in check works differently there (other tools and
     /// sources); empty = `description` applies to every platform.
     windows_description: String,
+    /// macOS wording, same rule as `windows_description`.
+    macos_description: String,
 }
 
 fn locale_catalog(language: Language) -> &'static LocaleCatalog {
@@ -844,6 +846,8 @@ pub fn requirement_metadata(id: &str, language: Language) -> Option<(&'static st
         .map(|metadata| {
             let description = if cfg!(windows) && !metadata.windows_description.is_empty() {
                 &metadata.windows_description
+            } else if cfg!(target_os = "macos") && !metadata.macos_description.is_empty() {
+                &metadata.macos_description
             } else {
                 &metadata.description
             };

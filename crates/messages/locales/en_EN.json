@@ -526,7 +526,9 @@
     "consent.cli_expires": " · expires in {seconds} s",
     "consent.effect.pending": "Waiting for an explicit decision. No authorization exists until you accept.",
     "consent.effect.accepted": "Consent recorded for this request only. M7 simulation: no report was sent.",
+    "consent.effect.accepted_remote": "Request accepted, your audit will be sent to the requesting Server.",
     "consent.effect.rejected": "Rejection recorded. M7 simulation: nothing was sent remotely.",
+    "consent.effect.rejected_remote": "Rejection recorded: no audit runs; the Server only receives the request outcome (rejected).",
     "consent.effect.expired": "Expired without a response. No authorization was granted.",
     "consent.title.accepted": "Consent request accepted",
     "consent.title.rejected": "Consent request rejected",
@@ -970,17 +972,20 @@
     "REQ-001": {
       "name": "Software updates",
       "description": "Checks whether updates are available for installed packages.",
-      "windows_description": "Checks through Windows Update that no software update is pending."
+      "windows_description": "Checks through Windows Update that no software update is pending.",
+      "macos_description": "Checks with softwareupdate that Apple reports no available macOS, Command Line Tools or security data (XProtect) update."
     },
     "REQ-002": {
       "name": "Antivirus protection",
       "description": "Checks that a supported antivirus (providers: ClamAV, Microsoft Defender, Bitdefender GravityZone, Windows Security Center) is active with up-to-date signatures. With an empty acceptedProviders one compliant provider is enough; listed providers become mandatory.",
-      "windows_description": "Checks that a supported antivirus (providers: Microsoft Defender, Bitdefender GravityZone, Windows Security Center) is active with up-to-date signatures. With an empty acceptedProviders one compliant provider is enough; listed providers become mandatory."
+      "windows_description": "Checks that a supported antivirus (providers: Microsoft Defender, Bitdefender GravityZone, Windows Security Center) is active with up-to-date signatures. With an empty acceptedProviders one compliant provider is enough; listed providers become mandatory.",
+      "macos_description": "Checks that a supported anti-malware protection (providers: Apple XProtect, Bitdefender GravityZone) is active with up-to-date signatures. With an empty acceptedProviders one compliant provider is enough; listed providers become mandatory."
     },
     "REQ-003": {
       "name": "Firewall protection",
       "description": "Checks that UFW, firewalld, or nftables provides active filtering evidence.",
-      "windows_description": "Checks that Windows Defender Firewall (or a firewall registered in Security Center) blocks inbound traffic on every profile."
+      "windows_description": "Checks that Windows Defender Firewall (or a firewall registered in Security Center) blocks inbound traffic on every profile.",
+      "macos_description": "Checks that the macOS Application Firewall is on (Packet Filter reported as evidence)."
     },
     "REQ-004": {
       "name": "DNS filtering",
@@ -995,7 +1000,8 @@
     "REQ-006": {
       "name": "Data encryption",
       "description": "Detects supported encryption methods: LUKS and eCryptfs.",
-      "windows_description": "Checks that BitLocker protects the system drive and the other fixed drives."
+      "windows_description": "Checks that BitLocker protects the system drive and the other fixed drives.",
+      "macos_description": "Checks that FileVault is on for the startup volume."
     },
     "REQ-007": {
       "name": "Screen lock",
@@ -1004,12 +1010,14 @@
     "REQ-008": {
       "name": "Password security",
       "description": "Checks expiry, length, and minimum character variety for local account passwords.",
-      "windows_description": "Checks expiry, warning, length, and complexity required for local account passwords."
+      "windows_description": "Checks expiry, warning, length, and complexity required for local account passwords.",
+      "macos_description": "Checks expiry, length, and complexity required for local account passwords (pwpolicy and configuration profile policies)."
     },
     "REQ-009": {
       "name": "Boot security",
       "description": "Checks platform protections that contribute to secure boot.",
-      "windows_description": "Checks UEFI boot with Secure Boot on and the presence of a TPM 2.0."
+      "windows_description": "Checks UEFI boot with Secure Boot on and the presence of a TPM 2.0.",
+      "macos_description": "Checks secure boot with Full Security, System Integrity Protection and the signed system volume (not applicable to Intel Macs without a T2 chip)."
     }
   },
   "cli_help": "BaradWatchU Client {version}\n\nUsage:\n  baradwatchu-agent refresh\n  baradwatchu-agent list [--json]\n  baradwatchu-agent enable ID | disable ID\n  baradwatchu-agent priority ID HIGHEST|HIGH|MEDIUM|LOW|OPTIONAL\n  baradwatchu-agent configure ID JSON_OBJECT\n  baradwatchu-agent check ID [--log]\n  baradwatchu-agent audit [--json] [--notify] [--log]\n  baradwatchu-agent status [--json]\n  baradwatchu-agent history [--json]\n  baradwatchu-agent history delete STAMP | history clear --yes\n  baradwatchu-agent report-theme list | report-theme use ID\n  baradwatchu-agent identity generate|show|export|reset …   (identity --help)\n  baradwatchu-agent trust list|import|show|revoke|clear …   (trust --help)\n  baradwatchu-agent remote enable|disable|status [--json]   (remote audit requests)\n  baradwatchu-agent service run   (system service)\n  baradwatchu-agent custom accept ID | custom remove ID\n  baradwatchu-agent dashboard [--no-browser] [--open ROUTE]\n  baradwatchu-agent quit   (closes this user's dashboard and tray; the service stays active)\n  baradwatchu-agent notifications [--json]\n  baradwatchu-agent events --json [--after ID]\n  baradwatchu-agent consent simulate|list|accept|reject …\n  baradwatchu-agent --version\n\nCustom checks live in $XDG_CONFIG_HOME/baradwatchu/custom-checks/CUSTOM-*/ (configuration.json + tool). `custom accept` pins the tool SHA-256 after an intentional edit. Reports are stored locally in audit history; `history delete` removes one audit and its report, log and PDF, while `history clear --yes` removes all of them. Audits do not require the dashboard or Server. REQ-001 may contact Arch mirrors via checkupdates. Tools run as the current user. The optional tray provides desktop notifications and the consent window; requests are local simulations, and only an explicit acceptance authorizes one request.\nThe cryptographic identity (identity) and the Server trust store (trust) are optional and local: keys are generated only on explicit request and Servers are imported only from files verified out of band.\n",

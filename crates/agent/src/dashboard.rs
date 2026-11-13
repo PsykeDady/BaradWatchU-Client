@@ -223,8 +223,8 @@ fn valid_token(token: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A recorded session is reused only if its port accepts connections and, on Linux, the
-/// recorded PID is this same executable (a busy single-threaded server still accepts).
+/// A recorded session is reused only if its port accepts connections and, on Linux and macOS,
+/// the recorded PID is this same executable (a busy single-threaded server still accepts).
 fn session_alive(session: &Session) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
     if TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err() {
@@ -236,6 +236,13 @@ fn session_alive(session: &Session) -> bool {
             return false;
         };
         return fs::read_link(format!("/proc/{}/exe", session.pid)).is_ok_and(|exe| exe == current);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(current) = std::env::current_exe().and_then(|p| p.canonicalize()) else {
+            return false;
+        };
+        return crate::events::process_executable(session.pid).is_some_and(|exe| exe == current);
     }
     #[allow(unreachable_code)]
     true

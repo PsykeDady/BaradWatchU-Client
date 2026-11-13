@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-005",
+  "name": "VPN aziendale",
+  "description": "Verifica lo stato di connessione dei client VPN Cato e WireGuard supportati.",
+  "priority": "LOW",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "833654b41aa197538e86f2fdabc7146ca6491faf56fe41db181fa7934fee96f3",
+  "version": 1,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

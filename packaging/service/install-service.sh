@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BaradWatchU system service (Milestone 2) on Linux (systemd) and macOS (launchd).
-# Internal component: install.sh calls it during installation, update and uninstall (in
-# the step that already runs as root); it can also be run by hand. It installs nothing but
+# Internal component: install.sh (install-macos.sh on macOS) calls it during installation,
+# update and uninstall (in the step that already runs as root); it can also be run by hand. It installs nothing but
 # the service definition. It never generates keys, starts a Server connection,
 # never changes firewall rules and never removes registrations or user data.
 set -euo pipefail
@@ -18,7 +18,8 @@ Usage: sudo packaging/service/install-service.sh [--agent=PATH] [--dry-run]
        sudo packaging/service/install-service.sh --uninstall|--stop|--start [--agent=PATH] [--dry-run]
        packaging/service/install-service.sh --status
 
-Normally run by install.sh: every system installation, update and uninstall includes it.
+Normally run by install.sh (macOS: install-macos.sh): every system installation, update and
+uninstall includes it.
 
   (default)     Install or update the service (systemd unit baradwatchu-agent.service,
                 LaunchDaemon io.baradwatchu.agent), enable it at boot and (re)start it,

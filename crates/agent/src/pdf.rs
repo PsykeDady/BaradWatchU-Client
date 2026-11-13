@@ -787,6 +787,7 @@ fn report_subtitle_key(report: &AuditReport) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Header also carries the remote initiator; mirrors Server renderer.
 fn draw_header(
     ops: &mut Vec<String>,
     cursor: &mut f32,

@@ -25,7 +25,9 @@ const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
 /// Package-owned builtin check folders for this OS, relative to the installation root.
 #[cfg(windows)]
 const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-windows";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-macos";
+#[cfg(not(any(windows, target_os = "macos")))]
 const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks";
 /// Summary of a result blocked by the SHA-256 gate (also used to classify events).
 pub(crate) const INTEGRITY_GATE_SUMMARY: &str = "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito";
@@ -2083,6 +2085,10 @@ pub(crate) fn atomic_text(path: &Path, value: &str) -> Result<(), CliError> {
 }
 
 pub(crate) fn install_root() -> Result<PathBuf, CliError> {
+    // Unit tests use the installation staged by build.rs, wherever Cargo put the test binary.
+    #[cfg(test)]
+    return Ok(PathBuf::from(env!("BARADWATCHU_TEST_INSTALL_ROOT")));
+    #[allow(unreachable_code)]
     let executable = std::env::current_exe()
         .map_err(|_| CliError("Cannot locate Client installation".into()))?;
     executable
@@ -2130,6 +2136,24 @@ fn spawn_failure(error: &std::io::Error, tool: &Path) -> (&'static str, Vec<Stri
         "Could not start requirement tool",
         vec![format!("Avvio di {} non riuscito: {error}", shown(tool))],
     )
+}
+
+/// A file the kernel can execute directly: a `#!` script or a Mach-O (thin or universal) binary.
+#[cfg(target_os = "macos")]
+fn has_interpreter_or_binary_header(tool: &Path) -> bool {
+    let mut header = [0u8; 4];
+    let Ok(mut file) = fs::File::open(tool) else {
+        // Let the spawn report the real error (missing file, permissions).
+        return true;
+    };
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    header.starts_with(b"#!")
+        || matches!(
+            u32::from_be_bytes(header),
+            0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe | 0xbeba_feca
+        )
 }
 
 fn error_result(requirement: &Requirement, priority: Priority, summary: &str) -> ResultRecord {
@@ -3009,6 +3033,16 @@ fn execute_with_timeout(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // macOS posix_spawn runs a script without a `#!` line through /bin/sh instead of failing
+    // with ENOEXEC as Linux does: refuse it the same way, so tools behave alike on both.
+    #[cfg(target_os = "macos")]
+    if !has_interpreter_or_binary_header(&execution_path) {
+        let (summary, details) = spawn_failure(
+            &io::Error::from_raw_os_error(libc::ENOEXEC),
+            &canonical_tool,
+        );
+        return error_with_details(requirement, priority, summary, details);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -4848,6 +4882,8 @@ mod tests {
                 ids,
                 ["bitdefender-gravityzone", "defender", "security-center"]
             );
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(ids, ["bitdefender-gravityzone", "xprotect"]);
         } else {
             assert_eq!(ids, ["bitdefender-gravityzone", "clamav"]);
         }

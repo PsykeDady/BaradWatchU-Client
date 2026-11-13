@@ -1,4 +1,5 @@
-#![cfg(unix)]
+// Exercises the Linux built-in scripts (catalog/checks, /usr/bin/bash).
+#![cfg(target_os = "linux")]
 
 use serde_json::Value;
 use std::{
