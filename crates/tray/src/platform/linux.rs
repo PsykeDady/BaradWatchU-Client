@@ -131,8 +131,16 @@ fn consent_blocking(title: &str, text: &str, timeout: Duration) -> DialogOutcome
 /// Dedicated consent window in its own process; the tray keeps running meanwhile.
 pub fn consent_dialog(title: &str, text: &str, timeout: Duration, done: DialogDone) {
     let (title, text) = (title.to_owned(), text.to_owned());
-    thread::spawn(move || done(consent_blocking(&title, &text, timeout)));
+    thread::spawn(move || {
+        done(
+            consent_blocking(&title, &text, timeout),
+            super::DecisionVia::Window,
+        )
+    });
 }
+
+/// The consent prompt is a separate window; consent events also get a plain notification.
+pub const CONSENT_IS_NOTIFICATION: bool = false;
 
 /// Informational window; returns false when no dialog tool is available.
 pub fn info_dialog(title: &str, text: &str) -> bool {

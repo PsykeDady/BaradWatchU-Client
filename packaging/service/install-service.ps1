@@ -23,7 +23,7 @@ Client dashboard. Firewall rules are left to the operator/IT.
 STATUS: written for Windows 10/11; not executed on a Windows host yet.
 #>
 param(
-    [string]$Agent = (Join-Path $env:ProgramFiles 'BaradWatchU\bin\baradwatchu-agent.exe'),
+    [string]$Agent = (Join-Path $(if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }) 'BaradWatchU\bin\baradwatchu-agent.exe'),
     [switch]$Uninstall,
     [switch]$Stop,
     [switch]$Start,
@@ -98,7 +98,9 @@ if ($Uninstall -or $Stop -or $Start) {
 }
 
 if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Agent not found: $full" }
-$allowed = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } |
+# ProgramW6432: in a 32-bit PowerShell (e.g. started by a 32-bit setup) ProgramFiles points to
+# "Program Files (x86)" while the x64 Client lives in the native "Program Files".
+$allowed = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } |
     ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') + '\' }
 if (-not ($allowed | Where-Object { $full.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) })) {
     throw "Refusing $full`: install the Client for all users under Program Files first."
@@ -106,7 +108,12 @@ if (-not ($allowed | Where-Object { $full.StartsWith($_, [StringComparison]::Ord
 if ($full.Contains('"')) { throw "Unsupported characters in $full" }
 & $full --version | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "$full does not run" }
-$usage = (& $full service 2>&1 | Out-String)
+# `service` without arguments prints its usage on stderr (exit code 2). In Windows PowerShell
+# 5.1 a redirected stderr line becomes an error record, which 'Stop' would turn into a
+# terminating error before the service is created: probe with 'Continue' locally.
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try { $usage = (& $full service 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
 if ($usage -notmatch 'service run') { throw "$full predates the system service: reinstall the Client first" }
 
 Write-Host 'BaradWatchU Windows service'
@@ -115,23 +122,33 @@ if ($current -and -not [string]::Equals($current, $full, [StringComparison]::Ord
 Write-Host '  account: LocalSystem, automatic start, restart on failure'
 Write-Host '  data:    %ProgramData%\BaradWatchU\service (user connections start only when enabled)'
 $binPath = "`"$full`" service run"
+$description = 'BaradWatchU: remote audit requests from trusted Servers (consent required).'
+# The command line contains quotes (path with spaces). Windows PowerShell 5.1 does not escape
+# embedded quotes for native programs, so `sc.exe create/config binPath= ...` received a broken
+# command line (error 1639). The service cmdlets and the registry take it as one value.
 if ($current) {
     Invoke-Step "update service $Name" {
         Stop-Service -Name $Name -ErrorAction SilentlyContinue
-        & sc.exe config $Name binPath= $binPath start= auto obj= LocalSystem | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "sc.exe config failed ($LASTEXITCODE)" }
+        Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name ImagePath -Value $binPath
+        Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name ObjectName -Value 'LocalSystem'
+        Set-Service -Name $Name -StartupType Automatic -Description $description
     }
 } else {
     Invoke-Step "create service $Name" {
-        & sc.exe create $Name binPath= $binPath start= auto obj= LocalSystem DisplayName= 'BaradWatchU Client service' | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed ($LASTEXITCODE)" }
+        New-Service -Name $Name -BinaryPathName $binPath -DisplayName 'BaradWatchU Client service' -Description $description -StartupType Automatic | Out-Null
     }
 }
-Invoke-Step 'set description and restart-on-failure actions' {
-    & sc.exe description $Name 'BaradWatchU: remote audit requests from trusted Servers (consent required).' | Out-Null
+Invoke-Step 'set restart-on-failure actions' {
     & sc.exe failure $Name reset= 86400 actions= restart/5000/restart/5000/restart/30000 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "sc.exe failure failed ($LASTEXITCODE)" }
 }
+if (-not $DryRun -and (Get-ServiceAgent) -ne $full) { throw "The service command line is not `"$full`" service run" }
 # Restart, not just start: a service still running must load the new executable.
-Invoke-Step "(re)start service $Name" { Restart-Service -Name $Name -Force }
+# Stop judged by the final state: agents up to 0.0.1 made the SCM report a stop error.
+Invoke-Step "(re)start service $Name" {
+    Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+    (Get-Service -Name $Name).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    Start-Service -Name $Name
+}
 Confirm-Running $full
 Write-Host 'Service ready. Each user enables remote requests and starts trusted Server connections from the Client dashboard (after identity generate).'

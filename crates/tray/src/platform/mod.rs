@@ -37,7 +37,17 @@ pub use macos::*;
 /// Posts a message to the tray's main-thread event loop from any thread.
 pub type Poster = Arc<dyn Fn(Msg) + Send + Sync>;
 pub type Builder = Box<dyn FnOnce(Poster) -> Result<App, String>>;
-pub type DialogDone = Box<dyn FnOnce(DialogOutcome) + Send>;
+pub type DialogDone = Box<dyn FnOnce(DialogOutcome, DecisionVia) + Send>;
+
+/// Which consent surface produced the decision (recorded by the agent as `decidedVia`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecisionVia {
+    /// Dedicated consent window (zenity/kdialog, message box).
+    Window,
+    /// Accept/Reject buttons of the desktop notification (Windows toast).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    Notification,
+}
 
 /// Result of the dedicated consent window. Only `Accept` may lead to an authorization.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +83,26 @@ pub fn runtime_dir() -> Option<PathBuf> {
                 .map(|h| PathBuf::from(h).join(".local/state").join("baradwatchu"))
         })?;
     Some(state.join("run"))
+}
+
+/// Close request left by the agent (`quit`, or "Quit BaradWatchU" in the dashboard) in the
+/// private runtime folder. Requests older than this tray are stale and ignored; an obeyed one
+/// is removed so the next tray does not close at once.
+pub fn take_quit_request(started: std::time::SystemTime) -> bool {
+    let Some(path) = runtime_dir().map(|dir| dir.join("tray-quit-request")) else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    let fresh = metadata.is_file()
+        && metadata
+            .modified()
+            .is_ok_and(|modified| modified >= started);
+    if fresh {
+        let _ = fs::remove_file(&path);
+    }
+    fresh
 }
 
 fn private_dir(path: &std::path::Path) -> Result<(), String> {

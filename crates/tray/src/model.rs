@@ -315,9 +315,19 @@ pub struct Notifier {
     failures: u32,
     lost_notified: bool,
     preferences: Preferences,
+    /// The consent prompt is itself a notification with Accept/Reject (Windows toast):
+    /// consent events must not also produce a plain notification.
+    consent_is_notification: bool,
 }
 
 impl Notifier {
+    pub fn new(consent_is_notification: bool) -> Self {
+        Self {
+            consent_is_notification,
+            ..Self::default()
+        }
+    }
+
     pub fn cursor(&self) -> Option<u64> {
         self.cursor
     }
@@ -343,6 +353,7 @@ impl Notifier {
             .events
             .iter()
             .filter(|event| event.id > cursor && wants(event, self.preferences))
+            .filter(|event| !(self.consent_is_notification && event.severity == Severity::Action))
             .collect::<Vec<_>>();
         self.cursor = Some(cursor.max(snapshot.latest_event_id));
         // Most urgent first; keep a few and summarize the rest in one notification.
@@ -501,6 +512,19 @@ mod tests {
         )
         .replace("{count}", "3");
         assert_eq!(notes.last().unwrap().body, expected);
+    }
+
+    #[test]
+    fn actionable_consent_notification_replaces_the_plain_one() {
+        let mut notifier = Notifier::new(true);
+        notifier.on_snapshot(&snapshot(0, vec![], Preferences::default()));
+        let events = vec![
+            event(1, Severity::Action, false),
+            event(2, Severity::Critical, false),
+        ];
+        let notes = notifier.on_snapshot(&snapshot(2, events, Preferences::default()));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "e2");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::{
     agent::{Agent, DashboardRoute},
     icon,
     model::{self, Health, Note, Notifier, Snapshot, Urgency},
-    platform::{self, DialogOutcome, InstanceLock, Poster},
+    platform::{self, DecisionVia, DialogOutcome, InstanceLock, Poster},
 };
 use std::{
     collections::HashSet,
@@ -29,6 +29,7 @@ pub enum Msg {
     ConsentClosed {
         request_id: String,
         outcome: DialogOutcome,
+        via: DecisionVia,
     },
     ConsentRecorded(Result<String, String>),
 }
@@ -51,6 +52,7 @@ struct Items {
     autostart: CheckMenuItem,
     about: MenuItem,
     quit: MenuItem,
+    quit_all: MenuItem,
 }
 
 pub struct App {
@@ -68,6 +70,7 @@ pub struct App {
     auditing: bool,
     dialog_open: bool,
     offered: HashSet<String>,
+    started: SystemTime,
     _lock: InstanceLock,
 }
 
@@ -115,6 +118,7 @@ impl App {
             ),
             about: item("about", &tr("tray.about"), true),
             quit: item("quit", &tr("tray.quit"), true),
+            quit_all: item("quit-all", &tr("tray.quit_all"), true),
         };
         let menu = Menu::new();
         let separator = PredefinedMenuItem::separator;
@@ -133,6 +137,7 @@ impl App {
             &items.autostart,
             &items.about,
             &items.quit,
+            &items.quit_all,
         ])
         .map_err(|_| baradwatchu_messages::message("tray.error.menu", language))?;
         let tray = TrayIconBuilder::new()
@@ -177,12 +182,13 @@ impl App {
             exe,
             snapshot: None,
             comm_error: None,
-            notifier: Notifier::default(),
+            notifier: Notifier::new(platform::CONSENT_IS_NOTIFICATION),
             health: None,
             polling: false,
             auditing: false,
             dialog_open: false,
             offered: HashSet::new(),
+            started: SystemTime::now(),
             _lock: lock,
         })
     }
@@ -194,7 +200,12 @@ impl App {
 
     pub fn handle(&mut self, message: Msg) -> Control {
         match message {
-            Msg::Tick => self.poll(),
+            Msg::Tick => {
+                if platform::take_quit_request(self.started) {
+                    return Control::Exit;
+                }
+                self.poll()
+            }
             Msg::Snapshot(result) => self.on_snapshot(result),
             Msg::Menu(id) => return self.on_menu(&id),
             Msg::AuditDone(result) => {
@@ -213,7 +224,8 @@ impl App {
             Msg::ConsentClosed {
                 request_id,
                 outcome,
-            } => self.on_consent_closed(request_id, outcome),
+                via,
+            } => self.on_consent_closed(request_id, outcome, via),
             Msg::ConsentRecorded(result) => {
                 if let Err(error) = result {
                     let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
@@ -312,6 +324,7 @@ impl App {
         self.items.events.set_text(text("tray.notifications"));
         self.items.about.set_text(text("tray.about"));
         self.items.quit.set_text(text("tray.quit"));
+        self.items.quit_all.set_text(text("tray.quit_all"));
         self.items.autostart.set_text(text("tray.start_login"));
         let pending = self
             .snapshot
@@ -384,6 +397,18 @@ impl App {
                 }
             }
             "quit" => return Control::Exit,
+            // Dashboard and tray of this user; the system service keeps running.
+            "quit-all" => {
+                if let Err(error) = self.agent.quit_all() {
+                    let error = baradwatchu_messages::localize_diagnostic(&error, self.language);
+                    platform::notify(note(
+                        baradwatchu_messages::message("tray.dashboard_error", self.language),
+                        &error,
+                        Urgency::Normal,
+                    ));
+                }
+                return Control::Exit;
+            }
             _ => {}
         }
         Control::Continue
@@ -428,16 +453,17 @@ impl App {
             baradwatchu_messages::message("tray.consent_title", self.language),
             &consent.prompt,
             platform::dialog_timeout(consent.remaining_seconds),
-            Box::new(move |outcome| {
+            Box::new(move |outcome, via| {
                 post(Msg::ConsentClosed {
                     request_id,
                     outcome,
+                    via,
                 })
             }),
         );
     }
 
-    fn on_consent_closed(&mut self, request_id: String, outcome: DialogOutcome) {
+    fn on_consent_closed(&mut self, request_id: String, outcome: DialogOutcome, via: DecisionVia) {
         self.dialog_open = false;
         let accept = match outcome {
             DialogOutcome::Accept => true,
@@ -461,6 +487,6 @@ impl App {
             }
         };
         let agent = self.agent.clone();
-        self.spawn(move || Msg::ConsentRecorded(agent.decide(&request_id, accept)));
+        self.spawn(move || Msg::ConsentRecorded(agent.decide(&request_id, accept, via)));
     }
 }

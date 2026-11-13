@@ -1,9 +1,10 @@
 //! Windows: notification-area icon, toast notifications (notify-rust/WinRT), message-box
 //! consent window (rfd), autostart through the per-user `Run` registry key.
-use super::{DialogDone, DialogOutcome};
+use super::{DecisionVia, DialogDone, DialogOutcome};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc,
     thread,
     time::Duration,
 };
@@ -83,10 +84,65 @@ fn ask(title: &str, text: &str) -> DialogOutcome {
     }
 }
 
-/// The message box cannot close itself on expiry: a late Accept is refused by the agent.
-pub fn consent_dialog(title: &str, text: &str, _timeout: Duration, done: DialogDone) {
+/// The consent prompt is the toast itself (Accept / Reject buttons): consent events get no
+/// second, plain notification.
+pub const CONSENT_IS_NOTIFICATION: bool = true;
+
+/// Consent as a Windows notification with **Accept** and **Reject** buttons ("reminder"
+/// scenario: it stays on screen until the user answers or dismisses it). Dismissing it, or
+/// clicking its body, decides nothing: the request stays pending (tray menu, dashboard) until
+/// it expires. If the toast cannot be shown (for example notifications turned off for the
+/// sender), the message box is used instead. A late click is refused by the agent.
+pub fn consent_dialog(title: &str, text: &str, timeout: Duration, done: DialogDone) {
     let (title, text) = (title.to_owned(), text.to_owned());
-    thread::spawn(move || done(ask(&title, &text)));
+    thread::spawn(move || match consent_toast(&title, &text) {
+        Ok(answers) => {
+            let outcome = answers
+                .recv_timeout(timeout)
+                .unwrap_or(DialogOutcome::TimedOut);
+            done(outcome, DecisionVia::Notification)
+        }
+        Err(_) => done(ask(&title, &text), DecisionVia::Window),
+    });
+}
+
+fn consent_toast(title: &str, text: &str) -> Result<mpsc::Receiver<DialogOutcome>, String> {
+    use tauri_winrt_notification::{Scenario, Toast, ToastDismissalReason};
+    let language = baradwatchu_messages::configured_language();
+    let (sender, answers) = mpsc::channel();
+    let dismissed = sender.clone();
+    // Same sender identity as the other tray notifications (notify-rust's default).
+    Toast::new(Toast::POWERSHELL_APP_ID)
+        .title(title)
+        .text1(text)
+        .scenario(Scenario::Reminder)
+        .add_button(
+            baradwatchu_messages::message("consent.button.accept", language),
+            "accept",
+        )
+        .add_button(
+            baradwatchu_messages::message("consent.button.reject", language),
+            "reject",
+        )
+        .on_activated(move |action| {
+            let _ = sender.send(match action.as_deref() {
+                Some("accept") => DialogOutcome::Accept,
+                Some("reject") => DialogOutcome::Reject,
+                // Click on the body: no decision.
+                _ => DialogOutcome::Later,
+            });
+            Ok(())
+        })
+        .on_dismissed(move |reason| {
+            let _ = dismissed.send(match reason {
+                Some(ToastDismissalReason::TimedOut) => DialogOutcome::TimedOut,
+                _ => DialogOutcome::Later,
+            });
+            Ok(())
+        })
+        .show()
+        .map_err(|error| error.to_string())?;
+    Ok(answers)
 }
 
 pub fn info_dialog(title: &str, text: &str) -> bool {
