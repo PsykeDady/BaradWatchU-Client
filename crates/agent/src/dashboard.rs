@@ -132,6 +132,73 @@ struct Session {
 }
 
 const SESSION_SCHEMA: &str = "baradwatchu.dashboard-session.v1";
+/// Runtime file whose modification time asks the tray of this user to close. The tray
+/// ignores requests older than its own start and removes the file when it obeys.
+const TRAY_QUIT_REQUEST: &str = "tray-quit-request";
+const SHUTDOWN_BODY: &str = "{\"confirm\":true}";
+
+fn request_tray_quit(dir: &Path) -> Result<(), String> {
+    requirements::atomic_text(
+        &dir.join(TRAY_QUIT_REQUEST),
+        &format!("{}\n", requirements::now_ms()),
+    )
+    .map_err(|_| "Cannot ask the tray to close".to_owned())
+}
+
+/// `quit`: closes this user's dashboard (through its own authenticated API) and asks the tray
+/// to close. The system service is never touched.
+pub fn quit() -> Result<String, String> {
+    let dir = runtime_dir()?;
+    let language = baradwatchu_messages::configured_language();
+    let mut lines = Vec::new();
+    match read_session(&dir).filter(session_alive) {
+        Some(session) => {
+            request_shutdown(&session)?;
+            lines.push(baradwatchu_messages::message(
+                "cli.quit.dashboard_closed",
+                language,
+            ));
+        }
+        None => lines.push(baradwatchu_messages::message(
+            "cli.quit.dashboard_none",
+            language,
+        )),
+    }
+    request_tray_quit(&dir)?;
+    lines.push(baradwatchu_messages::message(
+        "cli.quit.tray_requested",
+        language,
+    ));
+    Ok(lines.join("\n") + "\n")
+}
+
+fn request_shutdown(session: &Session) -> Result<(), String> {
+    let fail = || "Cannot stop the running dashboard".to_owned();
+    let mut stream = TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], session.port)),
+        Duration::from_secs(2),
+    )
+    .map_err(|_| fail())?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let host = format!("127.0.0.1:{}", session.port);
+    write!(
+        stream,
+        "POST /api/shutdown HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nContent-Type: application/json\r\nX-BaradWatchU-Token: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SHUTDOWN_BODY}",
+        session.token,
+        SHUTDOWN_BODY.len()
+    )
+    .map_err(|_| fail())?;
+    let mut status = String::new();
+    BufReader::new(stream)
+        .read_line(&mut status)
+        .map_err(|_| fail())?;
+    if status.starts_with("HTTP/1.1 200") {
+        Ok(())
+    } else {
+        Err(fail())
+    }
+}
 
 fn runtime_dir() -> Result<PathBuf, String> {
     let dir = requirements::runtime_dir().map_err(|e| e.0)?;
@@ -267,9 +334,26 @@ pub fn run(options: Options) -> Result<(), String> {
     for stream in listener.incoming().flatten() {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
-        let _ = handle(stream, &origin, port, &session.token, &root);
+        if let Ok(Handled::Shutdown) = handle(stream, &origin, port, &session.token, &root) {
+            break;
+        }
     }
+    // Shutdown requested from the dashboard or `quit`: forget this session so nothing tries
+    // to reuse it, unless another dashboard has already replaced the record.
+    if read_session(&dir).is_some_and(|recorded| recorded.token == session.token) {
+        let _ = fs::remove_file(dir.join("dashboard.json"));
+    }
+    print!(
+        "{}",
+        baradwatchu_messages::message("cli.dashboard.closed", language)
+    );
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum Handled {
+    Continue,
+    Shutdown,
 }
 
 /// Constant-time comparison of the session token.
@@ -291,20 +375,20 @@ fn handle(
     port: u16,
     token: &str,
     root: &Path,
-) -> io::Result<()> {
+) -> io::Result<Handled> {
     let clone = stream.try_clone()?;
     let mut reader = BufReader::new(clone);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     if request_line.len() > 8192 {
-        return write_response(&mut stream, Response::error(400, "Richiesta non valida"));
+        return reply(&mut stream, Response::error(400, "Richiesta non valida"));
     }
     let mut request = request_line.split_whitespace();
     let method = request.next().unwrap_or("");
     let target = request.next().unwrap_or("");
     let version = request.next().unwrap_or("");
     if target.is_empty() || version != "HTTP/1.1" {
-        return write_response(&mut stream, Response::error(400, "Richiesta non valida"));
+        return reply(&mut stream, Response::error(400, "Richiesta non valida"));
     }
 
     let mut header_bytes = request_line.len();
@@ -321,11 +405,11 @@ fn handle(
         let mut line = String::new();
         let read = reader.read_line(&mut line)?;
         if read == 0 {
-            return write_response(&mut stream, Response::error(400, "Intestazioni incomplete"));
+            return reply(&mut stream, Response::error(400, "Intestazioni incomplete"));
         }
         header_bytes += read;
         if header_bytes > MAX_HEADERS {
-            return write_response(
+            return reply(
                 &mut stream,
                 Response::error(431, "Intestazioni troppo grandi"),
             );
@@ -334,7 +418,7 @@ fn handle(
             break;
         }
         let Some((name, value)) = line.split_once(':') else {
-            return write_response(&mut stream, Response::error(400, "Intestazione non valida"));
+            return reply(&mut stream, Response::error(400, "Intestazione non valida"));
         };
         let value = value.trim();
         match name.trim().to_ascii_lowercase().as_str() {
@@ -355,12 +439,7 @@ fn handle(
             "content-length" if content_length.is_none() => {
                 content_length = Some(match value.parse::<usize>() {
                     Ok(n) if n <= MAX_BODY => n,
-                    _ => {
-                        return write_response(
-                            &mut stream,
-                            Response::error(413, "Corpo troppo grande"),
-                        )
-                    }
+                    _ => return reply(&mut stream, Response::error(413, "Corpo troppo grande")),
                 })
             }
             "transfer-encoding" => transfer_encoding = true,
@@ -376,19 +455,19 @@ fn handle(
         || host.as_deref() != Some(&format!("127.0.0.1:{port}"))
         || transfer_encoding
     {
-        return write_response(&mut stream, Response::error(403, "Richiesta rifiutata"));
+        return reply(&mut stream, Response::error(403, "Richiesta rifiutata"));
     }
     if request_origin
         .as_deref()
         .is_some_and(|value| value != origin)
     {
-        return write_response(&mut stream, Response::error(403, "Origine rifiutata"));
+        return reply(&mut stream, Response::error(403, "Origine rifiutata"));
     }
     let is_api = target.starts_with("/api/");
     // Loopback is not a security boundary (other local users and processes can connect):
     // every API call needs the per-session token; static files carry no data.
     if is_api && (duplicate_token || !token_matches(token, session_token.as_deref())) {
-        return write_response(
+        return reply(
             &mut stream,
             Response::error(401, "Sessione non valida: riapri la dashboard"),
         );
@@ -398,15 +477,34 @@ fn handle(
         && (request_origin.as_deref() != Some(origin)
             || content_type.as_deref() != Some("application/json"))
     {
-        return write_response(
+        return reply(
             &mut stream,
             Response::error(403, "Origine o tipo di contenuto rifiutato"),
         );
     }
     let mut body = vec![0; content_length.unwrap_or(0)];
     reader.read_exact(&mut body)?;
+    // Closing the dashboard (and asking the tray to close) is a session-authenticated,
+    // same-origin JSON request like every other mutation; the service is never involved.
+    if method == "POST" && target == "/api/shutdown" {
+        if body != SHUTDOWN_BODY.as_bytes() {
+            return reply(
+                &mut stream,
+                Response::error(400, "Invalid shutdown request"),
+            );
+        }
+        if let Ok(dir) = runtime_dir() {
+            let _ = request_tray_quit(&dir);
+        }
+        write_response(&mut stream, Response::json(200, "{\"ok\":true}"))?;
+        return Ok(Handled::Shutdown);
+    }
     let response = route(method, target, &body, root);
-    write_response(&mut stream, response)
+    reply(&mut stream, response)
+}
+
+fn reply(stream: &mut TcpStream, response: Response) -> io::Result<Handled> {
+    write_response(stream, response).map(|()| Handled::Continue)
 }
 
 fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
@@ -443,6 +541,9 @@ fn route(method: &str, target: &str, body: &[u8], root: &Path) -> Response {
             std::str::from_utf8(body).unwrap_or(""),
         )),
         ("POST", "/api/consent/simulate") => api(crate::consent::dashboard_simulate(
+            std::str::from_utf8(body).unwrap_or(""),
+        )),
+        ("POST", "/api/consent/decide") => api(crate::consent::dashboard_decide(
             std::str::from_utf8(body).unwrap_or(""),
         )),
         // Identity and trust store: local operator actions only. Imports carry the content of
@@ -782,6 +883,62 @@ mod tests {
             route("DELETE", "/api/identity", &[], Path::new("/x")).status,
             405
         );
+    }
+
+    #[test]
+    fn shutdown_needs_the_session_and_asks_the_tray_to_close() {
+        let _env = requirements::TestEnv::new("dashboard-shutdown");
+        let token = "e".repeat(64);
+        let request = |headers: &str, body: &str| {
+            format!(
+                "POST /api/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{{port}}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let origin = "Origin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\n";
+        let auth = format!("X-BaradWatchU-Token: {token}\r\n");
+        let quit_file = runtime_dir().unwrap().join(TRAY_QUIT_REQUEST);
+        // No token, foreign origin, or a body other than the confirmation: refused, nothing written.
+        assert!(exchange(&request(origin, SHUTDOWN_BODY), &token).starts_with("HTTP/1.1 401"));
+        assert!(exchange(
+            &request(
+                &format!("Origin: http://evil.example\r\nContent-Type: application/json\r\n{auth}"),
+                SHUTDOWN_BODY
+            ),
+            &token
+        )
+        .starts_with("HTTP/1.1 403"));
+        assert!(exchange(&request(&format!("{origin}{auth}"), "{}"), &token)
+            .starts_with("HTTP/1.1 400"));
+        assert!(!quit_file.exists());
+        // Authorized: the server answers, stops serving and leaves the tray request.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_token = token.clone();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            handle(
+                stream,
+                &format!("http://127.0.0.1:{port}"),
+                port,
+                &server_token,
+                Path::new("/does/not/exist"),
+            )
+            .unwrap()
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(
+                request(&format!("{origin}{auth}"), SHUTDOWN_BODY)
+                    .replace("{port}", &port.to_string())
+                    .as_bytes(),
+            )
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(server.join().unwrap(), Handled::Shutdown);
+        assert!(quit_file.is_file());
     }
 
     #[test]

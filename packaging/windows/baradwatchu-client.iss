@@ -1,15 +1,11 @@
 ﻿; BaradWatchU Client: Windows setup (Inno Setup 6).
-; Built by `install.ps1 -Package`, which stages the validated build and passes:
+; Built (and run) by `install.ps1`, which stages the validated build and passes:
 ;   /DAppVersion=X.Y.Z  /DStageDir=<staged bin + share tree>  /DWithTray=1|0  /O<output dir>
-; Two modes (dialog at start; silent: /ALLUSERS or /CURRENTUSER):
-; - All users (default, administrator): the complete Client in Program Files, Windows service
-;   included, installed/updated/removed through packaging\service\install-service.ps1 (shipped
-;   in {app}\share\baradwatchu-client\service). The service is stopped before files change and
-;   restarted (and checked) on the new executable; a failed or cancelled setup restarts it.
-; - Current user only (no administrator rights): %LOCALAPPDATA%\Programs\BaradWatchU, user's
-;   Start menu; agent, dashboard, tray, identity and local audits; no service, no remote
-;   communication.
-; An upgrade keeps the mode of the existing installation.
+; System-wide installation only (administrator): the complete Client in Program Files for all
+; users, Windows service included, installed/updated/removed through
+; packaging\service\install-service.ps1 (shipped in {app}\share\baradwatchu-client\service).
+; The service is stopped before files change and restarted (and checked) on the new
+; executable; a failed or cancelled setup restarts it. There is no per-user mode.
 ; Setup never generates keys, starts a Server connection or changes the firewall.
 ; Settings, identities, trust stores, custom checks and audit history live in
 ; %APPDATA% / %LOCALAPPDATA%\baradwatchu, service registrations in
@@ -26,7 +22,7 @@
 #endif
 
 [Setup]
-; Fixed AppId: upgrades replace the same installation. install.ps1 refuses a -Prefix owned by it.
+; Fixed AppId: upgrades replace the same installation.
 AppId={{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}
 AppName=BaradWatchU Client
 AppVersion={#AppVersion}
@@ -34,11 +30,8 @@ AppVerName=BaradWatchU Client {#AppVersion}
 AppPublisher=BaradWatchU
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription=BaradWatchU Client setup
-; All users (complete, with the service) by default; "only for me" stays available.
-; An upgrade keeps the mode of the existing installation (UsePreviousPrivileges).
+; All users only (the service needs it); no "only for me" override.
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=dialog commandline
-UsePreviousPrivileges=yes
 DefaultDirName={autopf}\BaradWatchU
 DisableProgramGroupPage=yes
 DefaultGroupName=BaradWatchU
@@ -78,8 +71,8 @@ it.ServiceFailed=I file sono installati, ma il servizio BaradWatchU non è stato
 en.ServiceFailed=The files are installed, but the BaradWatchU service could not be installed or started and is stopped (no old executable is running). From an elevated PowerShell run this to see the error:
 it.ServiceRemoveFailed=Impossibile rimuovere il servizio BaradWatchU; rimuovilo con: sc.exe delete BaradWatchU
 en.ServiceRemoveFailed=The BaradWatchU service could not be removed; remove it with: sc.exe delete BaradWatchU
-it.StillRunning=BaradWatchU è in esecuzione da questa cartella (dashboard o tray). Chiudi la dashboard (Ctrl+C o chiudi la sua finestra) e la tray (menu della tray › Chiudi tray), poi riprova. Nessun file è stato modificato.
-en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Close the dashboard (Ctrl+C or close its window) and the tray (tray menu › Close tray), then retry. No file was changed.
+it.StillRunning=BaradWatchU è in esecuzione da questa cartella (dashboard o tray). Usa «Chiudi BaradWatchU» nella dashboard o nel menu della tray (o esegui: baradwatchu-agent quit), poi riprova. Nessun file è stato modificato.
+en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Use "Quit BaradWatchU" in the dashboard or the tray menu (or run: baradwatchu-agent quit), then retry. No file was changed.
 
 [Tasks]
 #if WithTray == "1"
@@ -95,7 +88,7 @@ Source: "{#StageDir}\bin\baradwatchu-agent.exe"; DestDir: "{app}\bin"; Flags: ig
 Source: "{#StageDir}\bin\baradwatchu-tray.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 #endif
 Source: "{#StageDir}\share\*"; DestDir: "{app}\share"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Service component (all-users installations always run it; unused per user).
+; Service component (installed, updated and removed by every setup run).
 Source: "{#SourcePath}..\service\install-service.ps1"; DestDir: "{app}\share\baradwatchu-client\service"; Flags: ignoreversion
 
 [InstallDelete]
@@ -128,7 +121,7 @@ var
   ServiceStopped: Boolean;
   ServiceStepDone: Boolean;
 
-{ No uninstall entry for this AppId yet: first installation (per user: HKCU; all users: HKLM). }
+{ No uninstall entry for this AppId yet: first installation (HKA = HKLM in admin mode). }
 function IsFirstInstall(): Boolean;
 begin
   Result := not RegKeyExists(HKA, 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}_is1');
@@ -143,7 +136,10 @@ function PowerShell(const Arguments: String): Boolean;
 var
   Code: Integer;
 begin
-  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+  // sysnative constant = the 64-bit PowerShell. The setup itself is a 32-bit process, and a
+  // 32-bit PowerShell sees ProgramFiles as "Program Files (x86)" (install-service.ps1 then
+  // refused the x64 agent in "Program Files").
+  Result := Exec(ExpandConstant('{sysnative}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass ' + Arguments, '', SW_HIDE,
     ewWaitUntilTerminated, Code) and (Code = 0);
   Log('powershell ' + Arguments + ': ' + IntToStr(Code));
@@ -180,7 +176,10 @@ begin
   Result := True;
   if OurServiceInstalled() and ServiceRunning() then
   begin
-    Result := PowerShell('-Command "Stop-Service -Name ' + ServiceName + ' -ErrorAction Stop; (Get-Service -Name ' + ServiceName + ').WaitForStatus(''Stopped'', [TimeSpan]::FromSeconds(30))"');
+    // Judged by the final state, not by Stop-Service's own result: agents up to 0.0.1 exited
+    // inside the stop handler, so the SCM reported an error although the service stopped.
+    // The short sleep lets the process end after reporting STOPPED, before files change.
+    Result := PowerShell('-Command "Stop-Service -Name ' + ServiceName + ' -ErrorAction SilentlyContinue; (Get-Service -Name ' + ServiceName + ').WaitForStatus(''Stopped'', [TimeSpan]::FromSeconds(30)); Start-Sleep -Milliseconds 800"');
     ServiceStopped := Result;
   end;
 end;
@@ -205,7 +204,7 @@ begin
   if (CurStep = ssPostInstall) and IsAdminInstallMode then
   begin
     ServiceStepDone := True;
-    { All users = complete installation: the service is always installed or updated. }
+    { The service is always installed or updated. }
     if not ServiceScript('') then
     begin
       ServiceScript('-Stop');

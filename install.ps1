@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 # BaradWatchU Client installer for Windows: the Windows counterpart of install.sh.
-# Per-user installation, no administrator rights, no service. Run it with:
+# System-wide installation only (Program Files + Windows service), done by the Inno Setup
+# setup.exe that this script builds and then runs elevated (UAC). Run it with:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [options]
-# -Package builds the same artifacts into a dual-mode setup.exe with Inno Setup 6.
 param(
     [Alias('h')][switch]$Help,
     [Alias('V')][switch]$Version,
@@ -11,7 +11,6 @@ param(
     [switch]$NoBuild,
     [switch]$BuildOnly,
     [string]$BuildDir = '',
-    [string]$Prefix = '',
     [Alias('U')][switch]$Uninstall,
     [switch]$WithoutTray,
     [switch]$TrayAutostart,
@@ -30,45 +29,46 @@ $ManifestHeader = 'BaradWatchU source manifest v1'
 $ManifestKind = 'client-windows'
 $MarkerHeader = 'BaradWatchU build marker v2-windows'
 $Platform = 'Windows-x64'
-# Inno Setup AppId of the setup.exe produced by -Package (packaging/windows/baradwatchu-client.iss).
+$ServiceName = 'BaradWatchU'
+# Inno Setup AppId of the setup.exe (packaging/windows/baradwatchu-client.iss).
 $SetupAppId = '{8F3D2B6A-4C1E-4B7A-9E52-6D0B1C7A3E94}'
-$StartMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BaradWatchU'
+$SetupKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$($SetupAppId)_is1"
+$UserSetupKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$($SetupAppId)_is1"
+# Former per-user installation made by older versions of this script (removed by -Uninstall).
+$LegacyPrefix = Join-Path $env:LOCALAPPDATA 'Programs\BaradWatchU'
+$LegacyStartMenuDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\BaradWatchU'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $RunValue = 'BaradWatchU-Tray'
 
 function Show-Usage {
     @'
-BaradWatchU Client installer for Windows (per user, no administrator rights)
+BaradWatchU Client installer for Windows (system-wide, with the Windows service)
 Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [OPTIONS]
   -Help, -h          Show help          -Version, -V       Show version
   -MissingDeps       Read-only dependency check: [REQUIRED] items block the
-                     install, [optional] items only degrade checks or packaging
-  -DryRun            Print the plan without changing files
+                     install, [optional] items only degrade checks
+  -DryRun            Print the plan without building or changing anything
   -NoBuild           Reuse a validated source/platform/version build cache
-  -BuildOnly         Build and validate the cache; do not install files
+  -BuildOnly         Build and validate the cache; do not install
   -BuildDir DIR      Build cache outside the source tree
                      (default %LOCALAPPDATA%\baradwatchu\build\baradwatchu-agent-VERSION)
-  -Prefix DIR        Installation folder (default %LOCALAPPDATA%\Programs\BaradWatchU)
-  -Uninstall, -U     Remove unchanged files listed in the installation manifest
+  -Uninstall, -U     Run the uninstaller of the system installation; also removes
+                     a former per-user installation made by older versions
   -WithoutTray       Do not build/install the baradwatchu-tray companion
-  -TrayAutostart     Enable start of the tray at login (HKCU Run key), also on a reinstall
-  -NoTrayAutostart   Do not enable it on a first installation. By default a first
-                     installation enables start at login and a reinstall keeps the
-                     user's choice (tray menu: Avvia al login)
-  -Package           Build a setup.exe with Inno Setup 6 instead of
-                     installing (with -OutputDir DIR, default BUILDDIR\dist)
-Everything runs as the current user: files go to a per-user folder and Start
-menu entries to the user's Start menu. No service, scheduled task or system
-setting is changed; settings, identities, trust stores, custom checks and
-history are never touched. This is the per-user installation mode: local
-audits, dashboard, tray, identity and reports work; there is no system service
-and no remote communication. The complete system installation (with the
-service for remote audit requests) is the setup built with -Package, run as an
-administrator for all users (its default; see the README).
-Before files are replaced or removed, a running baradwatchu-agent or
-baradwatchu-tray of the same installation (matched by executable path, e.g. an
-open dashboard) is asked to close (Ctrl+C / close request) and gets up to
-BARADWATCHU_STOP_TIMEOUT seconds (default 10); it is never killed.
+  -TrayAutostart     First installation: start the tray at login (default)
+  -NoTrayAutostart   First installation: do not start the tray at login. An
+                     upgrade keeps the user's choice (tray menu: Avvia al login)
+  -Package           Only build the setup.exe (with -OutputDir DIR, default
+                     BUILDDIR\dist), e.g. to install it on other machines
+Install = build as the current user, build the setup.exe with Inno Setup 6, then
+run it elevated (UAC: administrator credentials are required). The setup
+installs into Program Files for all users and installs, updates and starts the
+BaradWatchU Windows service that keeps the Server connections (tunnels). There
+is no per-user installation. Settings, identities, trust stores, custom checks
+and history are never touched.
+Before the setup runs, the dashboard and tray of the installed version are asked
+to close (baradwatchu-agent quit); the setup refuses to replace files while a
+program of that folder is still running and never kills it.
 '@
 }
 
@@ -174,15 +174,10 @@ function Test-Dependencies([string]$Mode) {
     if (Test-Path -LiteralPath $powershell) { DepOk "Windows PowerShell 5.1 ($powershell): runs the built-in checks" }
     else { DepRequired 'Windows PowerShell 5.1 (runs the built-in checks)'; $missing++ }
     if ([Environment]::Is64BitOperatingSystem) { DepOk '64-bit Windows' } else { DepRequired '64-bit Windows'; $missing++ }
-    if ($Mode -eq 'package' -or $Mode -eq 'audit') {
+    if ($Mode -ne 'build') {
+        Section '[REQUIRED] setup'
         $iscc = Get-InnoCompiler
-        if ($Mode -eq 'package') {
-            Section '[REQUIRED] packaging'
-            if ($iscc) { DepOk "Inno Setup 6 ($iscc)" } else { DepRequired 'Inno Setup 6 (winget install JRSoftware.InnoSetup)'; $missing++ }
-        } else {
-            Section '[optional] packaging (-Package)'
-            if ($iscc) { DepOk "Inno Setup 6 ($iscc)" } else { DepOptional 'Inno Setup 6 for -Package (winget install JRSoftware.InnoSetup)' }
-        }
+        if ($iscc) { DepOk "Inno Setup 6 ($iscc)" } else { DepRequired 'Inno Setup 6 (winget install JRSoftware.InnoSetup)'; $missing++ }
     }
     if ($Mode -eq 'audit') {
         Section '[optional] audit sources'
@@ -449,26 +444,108 @@ function New-Stage([string]$StageDir) {
     $problem = Test-RequirementAssets $share
     if ($problem) { Fail "staged check folders are invalid ($problem)" }
 }
-function Get-StagedFiles([string]$StageDir) {
-    $files = @(Get-ChildItem -LiteralPath $StageDir -Recurse -File -Force | ForEach-Object {
-            $_.FullName.Substring($StageDir.Length).TrimStart('\').Replace('\', '/')
-        })
-    [Array]::Sort($files, [StringComparer]::Ordinal)
-    return $files
-}
 function Test-Allowed([string]$Rel) {
     if ($Rel -match '(^|/)\.\.(/|$)' -or $Rel.StartsWith('/') -or $Rel -match '^[A-Za-z]:') { return $false }
     return ($Rel -eq "bin/$Bin" -or $Rel -eq "bin/$TrayBin" -or $Rel.StartsWith('share/baradwatchu-client/'))
 }
 
-# --- manifest ----------------------------------------------------------------------------
+# --- system installation (setup.exe) ----------------------------------------------------
 
-function Get-ManifestPath { return Join-Path $Prefix 'share\baradwatchu-source\baradwatchu-agent.manifest' }
-function Read-InstallManifest {
-    $path = Get-ManifestPath
-    $lines = [IO.File]::ReadAllLines($path)
-    if ($lines.Count -lt 4 -or $lines[0] -ne $ManifestHeader -or $lines[1] -ne $ManifestKind -or -not [string]::Equals($lines[2], $Prefix, [StringComparison]::OrdinalIgnoreCase)) {
-        Fail 'installation manifest missing, unsafe or mismatched'
+function Get-SetupEntry {
+    $entry = Get-ItemProperty -Path $SetupKey -ErrorAction SilentlyContinue
+    if ($entry -and $entry.PSObject.Properties['InstallLocation'] -and $entry.InstallLocation) { return $entry }
+    return $null
+}
+
+# Asks the dashboard and tray of the installed version to close (`quit`, same as the button in
+# the dashboard and the tray menu). Older agents without `quit` are left to the setup check.
+function Close-InstalledPrograms {
+    $entry = Get-SetupEntry
+    if (-not $entry) { return }
+    $agent = Join-Path (Get-FullPath $entry.InstallLocation) "bin\$Bin"
+    if (-not (Test-Path -LiteralPath $agent -PathType Leaf)) { return }
+    if ($DryRun) { Write-Host "Would ask the dashboard and tray of $agent to close (quit)"; return }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { $text = (& $agent quit 2>&1 | Out-String).Trim() } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -eq 0) {
+        if ($text) { Write-Host $text }
+        # The tray reads the request at its next poll (every 5 s).
+        Start-Sleep -Seconds 6
+    } else {
+        Write-Host 'The installed version cannot close its dashboard and tray by itself; close them if the setup asks.' -ForegroundColor Yellow
+    }
+}
+
+function Invoke-Setup([string]$Setup) {
+    $arguments = @('/SILENT', '/NORESTART', "/LOG=`"$(Join-Path $BuildDir 'setup.log')`"")
+    if (-not $WithoutTray) {
+        if ($NoTrayAutostart) { $arguments += '/MERGETASKS="!trayautostart"' }
+        elseif ($TrayAutostart) { $arguments += '/MERGETASKS="trayautostart"' }
+    }
+    Write-Host 'Starting the setup as administrator (UAC prompt)...'
+    try {
+        $process = Start-Process -FilePath $Setup -ArgumentList $arguments -Verb RunAs -Wait -PassThru
+    } catch {
+        Fail "the setup was not started (administrator rights refused?): $($_.Exception.Message)"
+    }
+    if ($process.ExitCode -ne 0) { Fail "the setup ended with exit code $($process.ExitCode); see $(Join-Path $BuildDir 'setup.log')" }
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -eq 'Running') {
+        Write-Host "Installed BaradWatchU Client $ProductVersion for all users; service $ServiceName running."
+    } else {
+        Fail "files installed, but the $ServiceName service is not running; see $(Join-Path $BuildDir 'setup.log')"
+    }
+}
+
+function Invoke-Install {
+    Assert-NoLegacyInstall
+    if ($NoBuild) {
+        if (-not (Test-Dependencies 'runtime')) { Fail 'required dependencies are missing; nothing was installed' }
+    }
+    Invoke-Package | Out-Host
+    $setup = Get-SetupPath
+    Close-InstalledPrograms
+    Invoke-Setup $setup
+}
+
+function Invoke-SystemUninstall {
+    $entry = Get-SetupEntry
+    if (-not $entry) { Write-Host 'No system installation of BaradWatchU Client found.'; return }
+    $uninstaller = "$($entry.UninstallString)".Trim('"')
+    if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { Fail "uninstaller missing: $uninstaller" }
+    if ($DryRun) { Write-Host "Would run $uninstaller /SILENT as administrator"; return }
+    Close-InstalledPrograms
+    Write-Host 'Starting the uninstaller as administrator (UAC prompt)...'
+    try {
+        $process = Start-Process -FilePath $uninstaller -ArgumentList '/SILENT', '/NORESTART' -Verb RunAs -Wait -PassThru
+    } catch {
+        Fail "the uninstaller was not started (administrator rights refused?): $($_.Exception.Message)"
+    }
+    if ($process.ExitCode -ne 0) { Fail "the uninstaller ended with exit code $($process.ExitCode)" }
+    Write-Host 'System installation removed; configuration and user data preserved.'
+}
+
+# --- former per-user installation --------------------------------------------------------
+# Older versions of this script installed per user without the service. Both kinds would
+# register the same Start menu names and start-at-login value, so install refuses while one
+# exists and -Uninstall removes it (manifest-owned, unchanged files only).
+
+function Get-LegacyManifestPath { return Join-Path $LegacyPrefix 'share\baradwatchu-source\baradwatchu-agent.manifest' }
+
+function Assert-NoLegacyInstall {
+    if (Test-Path -LiteralPath $UserSetupKey) {
+        Fail 'a per-user BaradWatchU setup installation exists: uninstall it from Settings > Apps first'
+    }
+    if (Test-Path -LiteralPath (Get-LegacyManifestPath) -PathType Leaf) {
+        Fail "a per-user installation exists in ${LegacyPrefix}: remove it first with install.ps1 -Uninstall"
+    }
+}
+
+function Read-LegacyManifest {
+    $lines = [IO.File]::ReadAllLines((Get-LegacyManifestPath))
+    if ($lines.Count -lt 4 -or $lines[0] -ne $ManifestHeader -or $lines[1] -ne $ManifestKind -or -not [string]::Equals($lines[2], $LegacyPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Fail 'per-user installation manifest missing, unsafe or mismatched'
     }
     $files = [ordered]@{}
     $shortcuts = New-Object System.Collections.Generic.List[string]
@@ -480,37 +557,24 @@ function Read-InstallManifest {
         elseif ($fields[0] -eq 'shortcut' -and $fields[2] -match '^[A-Za-z0-9 ._-]+\.lnk$') { $shortcuts.Add($fields[2]) }
         else { Fail 'invalid manifest ownership entry' }
     }
-    return @{ Version = $lines[3]; Files = $files; Shortcuts = $shortcuts }
+    return @{ Files = $files; Shortcuts = $shortcuts }
 }
+
 function Test-HashOk([string]$Path, [string]$Hash) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant() -eq $Hash
 }
-# A folder installed by the setup.exe is owned by that setup (like a package manager).
-function Assert-NotOwnedBySetup {
-    $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$($SetupAppId)_is1"
-    $entry = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
-    if ($entry -and $entry.PSObject.Properties['InstallLocation'] -and $entry.InstallLocation) {
-        if ([string]::Equals((Get-FullPath $entry.InstallLocation), $Prefix, [StringComparison]::OrdinalIgnoreCase)) {
-            Fail "$Prefix is managed by the BaradWatchU setup; uninstall it from Settings > Apps first or choose another -Prefix"
-        }
-    }
-}
 
-# --- running instances -------------------------------------------------------------------
-
-function Get-RunningInstances {
-    $targets = @((Join-Path $Prefix "bin\$Bin"), (Join-Path $Prefix "bin\$TrayBin"))
+# Running programs of the per-user folder: closed politely, never killed. The per-user agent
+# may predate `quit`, so the window close request / Ctrl+C helper is still needed here.
+function Get-LegacyInstances {
+    $targets = @((Join-Path $LegacyPrefix "bin\$Bin"), (Join-Path $LegacyPrefix "bin\$TrayBin"))
     return @(Get-CimInstance Win32_Process -Filter "Name = '$Bin' OR Name = '$TrayBin'" | Where-Object {
-            # Normalize: a process started through an 8.3 short path reports that form.
             $exe = $_.ExecutablePath
             if ($exe) { $exe = Get-FullPath $exe }
             $exe -and ($targets | Where-Object { [string]::Equals($_, $exe, [StringComparison]::OrdinalIgnoreCase) })
         })
 }
-# Windows has no SIGTERM: ask politely, never TerminateProcess. A short-lived helper posts
-# WM_CLOSE to the process's "BaradWatchU Tray" window (the GUI tray quits as from its menu)
-# and sends Ctrl+C on the process's own console (agent, dashboard); our console is untouched.
 function Send-CloseRequest([int]$ProcessId) {
     $helper = @"
 Add-Type -Namespace BaradWatchU -Name Console -MemberDefinition @'
@@ -545,13 +609,13 @@ if ([BaradWatchU.Console]::AttachConsole($ProcessId)) {
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     Start-Process -FilePath $powershell -ArgumentList '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded -WindowStyle Hidden -Wait
 }
-function Stop-RunningInstances {
-    $instances = @(Get-RunningInstances)
+function Stop-LegacyInstances {
+    $instances = @(Get-LegacyInstances)
     if ($instances.Count -eq 0) { return }
     $timeout = 10
     if ($env:BARADWATCHU_STOP_TIMEOUT -match '^\d+$') { $timeout = [int]$env:BARADWATCHU_STOP_TIMEOUT }
     foreach ($instance in $instances) {
-        Write-Host "Closing running $($instance.Name) (PID $($instance.ProcessId)) of this installation..."
+        Write-Host "Closing running $($instance.Name) (PID $($instance.ProcessId)) of the per-user installation..."
         if (-not $DryRun) { Send-CloseRequest ([int]$instance.ProcessId) }
     }
     if ($DryRun) { return }
@@ -562,105 +626,8 @@ function Stop-RunningInstances {
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
     $list = ($alive | ForEach-Object { "$($_.Name) PID $($_.ProcessId)" }) -join ', '
-    Fail "still running after $timeout s: $list. Close it (Ctrl+C in the dashboard window, Close tray in the tray menu) and retry; nothing was changed"
+    Fail "still running after $timeout s: $list. Close it and retry; nothing was changed"
 }
-function Show-RunningInstances {
-    foreach ($instance in Get-RunningInstances) { Write-Host "  would close $($instance.Name) (PID $($instance.ProcessId))" }
-}
-
-# --- Start menu, autostart ---------------------------------------------------------------
-
-function Get-Shortcuts {
-    $list = @(@{ Name = 'BaradWatchU Dashboard.lnk'; Target = (Join-Path $Prefix "bin\$Bin"); Arguments = 'dashboard'; Description = 'Apre la dashboard locale di BaradWatchU (chiudi la finestra per fermarla)' })
-    if (-not $WithoutTray) {
-        $list += @{ Name = 'BaradWatchU Tray.lnk'; Target = (Join-Path $Prefix "bin\$TrayBin"); Arguments = ''; Description = 'Stato di BaradWatchU, notifiche e richieste di consenso' }
-    }
-    return $list
-}
-# Start menu entries share one folder and fixed names for every installation of this user: an
-# entry that points into another installation (another -Prefix, or the setup) is left alone.
-function Get-OwnShortcuts {
-    $shell = $null
-    $own = New-Object System.Collections.Generic.List[object]
-    foreach ($entry in Get-Shortcuts) {
-        $path = Join-Path $StartMenuDir $entry.Name
-        if (Test-Path -LiteralPath $path -PathType Leaf) {
-            if (-not $shell) { $shell = New-Object -ComObject WScript.Shell }
-            $target = $shell.CreateShortcut($path).TargetPath
-            if ($target -and -not (Test-Inside $target $Prefix)) {
-                Write-Host "Start menu entry '$($entry.Name)' belongs to another BaradWatchU installation ($target): left unchanged." -ForegroundColor Yellow
-                continue
-            }
-        }
-        $own.Add($entry)
-    }
-    # Callers wrap the result in @(): an empty list must stay empty, not become one element.
-    return $own.ToArray()
-}
-function New-Shortcuts([object[]]$Entries) {
-    New-Item -ItemType Directory -Force -Path $StartMenuDir | Out-Null
-    $shell = New-Object -ComObject WScript.Shell
-    foreach ($entry in $Entries) {
-        $link = $shell.CreateShortcut((Join-Path $StartMenuDir $entry.Name))
-        $link.TargetPath = $entry.Target
-        $link.Arguments = $entry.Arguments
-        $link.WorkingDirectory = Join-Path $Prefix 'bin'
-        $link.Description = $entry.Description
-        $link.Save()
-    }
-}
-function Remove-Shortcuts([string[]]$Names) {
-    if (-not (Test-Path -LiteralPath $StartMenuDir)) { return }
-    $shell = New-Object -ComObject WScript.Shell
-    foreach ($name in $Names) {
-        $path = Join-Path $StartMenuDir $name
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        # Only shortcuts that still point into this installation are removed.
-        $target = $shell.CreateShortcut($path).TargetPath
-        if ($target -and (Test-Inside $target $Prefix)) {
-            if ($DryRun) { Write-Host "Would remove Start menu entry $path" } else { Remove-Item -LiteralPath $path -Force }
-        }
-    }
-    if (-not $DryRun -and -not (Get-ChildItem -LiteralPath $StartMenuDir -Force)) { Remove-Item -LiteralPath $StartMenuDir -Force }
-}
-function Remove-TrayAutostart {
-    $value = (Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue)
-    if (-not $value) { return }
-    $command = "$($value.$RunValue)".Trim('"')
-    try { $command = Get-FullPath $command } catch { return }
-    if ([string]::Equals($command, (Join-Path $Prefix "bin\$TrayBin"), [StringComparison]::OrdinalIgnoreCase)) {
-        if ($DryRun) { Write-Host 'Would remove the tray autostart entry (HKCU Run)' }
-        else { Remove-ItemProperty -Path $RunKey -Name $RunValue; Write-Host 'Removed the tray autostart entry (HKCU Run)' }
-    }
-}
-function Invoke-PostInstall {
-    if ($WithoutTray) { return }
-    $tray = Join-Path $Prefix "bin\$TrayBin"
-    # Start at login: on by default for a first installation; a reinstall keeps the user's
-    # choice (tray menu "Avvia al login"); -TrayAutostart forces it, -NoTrayAutostart skips it.
-    # The HKCU Run value is shared by every installation of this user: the default never takes
-    # it over from another installation; -TrayAutostart does, because it is explicit.
-    $runEntry = Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
-    $otherOwner = $null
-    if ($runEntry) {
-        $command = "$($runEntry.$RunValue)".Trim('"')
-        try { $command = Get-FullPath $command } catch { }
-        if (-not [string]::Equals($command, $tray, [StringComparison]::OrdinalIgnoreCase)) { $otherOwner = $command }
-    }
-    if (-not $TrayAutostart -and $script:FreshInstall -and -not $NoTrayAutostart -and $otherOwner) {
-        Write-Host "Start at login already used by another BaradWatchU installation ($otherOwner): left unchanged (use -TrayAutostart to move it here)." -ForegroundColor Yellow
-    } elseif ($TrayAutostart -or ($script:FreshInstall -and -not $NoTrayAutostart)) {
-        $result = Invoke-Tray $tray @('autostart', 'enable')
-        if ($result.Text) { Write-Host $result.Text }
-        if ($result.Code -ne 0) { Write-Host 'Warning: tray autostart could not be enabled' -ForegroundColor Yellow }
-    } else {
-        $result = Invoke-Tray $tray @('autostart', 'status')
-        if ($result.Text) { Write-Host "$($result.Text) (unchanged; change it from the tray menu: Avvia al login)" }
-    }
-    Write-Host "Tray companion: start it with $tray (or the Start menu); closing it does not stop the agent."
-}
-
-# --- install / uninstall -----------------------------------------------------------------
 
 function Remove-EmptyFolders([string]$Base) {
     if (-not (Test-Path -LiteralPath $Base -PathType Container)) { return }
@@ -669,109 +636,53 @@ function Remove-EmptyFolders([string]$Base) {
     if (-not (Get-ChildItem -LiteralPath $Base -Force)) { Remove-Item -LiteralPath $Base -Force }
 }
 
-function Invoke-Uninstall {
-    Assert-NoReparsePoint $Prefix
-    Assert-NotOwnedBySetup
-    if (-not (Test-Path -LiteralPath (Get-ManifestPath) -PathType Leaf)) { Fail "no installation manifest in $Prefix" }
-    $manifest = Read-InstallManifest
-    # Preflight every owned path before removing any of them.
+function Remove-LegacyInstall {
+    if (-not (Test-Path -LiteralPath (Get-LegacyManifestPath) -PathType Leaf)) { return }
+    Assert-NoReparsePoint $LegacyPrefix
+    Write-Host "Removing the former per-user installation in $LegacyPrefix"
+    $manifest = Read-LegacyManifest
     foreach ($rel in $manifest.Files.Keys) {
-        $path = Join-Path $Prefix $rel
+        $path = Join-Path $LegacyPrefix $rel
         if ((Test-Path -LiteralPath $path) -and -not (Test-HashOk $path $manifest.Files[$rel])) { Fail "changed file preserved: $path" }
     }
-    Remove-TrayAutostart
-    Stop-RunningInstances
+    # Start at login: only the value that starts this per-user tray.
+    $value = Get-ItemProperty -Path $RunKey -Name $RunValue -ErrorAction SilentlyContinue
+    if ($value) {
+        $command = "$($value.$RunValue)".Trim('"')
+        try { $command = Get-FullPath $command } catch { $command = '' }
+        if ([string]::Equals($command, (Join-Path $LegacyPrefix "bin\$TrayBin"), [StringComparison]::OrdinalIgnoreCase)) {
+            if ($DryRun) { Write-Host 'Would remove the per-user tray autostart entry (HKCU Run)' }
+            else { Remove-ItemProperty -Path $RunKey -Name $RunValue; Write-Host 'Removed the per-user tray autostart entry (HKCU Run)' }
+        }
+    }
+    Stop-LegacyInstances
     $count = 0
     foreach ($rel in $manifest.Files.Keys) {
-        $path = Join-Path $Prefix $rel
+        $path = Join-Path $LegacyPrefix $rel
         if (Test-Path -LiteralPath $path) {
             if ($DryRun) { Write-Host "Would remove $path" } else { Remove-Item -LiteralPath $path -Force }
             $count++
         }
     }
-    Remove-Shortcuts ([string[]]$manifest.Shortcuts)
-    if ($DryRun) { Write-Host "Would remove $(Get-ManifestPath)"; Write-Host "Dry-run complete; $count files would be removed."; return }
-    Remove-Item -LiteralPath (Get-ManifestPath) -Force
-    Remove-EmptyFolders $Prefix
-    Write-Host 'Manifest removed; configuration and user data preserved.'
-    Write-Host "Uninstall complete; $count files removed."
+    if (Test-Path -LiteralPath $LegacyStartMenuDir) {
+        $shell = New-Object -ComObject WScript.Shell
+        foreach ($name in $manifest.Shortcuts) {
+            $path = Join-Path $LegacyStartMenuDir $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $target = $shell.CreateShortcut($path).TargetPath
+            if ($target -and (Test-Inside $target $LegacyPrefix)) {
+                if ($DryRun) { Write-Host "Would remove Start menu entry $path" } else { Remove-Item -LiteralPath $path -Force }
+            }
+        }
+        if (-not $DryRun -and -not (Get-ChildItem -LiteralPath $LegacyStartMenuDir -Force)) { Remove-Item -LiteralPath $LegacyStartMenuDir -Force }
+    }
+    if ($DryRun) { Write-Host "Dry-run: $count per-user files would be removed."; return }
+    Remove-Item -LiteralPath (Get-LegacyManifestPath) -Force
+    Remove-EmptyFolders $LegacyPrefix
+    Write-Host "Per-user installation removed ($count files); configuration and user data preserved."
 }
 
-function Invoke-Install {
-    if ((Test-Path -LiteralPath $Prefix) -and -not (Test-Path -LiteralPath $Prefix -PathType Container)) { Fail 'prefix exists and is not a directory' }
-    Assert-NoReparsePoint $Prefix
-    Assert-NotOwnedBySetup
-    if ($NoBuild) {
-        if (-not (Test-Dependencies 'runtime')) { Fail 'required runtime dependencies are missing; nothing was installed' }
-        Test-Build
-    } else {
-        Invoke-Build
-    }
-    # First installation = no manifest yet; it decides the start-at-login default.
-    $script:FreshInstall = -not (Test-Path -LiteralPath (Get-ManifestPath))
-    $stage = Join-Path $BuildDir ('stage-' + [Guid]::NewGuid().ToString('N'))
-    try {
-        New-Stage $stage
-        $staged = @(Get-StagedFiles $stage)
-        $old = [ordered]@{}
-        $oldShortcuts = @()
-        if (Test-Path -LiteralPath (Get-ManifestPath)) {
-            $manifest = Read-InstallManifest
-            $old = $manifest.Files
-            $oldShortcuts = [string[]]$manifest.Shortcuts
-        }
-        $entries = New-Object System.Collections.Generic.List[string]
-        foreach ($rel in $staged) {
-            if (-not (Test-Allowed $rel)) { Fail "staged path outside allowed destinations: $rel" }
-            $dest = Join-Path $Prefix $rel
-            if (Test-Path -LiteralPath $dest) {
-                if (-not $old.Contains($rel)) { Fail "unmanaged file exists: $dest" }
-                if (-not (Test-HashOk $dest $old[$rel])) { Fail "changed file preserved: $dest" }
-            }
-            $entries.Add("file`t$((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $stage $rel)).Hash.ToLowerInvariant())`t$rel")
-        }
-        foreach ($rel in $old.Keys) {
-            if ($staged -contains $rel) { continue }
-            $dest = Join-Path $Prefix $rel
-            if ((Test-Path -LiteralPath $dest) -and -not (Test-HashOk $dest $old[$rel])) { Fail "changed old file preserved: $dest" }
-        }
-        $ownShortcuts = @(Get-OwnShortcuts)
-        foreach ($entry in $ownShortcuts) { $entries.Add("shortcut`t-`t$($entry.Name)") }
-        Write-Host "Staged $($staged.Count) files before modifying $Prefix."
-        # Last step before any file changes: close this installation's running programs.
-        Stop-RunningInstances
-        foreach ($rel in $staged) {
-            $dest = Join-Path $Prefix $rel
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
-            $tmp = "$dest.baradwatchu-$([Guid]::NewGuid().ToString('N'))"
-            try {
-                Copy-Item -LiteralPath (Join-Path $stage $rel) -Destination $tmp
-                Move-Item -LiteralPath $tmp -Destination $dest -Force
-            } catch {
-                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
-                Fail "could not replace destination file: $dest ($($_.Exception.Message))"
-            }
-        }
-        foreach ($rel in $old.Keys) {
-            if ($staged -contains $rel) { continue }
-            $dest = Join-Path $Prefix $rel
-            if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Force }
-        }
-        $manifestPath = Get-ManifestPath
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $manifestPath) | Out-Null
-        $content = @($ManifestHeader, $ManifestKind, $Prefix, $ProductVersion) + $entries.ToArray()
-        $tmpManifest = "$manifestPath.baradwatchu-$([Guid]::NewGuid().ToString('N'))"
-        [IO.File]::WriteAllText($tmpManifest, (($content -join "`n") + "`n"), (New-Object Text.UTF8Encoding $false))
-        Move-Item -LiteralPath $tmpManifest -Destination $manifestPath -Force
-        $stale = @($oldShortcuts | Where-Object { (Get-Shortcuts | ForEach-Object { $_.Name }) -notcontains $_ })
-        if ($stale.Count -gt 0) { Remove-Shortcuts ([string[]]$stale) }
-        New-Shortcuts $ownShortcuts
-        Write-Host "Installed BaradWatchU Client $ProductVersion in $Prefix (Start menu: BaradWatchU). No service or system setting was changed; configuration and user data were preserved."
-        Invoke-PostInstall
-    } finally {
-        if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-    }
-}
+function Get-SetupPath { return Join-Path $OutputDir "BaradWatchU-Client-$ProductVersion-setup.exe" }
 
 function Invoke-Package {
     if (-not (Test-Dependencies 'package')) { Fail 'required dependencies are missing (see the [REQUIRED] items above); no setup was built' }
@@ -784,7 +695,7 @@ function Invoke-Package {
     New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
     $tray = if ($WithoutTray) { '0' } else { '1' }
     Invoke-Native 'Inno Setup compiler' { & $iscc /Q "/DAppVersion=$ProductVersion" "/DStageDir=$stage" "/DWithTray=$tray" "/O$OutputDir" $script }
-    $setup = Join-Path $OutputDir "BaradWatchU-Client-$ProductVersion-setup.exe"
+    $setup = Get-SetupPath
     if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { Fail "setup not produced: $setup" }
     Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
     $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash.ToLowerInvariant()
@@ -798,11 +709,11 @@ function Show-Options([string]$Action) {
     Write-Host ('  {0,-18} {1}' -f 'action', $Action)
     if ($Action -eq 'dependency check') { return }
     if ($Action -ne 'uninstall') { Write-Host ('  {0,-18} {1}' -f 'build cache', $BuildDir) }
-    if ($Action -ne 'build-only' -and $Action -ne 'package') { Write-Host ('  {0,-18} {1}' -f 'prefix', $Prefix) }
-    if ($Action -eq 'package') { Write-Host ('  {0,-18} {1}' -f 'output', $OutputDir) }
+    if ($Action -eq 'install') { Write-Host ('  {0,-18} {1}' -f 'mode', 'system-wide (Program Files, Windows service), setup run as administrator') }
+    if ($Action -ne 'build-only' -and $Action -ne 'uninstall') { Write-Host ('  {0,-18} {1}' -f 'setup output', $OutputDir) }
     if ($Action -ne 'uninstall') {
         Write-Host ('  {0,-18} {1}' -f 'tray', $(if ($WithoutTray) { 'not built' } else { 'built and installed' }))
-        $autostart = if ($WithoutTray) { 'not applicable' } elseif ($TrayAutostart) { 'enabled after install' } elseif ($NoTrayAutostart) { 'not enabled (a reinstall keeps the current choice)' } else { 'enabled on first install; a reinstall keeps the current choice' }
+        $autostart = if ($WithoutTray) { 'not applicable' } elseif ($NoTrayAutostart) { 'not enabled on first install' } else { 'enabled on first install; an upgrade keeps the current choice' }
         Write-Host ('  {0,-18} {1}' -f 'tray autostart', $autostart)
         Write-Host ('  {0,-18} {1}' -f 'reuse build', $(if ($NoBuild) { 'yes (-NoBuild)' } else { 'no' }))
     }
@@ -811,55 +722,57 @@ function Show-Options([string]$Action) {
 
 # --- main --------------------------------------------------------------------------------
 
+# Without [CmdletBinding()] PowerShell puts unknown arguments in $args silently: an option
+# that no longer exists (for example -Prefix) must not start a full installation.
+if ($args.Count -gt 0) { BadArg "unknown argument: $($args -join ' ')" }
 if ($Help) { Show-Usage; exit 0 }
 if ($Version) { Write-Host "BaradWatchU Client $ProductVersion"; exit 0 }
-$installSet = $DryRun -or $NoBuild -or $BuildOnly -or $Uninstall -or $Package -or $Prefix -or $BuildDir -or $OutputDir -or $WithoutTray -or $TrayAutostart -or $NoTrayAutostart
+$installSet = $DryRun -or $NoBuild -or $BuildOnly -or $Uninstall -or $Package -or $BuildDir -or $OutputDir -or $WithoutTray -or $TrayAutostart -or $NoTrayAutostart
 if ($MissingDeps) {
     if ($installSet) { BadArg '-MissingDeps conflicts with other options' }
     Show-Options 'dependency check'
     if (Test-Dependencies 'audit') { exit 0 } else { exit 1 }
 }
-if ($BuildOnly -and ($DryRun -or $NoBuild -or $Uninstall -or $Prefix -or $Package)) { BadArg '-BuildOnly conflicts with install options' }
+if ($BuildOnly -and ($DryRun -or $NoBuild -or $Uninstall -or $Package)) { BadArg '-BuildOnly conflicts with install options' }
 if ($BuildOnly -and -not $BuildDir) { BadArg '-BuildOnly requires an explicit -BuildDir DIR' }
 if ($WithoutTray -and ($TrayAutostart -or $NoTrayAutostart)) { BadArg 'tray autostart options conflict with -WithoutTray' }
 if ($TrayAutostart -and $NoTrayAutostart) { BadArg '-TrayAutostart conflicts with -NoTrayAutostart' }
 if ($Uninstall -and ($WithoutTray -or $TrayAutostart -or $NoTrayAutostart)) { BadArg '-Uninstall removes the tray when installed; tray options do not apply' }
 if ($Uninstall -and ($NoBuild -or $BuildDir -or $Package)) { BadArg '-Uninstall conflicts with build options' }
-if ($Package -and ($Prefix -or $TrayAutostart -or $NoTrayAutostart -or $DryRun)) { BadArg '-Package builds a setup; -Prefix, tray autostart options and -DryRun do not apply' }
-if ($OutputDir -and -not $Package) { BadArg '-OutputDir requires -Package' }
+if ($Package -and ($TrayAutostart -or $NoTrayAutostart -or $DryRun)) { BadArg '-Package only builds the setup; tray autostart options and -DryRun do not apply' }
+if ($OutputDir -and $Uninstall) { BadArg '-OutputDir does not apply to -Uninstall' }
 
-if (-not $Prefix) { $Prefix = Join-Path $env:LOCALAPPDATA 'Programs\BaradWatchU' }
 if (-not $BuildDir) { $BuildDir = Join-Path $env:LOCALAPPDATA "baradwatchu\build\baradwatchu-agent-$ProductVersion" }
-if (-not [IO.Path]::IsPathRooted($Prefix)) { BadArg '-Prefix must be an absolute path' }
 if (-not [IO.Path]::IsPathRooted($BuildDir)) { BadArg '-BuildDir must be an absolute path' }
-$Prefix = Get-FullPath $Prefix
 $BuildDir = Get-FullPath $BuildDir
-if ($Prefix.Length -le 3) { BadArg '-Prefix may not be a drive root' }
 if (Test-Inside $BuildDir $Root) { BadArg '-BuildDir must be outside the source tree' }
-if (Test-Inside $Prefix $Root) { BadArg '-Prefix must be outside the source tree' }
 if (-not $OutputDir) { $OutputDir = Join-Path $BuildDir 'dist' }
 $OutputDir = Get-FullPath $OutputDir
 
 if ($BuildOnly) {
     Show-Options 'build-only'
     Invoke-Build
-    Write-Host "Build-only complete; validated cache at $BuildDir. No installation files changed."
+    Write-Host "Build-only complete; validated cache at $BuildDir. Nothing was installed."
     exit 0
 }
 if ($Package) { Show-Options 'package'; Invoke-Package; exit 0 }
 if ($Uninstall) {
     Show-Options 'uninstall'
-    if ($DryRun) { Write-Host 'Dry-run: no files change.'; Show-RunningInstances }
-    Invoke-Uninstall
+    Remove-LegacyInstall
+    Invoke-SystemUninstall
     exit 0
 }
 if ($DryRun) {
     Show-Options 'install'
-    $mode = if ($NoBuild) { 'runtime' } else { 'build' }
+    $mode = if ($NoBuild) { 'runtime' } else { 'package' }
     if (-not (Test-Dependencies $mode)) { Write-Host 'A real run would stop here: required dependencies are missing. No changes made.' }
-    if ($NoBuild) { Test-Build } else { Write-Host 'Plan: build as the current user, stage artifacts, install manifest-owned files and Start menu entries.' }
-    Show-RunningInstances
-    Write-Host 'Dry-run complete; no files changed.'
+    if ($NoBuild) { Test-Build }
+    if ((Test-Path -LiteralPath $UserSetupKey) -or (Test-Path -LiteralPath (Get-LegacyManifestPath) -PathType Leaf)) {
+        Write-Host 'A real run would stop here: a per-user installation exists (remove it with install.ps1 -Uninstall).' -ForegroundColor Yellow
+    }
+    Write-Host 'Plan: build as the current user, build the setup.exe, ask the installed dashboard and tray to close, run the setup as administrator, check the service.'
+    Close-InstalledPrograms
+    Write-Host 'Dry-run complete; nothing changed.'
     exit 0
 }
 Show-Options 'install'

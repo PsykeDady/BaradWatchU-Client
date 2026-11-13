@@ -31,8 +31,11 @@ pub fn consent_dialog(title: &str, text: &str, _timeout: Duration, done: DialogD
         rfd::MessageDialogResult::Custom(label) if label == reject => DialogOutcome::Reject,
         _ => DialogOutcome::Later,
     };
-    done(outcome);
+    done(outcome, super::DecisionVia::Window);
 }
+
+/// The consent prompt is a separate window; consent events also get a plain notification.
+pub const CONSENT_IS_NOTIFICATION: bool = false;
 
 pub fn info_dialog(title: &str, text: &str) -> bool {
     rfd::MessageDialog::new()

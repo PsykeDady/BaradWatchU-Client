@@ -320,16 +320,33 @@ impl Connection {
     }
 }
 
+/// Rights of Authenticated Users on the service pipe: SYNCHRONIZE | READ_CONTROL |
+/// FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_EA | FILE_READ_ATTRIBUTES |
+/// FILE_WRITE_ATTRIBUTES (no FILE_CREATE_PIPE_INSTANCE).
+#[cfg(windows)]
+const USER_PIPE_ACCESS: u32 = 0x0012_018b;
+
 /// Connects to the local service and checks who runs it.
 pub(crate) fn connect() -> io::Result<Connection> {
     let path = endpoint();
     #[cfg(unix)]
     let stream = std::os::unix::net::UnixStream::connect(&path)?;
+    // Ask exactly for the rights the pipe grants to users (`USER_PIPE_ACCESS`). Plain
+    // `.write(true)` asks GENERIC_WRITE, which includes FILE_CREATE_PIPE_INSTANCE (withheld on
+    // purpose) and was therefore denied: no user agent could reach the service.
     #[cfg(windows)]
-    let stream = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&path)?;
+    let stream = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // SECURITY_IDENTIFICATION: the service must read this account from its impersonation
+        // token. Recent Rust std opens files with SECURITY_ANONYMOUS by default, which made
+        // the service drop every connection; identification lets it know who is calling
+        // without letting it act as that user.
+        const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+        std::fs::OpenOptions::new()
+            .access_mode(USER_PIPE_ACCESS)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(&path)?
+    };
     let peer = peer_of_service(&stream)?;
     let me = Principal::current().ok_or_else(|| io::Error::other("unknown local account"))?;
     if !peer.is_system() && peer != me {
@@ -513,28 +530,26 @@ mod windows_pipe {
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-                SDDL_REVISION_1,
+                GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
             },
-            GetTokenInformation, RevertToSelf, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-            TOKEN_USER,
+            GetTokenInformation, RevertToSelf, TokenUser, OWNER_SECURITY_INFORMATION,
+            SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
         },
         Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX},
         System::{
             Pipes::{
-                ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId,
-                ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-                PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+                ConnectNamedPipe, CreateNamedPipeW, ImpersonateNamedPipeClient, PIPE_READMODE_BYTE,
+                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
             },
-            Threading::{
-                GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-                PROCESS_QUERY_LIMITED_INFORMATION,
-            },
+            Threading::{GetCurrentThread, OpenThreadToken},
         },
     };
 
     /// SYSTEM: full control; Authenticated Users: read/write data only (no
     /// FILE_CREATE_PIPE_INSTANCE, so no user can add a squatting instance).
-    const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;0x12018b;;;AU)";
+    const PIPE_DACL: &str = "D:P(A;;GA;;;SY)(A;;0x12018b;;;AU)";
+    // The client opens with exactly this mask; keep both in sync.
+    const _: () = assert!(super::USER_PIPE_ACCESS == 0x0012_018b);
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -546,7 +561,15 @@ mod windows_pipe {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        let sddl = wide(PIPE_SDDL);
+        // The service (LocalSystem) names SYSTEM as the pipe's owner: that owner is what user
+        // agents verify, and no ordinary account can create an object owned by SYSTEM. A
+        // console run by a user (development) keeps that user as the default owner.
+        let system = Principal::current().is_some_and(|me| me.is_system());
+        let sddl = wide(&if system {
+            format!("O:SY{PIPE_DACL}")
+        } else {
+            PIPE_DACL.to_owned()
+        });
         // SAFETY: the descriptor is freed after CreateNamedPipeW copied it; the returned
         // handle is owned by the File built from it.
         unsafe {
@@ -645,28 +668,40 @@ mod windows_pipe {
         }
     }
 
-    /// The account of the process serving the pipe (expected: LocalSystem).
+    /// The owner of the pipe (expected: LocalSystem, set by the service when it creates it).
+    /// Not the server process's token: an ordinary user may not open the token of a
+    /// LocalSystem process, so that check always failed for the agents it protects.
     pub(super) fn server_principal(pipe: &File) -> io::Result<Principal> {
-        // SAFETY: handles are closed before returning.
+        // SAFETY: the owner SID points into the descriptor, which is freed after conversion.
         unsafe {
-            let mut pid = 0u32;
-            if GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &mut pid) == 0 {
-                return Err(io::Error::last_os_error());
+            let mut owner = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            let status = GetSecurityInfo(
+                pipe.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut descriptor,
+            );
+            if status != 0 {
+                return Err(io::Error::from_raw_os_error(status as i32));
             }
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if process.is_null() {
-                return Err(io::Error::last_os_error());
+            let mut text = ptr::null_mut::<u16>();
+            let converted = !owner.is_null() && ConvertSidToStringSidW(owner, &mut text) != 0;
+            LocalFree(descriptor);
+            if !converted || text.is_null() {
+                return Err(io::Error::other("cannot identify the pipe owner"));
             }
-            let mut token: HANDLE = ptr::null_mut();
-            let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0;
-            CloseHandle(process);
-            if !opened {
-                return Err(io::Error::last_os_error());
+            let mut length = 0;
+            while *text.add(length) != 0 {
+                length += 1;
             }
-            let sid = token_sid(token);
-            CloseHandle(token);
-            sid.map(|sid| Principal::from_sid(&sid))
-                .ok_or_else(|| io::Error::other("cannot identify the pipe server"))
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+            LocalFree(text.cast());
+            Ok(Principal::from_sid(&sid))
         }
     }
 }

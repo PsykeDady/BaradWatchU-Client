@@ -67,7 +67,11 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           <button type="button" role="tab" class="tab" [class.active]="view === 'settings'" [attr.aria-selected]="view === 'settings'" (click)="go('settings')">{{ t('ui.nav.settings') }}</button>
         </nav>
         <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? t('ui.audit.running') : t('ui.audit.run') }}</button>
+        <button class="button secondary quit-button" type="button" (click)="quitApp()" [disabled]="busy || saving || closed">{{ t('ui.quit') }}</button>
       </header>
+      <div class="modal-backdrop" *ngIf="closed">
+        <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="quit-title"><h2 id="quit-title">{{ t('ui.quit_done_title') }}</h2><p>{{ t('ui.quit_done_text') }}</p></div>
+      </div>
 
       <div class="notices" aria-live="polite">
           <div *ngIf="error" class="notice error" role="alert"><span class="notice-icon">!</span><span>{{ error }}</span><button type="button" class="text-button" (click)="refresh()">{{ t('ui.retry') }}</button><button type="button" class="dismiss" (click)="error = ''" [attr.aria-label]="t('ui.close')">×</button></div>
@@ -326,6 +330,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <dt>{{ t('ui.notifications.device') }}</dt><dd>{{ consent.declaredDevice }}</dd>
               <dt>{{ t('ui.notifications.result') }}</dt><dd>{{ consent.effect }}</dd>
               <dt>ID</dt><dd><code>{{ consent.requestId }}</code></dd>
+              <dd class="consent-actions" *ngIf="consent.state === 'PENDING'"><button class="button primary small" type="button" (click)="decideConsent(consent, true)" [disabled]="saving">{{ t('ui.notifications.accept') }}</button><button class="button secondary small" type="button" (click)="decideConsent(consent, false)" [disabled]="saving">{{ t('ui.notifications.reject') }}</button></dd>
             </dl>
           </aside>
         </div>
@@ -536,6 +541,7 @@ class AppComponent implements OnInit {
   loading = true;
   historyLoading = false;
   busy = false;
+  closed = false;
   busyLabel = '';
   saving = false;
   error = '';
@@ -584,7 +590,11 @@ class AppComponent implements OnInit {
     }).sort((a, b) => this.visibleReport ? (SEVERITY[this.statusOf(a)] ?? 9) - (SEVERITY[this.statusOf(b)] ?? 9) : 0);
   }
 
-  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); this.connectionTimer = setInterval(() => { if (this.view === 'connections') void this.loadRemoteStatus().catch(() => undefined); }, 5000); }
+  ngOnInit(): void { this.view = this.viewFromHash(); void this.refresh().then(() => this.scrollToHistory()); this.connectionTimer = setInterval(() => {
+    if (this.view === 'connections') void this.loadRemoteStatus().catch(() => undefined);
+    // Pending consent requests (tab badge, Accept/Reject buttons) must show up without a manual refresh.
+    if (!this.saving) void this.loadNotifications().catch(() => undefined);
+  }, 5000); }
   ngOnDestroy(): void { clearInterval(this.connectionTimer); }
   @HostListener('window:hashchange') onHashChange(): void {
     const view = this.viewFromHash();
@@ -975,6 +985,15 @@ class AppComponent implements OnInit {
     } catch (error: unknown) { this.error = this.errorText(error); await this.loadNotifications().catch(() => undefined); }
     finally { this.saving = false; }
   }
+  /** Explicit decision for exactly this request (single-use; an expired one is refused by the agent). */
+  async decideConsent(consent: ConsentView, accept: boolean): Promise<void> {
+    this.saving = true; this.error = '';
+    try {
+      this.notifications = await this.post<NotificationsView>('/api/consent/decide', { requestId: consent.requestId, accept });
+      this.flash(this.t(accept ? 'ui.notifications.accepted_ok' : 'ui.notifications.rejected_ok'));
+    } catch (error: unknown) { this.error = this.errorText(error); await this.loadNotifications().catch(() => undefined); }
+    finally { this.saving = false; }
+  }
   async simulateConsent(): Promise<void> {
     this.saving = true; this.error = '';
     try {
@@ -1086,6 +1105,17 @@ class AppComponent implements OnInit {
     const settings = { schema_version: 'baradwatchu.settings.v1', requirements: Object.fromEntries(this.requirements.map(item => [item.id, { enabled: item.enabled, priority: item.priority, parameters: item.parameters }])) };
     const ok = await this.mutate(() => this.request<DashboardData>('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(settings) }), () => message);
     if (!ok) await this.refresh();
+  }
+  /** Stops this user's dashboard server and asks the tray to close; the system service stays up. */
+  async quitApp(): Promise<void> {
+    if (!window.confirm(this.t('ui.quit_confirm'))) return;
+    this.saving = true;
+    try {
+      await this.post<{ ok: boolean }>('/api/shutdown', { confirm: true });
+      clearInterval(this.connectionTimer);
+      this.closed = true;
+    } catch (error: unknown) { this.error = this.errorText(error); }
+    finally { this.saving = false; }
   }
   private post<T>(path: string, body: unknown = {}): Promise<T> {
     return this.request<T>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });

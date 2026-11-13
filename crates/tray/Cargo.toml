@@ -22,3 +22,7 @@ libc = "0.2"
 # Windows and macOS need a native event loop on the main thread for the tray icon.
 tao = "0.37"
 rfd = { version = "0.18", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Already used by notify-rust; used directly for the consent toast with Accept/Reject buttons.
+tauri-winrt-notification = "0.8"

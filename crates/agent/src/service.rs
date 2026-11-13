@@ -1384,8 +1384,13 @@ mod windows_scm {
         _context: *mut core::ffi::c_void,
     ) -> u32 {
         if code == SERVICE_CONTROL_STOP || code == SERVICE_CONTROL_SHUTDOWN {
+            // Answer the SCM first: exiting inside the handler made ControlService fail, so
+            // Stop-Service (and the setup's upgrade) reported an error although it stopped.
             report(SERVICE_STOPPED);
-            std::process::exit(0);
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::process::exit(0);
+            });
         }
         NO_ERROR
     }

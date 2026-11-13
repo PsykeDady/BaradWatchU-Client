@@ -56,6 +56,10 @@ pub enum ConsentState {
 pub enum DecisionChannel {
     /// The tray companion's dedicated consent window.
     ConsentWindow,
+    /// Accept/Reject buttons of the tray's desktop notification (Windows toast).
+    Notification,
+    /// Notifications tab of the local dashboard (session-token authenticated).
+    Dashboard,
     Cli,
 }
 
@@ -514,6 +518,22 @@ pub(crate) fn dashboard_simulate(text: &str) -> Result<String, CliError> {
     events::dashboard_notifications_json()
 }
 
+/// Explicit Accept/Reject of one pending request from the dashboard's Notifications tab.
+/// Body exactly `{"requestId": "<32 hex>", "accept": true|false}`; the same single-use,
+/// unexpired-request rules as every other channel apply.
+pub(crate) fn dashboard_decide(text: &str) -> Result<String, CliError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Body {
+        request_id: String,
+        accept: bool,
+    }
+    let body: Body = serde_json::from_str(text)
+        .map_err(|_| CliError("Richiesta di decisione non valida".into()))?;
+    decide(&body.request_id, body.accept, DecisionChannel::Dashboard)?;
+    events::dashboard_notifications_json()
+}
+
 fn usage() -> &'static str {
     baradwatchu_messages::message("consent.usage", baradwatchu_messages::configured_language())
 }
@@ -611,6 +631,9 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
                 [] => DecisionChannel::Cli,
                 [flag, value] if flag == "--via" && value == "window" => {
                     DecisionChannel::ConsentWindow
+                }
+                [flag, value] if flag == "--via" && value == "notification" => {
+                    DecisionChannel::Notification
                 }
                 _ => return Err(CliError(usage().into())),
             };
@@ -787,5 +810,48 @@ mod tests {
         assert!(run(&["simulate", "--ttl"].map(OsString::from)).is_err());
         assert!(run(&["accept", "0123", "--via", "dashboard"].map(OsString::from)).is_err());
         assert!(dashboard_simulate(r#"{"ttlSeconds":30,"accept":true}"#).is_err());
+    }
+
+    #[test]
+    fn dashboard_and_notification_decide_exactly_one_request() {
+        let _env = TestEnv::new("consent-dashboard");
+        let first = simulate(60).request.request_id;
+        let second = simulate(60).request.request_id;
+        // Only the exact body is accepted; nothing is decided by a malformed one.
+        for bad in [
+            "{}",
+            r#"{"requestId":"x","accept":true}"#,
+            &format!(r#"{{"requestId":"{first}","accept":"yes"}}"#),
+            &format!(r#"{{"requestId":"{first}","accept":true,"all":true}}"#),
+        ] {
+            assert!(dashboard_decide(bad).is_err(), "{bad}");
+        }
+        assert_eq!(pending_views().unwrap().len(), 2);
+        dashboard_decide(&format!(r#"{{"requestId":"{first}","accept":true}}"#)).unwrap();
+        let views = all_views().unwrap();
+        let decided = views
+            .iter()
+            .find(|v| v.request.request_id == first)
+            .unwrap();
+        assert_eq!(decided.request.state, ConsentState::Accepted);
+        assert_eq!(
+            decided.request.decided_via,
+            Some(DecisionChannel::Dashboard)
+        );
+        // Already decided: a second click (dashboard or notification) changes nothing.
+        assert!(dashboard_decide(&format!(r#"{{"requestId":"{first}","accept":false}}"#)).is_err());
+        let rejected =
+            run(&["reject", second.as_str(), "--via", "notification"].map(OsString::from)).unwrap();
+        assert_eq!(rejected.code, 0);
+        let views = all_views().unwrap();
+        let second_view = views
+            .iter()
+            .find(|v| v.request.request_id == second)
+            .unwrap();
+        assert_eq!(second_view.request.state, ConsentState::Rejected);
+        assert_eq!(
+            second_view.request.decided_via,
+            Some(DecisionChannel::Notification)
+        );
     }
 }

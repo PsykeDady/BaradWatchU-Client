@@ -105,7 +105,12 @@ impl Agent {
         }
     }
 
-    pub fn decide(&self, request_id: &str, accept: bool) -> Result<String, String> {
+    pub fn decide(
+        &self,
+        request_id: &str,
+        accept: bool,
+        via: platform::DecisionVia,
+    ) -> Result<String, String> {
         if request_id.len() != 32 || !request_id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("identificativo di richiesta non valido".into());
         }
@@ -114,13 +119,34 @@ impl Agent {
             .arg("consent")
             .arg(if accept { "accept" } else { "reject" })
             .arg(request_id)
-            .args(["--via", "window"]);
+            .args([
+                "--via",
+                match via {
+                    platform::DecisionVia::Window => "window",
+                    platform::DecisionVia::Notification => "notification",
+                },
+            ]);
         let (code, stdout, stderr) = run(command, DECISION_TIMEOUT)?;
         if code == Some(0) {
             Ok(stdout.trim().to_owned())
         } else {
             Err(failure("decisione non registrata", &stderr))
         }
+    }
+
+    /// `quit`: the agent stops this user's dashboard through its authenticated API and leaves
+    /// the tray close request. Detached: the tray exits right after starting it.
+    pub fn quit_all(&self) -> Result<(), String> {
+        let mut command = self.command()?;
+        command
+            .arg("quit")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        platform::detach(&mut command);
+        command
+            .spawn()
+            .map(drop)
+            .map_err(|_| "impossibile chiudere la dashboard".to_owned())
     }
 
     /// Opens the browser dashboard; the agent reuses a running dashboard of this user or
