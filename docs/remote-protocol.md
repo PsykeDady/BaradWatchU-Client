@@ -7,6 +7,8 @@ TLS helpers (`baradwatchu_agent::remote`) and the existing consent and report co
 **Rule zero: a trusted Server may *ask* for an audit; only the user's explicit acceptance,
 given locally on the workstation, runs it.** There is no automatic acceptance, no
 standing grant and no way for a Server to run commands, change keys or the trust store.
+The only audits that run without a prompt are the periodic ones of a Barad Policy that an
+administrator installed locally (§8); a Server cannot start, schedule or configure them.
 
 ## 1. Prerequisites (out of band, never over the network)
 
@@ -27,7 +29,8 @@ No discovery, pairing, TOFU or key import from the network exists.
 - The Client system service opens an outbound TCP connection to each enabled Server address. The Server listens for tunnels on `0.0.0.0:7445` by default (`BARADWATCHU_SERVER_TUNNEL_ADDR` overrides it). Its LOCAL dashboard remains loopback-only on port 3000.
 - TLS 1.3 uses the existing RFC 7250 raw Ed25519 public identity keys on both sides. The Client pins the imported Server key; the Server accepts only an imported Client key and matches the authenticated key to the Device ID in the hello frame. Session tickets/resumption are disabled on the Server.
 - The Client sends `{"schemaVersion":"baradwatchu.tunnel.v1","deviceId":"BWU-…","name":"…"}`. The name is informational. The Server acknowledges only after checking reciprocal trust. The Server holds this connection open and sends a ping frame every 10 seconds. Loss is reflected in the fleet badge; enabled Clients retry after five seconds. Stop disables retry persistently; Start and Refresh/repair replace the active connection.
-- Frames contain a four-byte big-endian JSON length followed by that many JSON bytes, at most 9 MiB each. Requests are `{schemaVersion,sequence,method,path,body}`; replies are `{schemaVersion,sequence,code,body}`. Sequence numbers bind replies to requests. One exchange at a time per Client. Network errors close the channel and trigger reconnection.
+- Frames contain a four-byte big-endian JSON length followed by that many JSON bytes, at most 9 MiB each. Requests are `{schemaVersion,sequence,method,path,body}`; replies are `{schemaVersion,sequence,code,body}`. Sequence numbers bind replies to requests (each side numbers its own requests). One exchange at a time per Client. Network errors close the channel and trigger reconnection.
+- The Server's acknowledgement may list optional features: `{"schemaVersion":"baradwatchu.tunnel.v1","connected":true,"accepts":["CHANGE_REPORTS"]}`. Only then may the Client send its single kind of request, `POST /v1/change-reports` (§8). The Server reads it while waiting for a reply or between its 10-second pings, answers it on the same channel and continues. An older Server without `accepts` never receives it.
 - SNI is the Server ID. The TLS key is the identity/trust-store key, not a new credential. Addresses and the hello name never authorize a request. Neither a Client listener nor LAN discovery is used.
 
 ## 3. Audit operations on the tunnel
@@ -150,7 +153,7 @@ service run (root/LocalSystem) ──outbound mTLS──► Server tunnel listen
 remote link (user, started by tray) ─► local consent ─► user audit engine
 ```
 
-IPC `baradwatchu.ipc.v1` carries registration, connection control/status, linked agent jobs and updates. The service learns the caller's account from the OS and changes only that account's registration. It reads the registered user's owner-only identity and trust store, never invents a key, never runs an audit, and stores no report on disk. The per-user connection configuration is persisted in the service's `users/<principal>.json`; it survives service restarts. The Server stores only Client identity keys and names in SQLite, not Client addresses.
+IPC `baradwatchu.ipc.v1` carries registration, connection control/status, linked agent jobs and updates. The service learns the caller's account from the OS and changes only that account's registration. It reads the registered user's owner-only identity and trust store, never invents a key and never audits as root. Remote results are not stored on disk; under a Barad Policy (§8) the service starts the standard audit engine as each registered user and keeps only the latest unsent change report. The per-user connection configuration is persisted in the service's `users/<principal>.json`; it survives service restarts. The Server stores only Client identity keys and names in SQLite, not Client addresses.
 
 ## 6. Connection controls
 
@@ -172,3 +175,43 @@ Neither operator email nor Google subject is transmitted to the Client.
 The Server keeps only bounded request routing records in memory (24 hours), not audit
 reports. Results remain governed by the Client's one-hour in-memory retention; local
 Client history is independent of both timers and survives service/Server restarts.
+
+## 8. Barad Policy change reports (Client to Server)
+
+A company administrator may install `barad-policy.json` locally on the workstation (see the
+README). With `onChangeDetecting.enabled`, the Client system service runs the standard audit
+(`audit --json --scheduled`, initiator `{"origin":"SCHEDULED"}`) as each registered user on
+the local cron schedule, with one catch-up after missed occurrences. A Server cannot request,
+schedule, change or disable these audits; it only receives their results.
+
+The Client computes the SHA-256 of a normalized security state (results, provider results,
+disabled requirements, installation integrity, Client version/hash, Barad Policy state/hash;
+no timestamps, free-text details, paths or IDs). For each trusted Server of that user it keeps
+the last state the Server acknowledged and at most one pending report (the latest). The first
+successful audit is always pending; identical states are not sent again.
+
+When the Server announced `CHANGE_REPORTS`, the Client sends:
+
+```json
+{"schemaVersion":"baradwatchu.tunnel.v1","sequence":1,"method":"POST","path":"/v1/change-reports",
+ "body":{"schemaVersion":"baradwatchu.change-report.v1","reportId":"auto-…","deviceId":"BWU-…",
+         "stateSha256":"<hex>","report":{…standard audit report without pdf/logFile…}}}
+```
+
+| Reply `code` | Body | Client action |
+|---|---|---|
+| 200 | `{"schemaVersion":"baradwatchu.change-report-ack.v1","reportId":"auto-…","stored":true}` | the state becomes the confirmed one |
+| 400 | `{"error":"INVALID_CHANGE_REPORT"}` (schema, ID, Device ID different from the tunnel's, initiator not `SCHEDULED`, invalid report) | keep pending, retry after 5 minutes |
+| 403 / 409 / 503 | `CLIENT_NOT_TRUSTED` / `REPORT_ID_REUSED` / `STORAGE_UNAVAILABLE` | keep pending, retry after 5 minutes |
+
+Without a reply within 60 seconds the same report (same `reportId`) is sent again; the Server
+stores a given `reportId` once and answers 200 to an identical resend. A newer change replaces
+an unsent one (the older acknowledgement then confirms nothing). The Server stores the report
+as received, visible to every authorized administrator, and compares `report.policy.sha256`
+with an administrator-entered expectation (per Client, else fleet): `MATCH` only for an
+`APPLIED` policy with that digest, `MISMATCH` otherwise, `UNKNOWN` without expectation. It
+never learns the expected digest from a report. `stateSha256` is informative.
+
+Every audit report, remote ones included, carries
+`policy: {"state":"APPLIED|ABSENT|INVALID|UNTRUSTED","path":"…","sha256":"<hex of the bytes read>"}`
+(no `sha256` when nothing could be read). Older Clients omit `policy`.

@@ -783,6 +783,7 @@ fn report_subtitle_key(report: &AuditReport) -> &'static str {
     match &report.initiator {
         Some(req::AuditInitiator::Local) => "pdf.report_subtitle",
         Some(req::AuditInitiator::Remote { .. }) => "pdf.report_subtitle_remote",
+        Some(req::AuditInitiator::Scheduled) => "pdf.report_subtitle_scheduled",
         None => "pdf.report_subtitle_unknown",
     }
 }
@@ -1016,6 +1017,7 @@ fn draw_summary(
             server_display_name,
             server_id
         ),
+        Some(req::AuditInitiator::Scheduled) => "SCHEDULED (Barad Policy)".to_owned(),
         None => baradwatchu_messages::message("pdf.origin_unknown", language).to_owned(),
     };
     for line in wrap(&attribution, 100) {
@@ -2320,6 +2322,7 @@ mod tests {
         let report = AuditReport {
             initiator: Some(crate::requirements::AuditInitiator::Local),
             installation: None,
+            policy: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: 1_784_000_000_000,
             results: vec![],

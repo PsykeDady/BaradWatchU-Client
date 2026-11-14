@@ -11,6 +11,8 @@ Registers "BaradWatchU" (LocalSystem, automatic start, restart on failure) runni
 "baradwatchu-agent.exe service run", then checks that the running service process is
 exactly that executable. It never generates keys, starts a Server connection,
 never changes firewall rules and never removes registrations or user data.
+A Barad Policy applied on this machine with "startOnBoot": false sets a manual start
+(the service is still started now); run this again after the policy changes.
 
 The agent must be installed for all users (Program Files): a LocalSystem service must not
 run a binary that a user can replace, so per-user copies under %LOCALAPPDATA% are refused.
@@ -116,10 +118,21 @@ $ErrorActionPreference = 'Continue'
 try { $usage = (& $full service 2>&1 | Out-String) } finally { $ErrorActionPreference = $previous }
 if ($usage -notmatch 'service run') { throw "$full predates the system service: reinstall the Client first" }
 
+# Barad Policy (installed by an administrator, never by this script): only an APPLIED policy
+# with "startOnBoot": false changes the start type; otherwise the default automatic start.
+$startType = 'Automatic'
+$previous = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $policy = (& $full policy status --json 2>$null | Out-String) | ConvertFrom-Json -ErrorAction SilentlyContinue
+} catch { $policy = $null } finally { $ErrorActionPreference = $previous }
+if ($policy -and $policy.state -eq 'APPLIED' -and $policy.startOnBoot -eq $false) { $startType = 'Manual' }
+
 Write-Host 'BaradWatchU Windows service'
 Write-Host "  agent:   $full"
 if ($current -and -not [string]::Equals($current, $full, [StringComparison]::OrdinalIgnoreCase)) { Write-Host "  replaces: service that ran $current" }
-Write-Host '  account: LocalSystem, automatic start, restart on failure'
+if ($startType -eq 'Automatic') { Write-Host '  account: LocalSystem, automatic start, restart on failure' }
+else { Write-Host '  account: LocalSystem, manual start (Barad Policy startOnBoot=false; started now), restart on failure' }
 Write-Host '  data:    %ProgramData%\BaradWatchU\service (user connections start only when enabled)'
 $binPath = "`"$full`" service run"
 $description = 'BaradWatchU: remote audit requests from trusted Servers (consent required).'
@@ -131,11 +144,11 @@ if ($current) {
         Stop-Service -Name $Name -ErrorAction SilentlyContinue
         Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name ImagePath -Value $binPath
         Set-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$Name" -Name ObjectName -Value 'LocalSystem'
-        Set-Service -Name $Name -StartupType Automatic -Description $description
+        Set-Service -Name $Name -StartupType $startType -Description $description
     }
 } else {
     Invoke-Step "create service $Name" {
-        New-Service -Name $Name -BinaryPathName $binPath -DisplayName 'BaradWatchU Client service' -Description $description -StartupType Automatic | Out-Null
+        New-Service -Name $Name -BinaryPathName $binPath -DisplayName 'BaradWatchU Client service' -Description $description -StartupType $startType | Out-Null
     }
 }
 Invoke-Step 'set restart-on-failure actions' {

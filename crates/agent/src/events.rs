@@ -707,6 +707,7 @@ mod tests {
         AuditReport {
             initiator: Some(crate::requirements::AuditInitiator::Local),
             installation: None,
+            policy: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: stamp,
             results,

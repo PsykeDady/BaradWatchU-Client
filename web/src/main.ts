@@ -15,7 +15,7 @@ interface PdfArtifact { status: 'GENERATED' | 'FAILED'; path?: string; error?: s
 interface ProviderResult { requirementId: string; providerId: string; name?: string; origin: 'BUILTIN' | 'CUSTOM'; required: boolean; status: ResultStatus; summary: string; details: string[]; }
 interface InstalledFile { requirementId: string; path: string; expectedSha256?: string; actualSha256?: string; state: 'VERIFIED' | 'MODIFIED' | 'MISSING' | 'UNEXPECTED' | 'UNSAFE'; }
 interface InstallationIntegrity { status: Integrity; platform: string; manifestSha256: string; verifiedFiles: number; files: InstalledFile[]; }
-interface AuditReport { initiator?: {origin: string; operatorDisplayName?: string; serverId?: string; serverDisplayName?: string}; schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; extensions?: { providers?: ProviderResult[] }; installation?: InstallationIntegrity; }
+interface AuditReport { initiator?: {origin: string; operatorDisplayName?: string; serverId?: string; serverDisplayName?: string}; policy?: { state: string; sha256?: string }; schemaVersion: string; completedAtUnixMs: number; logFile?: string; results: AuditResult[]; client?: { version: string; sha256?: string; sha256Error?: string }; pdf?: PdfArtifact; extensions?: { providers?: ProviderResult[] }; installation?: InstallationIntegrity; }
 interface ReportThemeOption { id: string; name: string; logoPath: string | null; primaryColor: string; secondaryColor: string; accentColor: string; }
 interface ReportThemeCatalog { schemaVersion: string; selectedThemeId: string; themes: ReportThemeOption[]; }
 interface DashboardData { schemaVersion: string; requirements: Requirement[]; customChecksDir?: string; ignoredFolders?: string[]; obsoleteSettingsFile?: string | null; }
@@ -29,7 +29,7 @@ interface AppEvent { id: number; atUnixMs: number; kind: string; severity: Event
 interface NotificationPreferences { schemaVersion?: string; enabled: boolean; informative: boolean; }
 interface ConsentView { requestId: string; serverId: string; accountName: string; accountId: string; declaredDevice: string; operation: string; source: string; createdAtUnixMs: number; expiresAtUnixMs: number; state: ConsentState; decidedAtUnixMs?: number; decidedVia?: string; effect: string; remainingSeconds: number; }
 interface NotificationsView { preferences: NotificationPreferences; events: AppEvent[]; consents: ConsentView[]; trayRunning: boolean | null; }
-interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; }
+interface ConfigurationView { version: string; platform: string; installRoot: string; language: 'system' | 'italian' | 'english'; effectiveLanguage: string; tray: { installed: boolean; running: boolean | null; autostart: boolean | null; error?: string }; paths: { configuration: string; customChecks: string; state: string; history: string; runtime: string }; policy?: { state: 'APPLIED' | 'ABSENT' | 'INVALID' | 'UNTRUSTED'; path: string; sha256?: string; error?: string; onChangeDetecting?: { enabled: boolean; cronJob: string }; privilegedAudit?: boolean; startOnBoot?: boolean }; }
 interface ServerConnection { serverId: string; endpoint: string; enabled: boolean; connected: boolean; error?: string; }
 interface RemoteStatus { serviceInstalled: boolean | null; serviceRunning: boolean; service?: { registered: boolean; registeredDeviceId?: string; registrationProblem?: string; sessionLinked: boolean; requestInProgress: boolean; connections: ServerConnection[] }; identityConfigured: boolean; deviceId?: string; trustedServers: number; trayRunning: boolean | null; }
 interface PublicIdentity { schemaVersion: string; role: 'client' | 'server'; id?: string; name?: string; algorithm: string; publicKey: string; fingerprint?: string; createdAtUnixMs?: number; executableSha256?:string; }
@@ -103,7 +103,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             <div class="run-context" *ngIf="viewingHistory"><span>{{ t('ui.history.viewing') }}</span><button class="text-button" type="button" (click)="showCurrent()">{{ t('ui.summary.back') }}</button></div>
           </div>
           <div class="settings-row report-meta" *ngIf="visibleReport as report">
-            <span *ngIf="report.initiator as initiator">{{ initiator.origin }} <ng-container *ngIf="initiator.origin === 'REMOTE'">· {{ initiator.operatorDisplayName || '?' }} · {{ initiator.serverDisplayName }} (<code>{{ initiator.serverId }}</code>)</ng-container></span>
+            <span *ngIf="report.policy as policy">Barad Policy {{ t('policy.state.' + policy.state.toLowerCase()) }}<code *ngIf="policy.sha256"> {{ policy.sha256.slice(0, 12) }}…</code></span> <span *ngIf="report.initiator as initiator">{{ initiator.origin }} <ng-container *ngIf="initiator.origin === 'REMOTE'">· {{ initiator.operatorDisplayName || '?' }} · {{ initiator.serverDisplayName }} (<code>{{ initiator.serverId }}</code>)</ng-container></span>
             <span>{{ t('ui.pdf.client') }} {{ report.client?.version || 'legacy' }} · SHA-256 <code>{{ report.client?.sha256 || report.client?.sha256Error || t('ui.value.unavailable') }}</code></span>
             <span *ngIf="report.installation as installation" [class.integrity-warning]="installation.status !== 'VERIFIED'" [attr.title]="installationProblems(installation)">{{ installationText(installation) }}</span>
             <a class="button secondary small" *ngIf="report.pdf?.status === 'GENERATED'" href="#" (click)="openPdf(report, $event)">{{ t('ui.pdf.open') }}</a>
@@ -360,6 +360,18 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
               <p class="hint" *ngIf="!config.tray.installed">{{ t('ui.settings.tray_missing') }}</p>
               <p class="hint" *ngIf="config.tray.error">{{ t('ui.settings.tray_status_error') }} {{ config.tray.error }}</p>
               <p class="hint">{{ t('ui.settings.tray_explanation') }}</p>
+            </div>
+            <div class="form-panel" *ngIf="config.policy as policy">
+              <div class="form-head"><h2>{{ t('ui.settings.policy_title') }}</h2><span class="tag" [class.muted]="policy.state !== 'APPLIED'">{{ t('policy.state.' + policy.state.toLowerCase()) }}</span></div>
+              <p class="hint"><code>{{ policy.path }}</code></p>
+              <p class="hint" *ngIf="policy.sha256">SHA-256 <code>{{ policy.sha256 }}</code></p>
+              <p class="hint error" *ngIf="policy.error">{{ policy.error }}</p>
+              <ul class="hint" *ngIf="policy.state === 'APPLIED'">
+                <li>{{ t('ui.settings.policy_schedule') }}: {{ policy.onChangeDetecting?.enabled ? policy.onChangeDetecting?.cronJob : '—' }}</li>
+                <li>{{ t('ui.settings.policy_privileged') }}: {{ policy.privilegedAudit ? '✓' : '—' }}</li>
+                <li>{{ t('ui.settings.policy_boot') }}: {{ policy.startOnBoot ? '✓' : '—' }}</li>
+              </ul>
+              <p class="hint">{{ t('ui.settings.policy_hint') }}</p>
             </div>
             <div class="form-panel">
               <div class="form-head"><h2>{{ t('ui.settings.language') }}</h2></div>

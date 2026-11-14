@@ -45,6 +45,7 @@ pub fn run(args: &[OsString]) -> Result<Output, Error> {
         Some("trust") => Some(crate::identity::run_trust(&args[1..])),
         Some("remote") => Some(crate::remote::run(&args[1..])),
         Some("service") => Some(crate::service::run(&args[1..])),
+        Some("policy") => Some(crate::policy::run(&args[1..])),
         Some("quit") => Some(if args.len() == 1 {
             crate::dashboard::quit()
                 .map(|text| crate::requirements::CliOutput { text, code: 0 })
