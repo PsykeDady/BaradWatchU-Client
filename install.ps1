@@ -67,8 +67,8 @@ BaradWatchU Windows service that keeps the Server connections (tunnels). There
 is no per-user installation. Settings, identities, trust stores, custom checks
 and history are never touched.
 Before the setup runs, the dashboard and tray of the installed version are asked
-to close (baradwatchu-agent quit); the setup refuses to replace files while a
-program of that folder is still running and never kills it.
+to close (baradwatchu-agent quit). If a program of that folder still runs, the
+setup asks whether to close it: it asks it to quit, then ends it after 10 s.
 '@
 }
 

@@ -42,8 +42,8 @@ OutputBaseFilename=BaradWatchU-Client-{#AppVersion}-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-; Restart Manager cannot close console programs gracefully: [Code] below refuses to install or
-; uninstall while BaradWatchU programs of this folder run, and never terminates them.
+; Restart Manager cannot close console programs gracefully: [Code] below asks once, then closes
+; BaradWatchU programs of this folder (quit first, forced after 10 s) before files change.
 CloseApplications=no
 UninstallDisplayName=BaradWatchU Client
 UninstallDisplayIcon={app}\bin\baradwatchu-agent.exe
@@ -71,8 +71,10 @@ it.ServiceFailed=I file sono installati, ma il servizio BaradWatchU non è stato
 en.ServiceFailed=The files are installed, but the BaradWatchU service could not be installed or started and is stopped (no old executable is running). From an elevated PowerShell run this to see the error:
 it.ServiceRemoveFailed=Impossibile rimuovere il servizio BaradWatchU; rimuovilo con: sc.exe delete BaradWatchU
 en.ServiceRemoveFailed=The BaradWatchU service could not be removed; remove it with: sc.exe delete BaradWatchU
-it.StillRunning=BaradWatchU è in esecuzione da questa cartella (dashboard o tray). Usa «Chiudi BaradWatchU» nella dashboard o nel menu della tray (o esegui: baradwatchu-agent quit), poi riprova. Nessun file è stato modificato.
-en.StillRunning=BaradWatchU is running from this folder (dashboard or tray). Use "Quit BaradWatchU" in the dashboard or the tray menu (or run: baradwatchu-agent quit), then retry. No file was changed.
+it.AskClose=BaradWatchU è in esecuzione (dashboard o tray). Chiuderlo e continuare?%n%nSì: viene chiesto ai programmi di chiudersi; quelli ancora attivi dopo 10 secondi vengono terminati (un audit locale in corso andrebbe perso). Il servizio di sistema viene gestito dal setup.%nNo: annulla senza modificare nulla.
+en.AskClose=BaradWatchU is running (dashboard or tray). Close it and continue?%n%nYes: the programs are asked to close; those still running after 10 seconds are ended (a local audit in progress would be lost). The system service is handled by setup.%nNo: cancel without changing anything.
+it.StillRunning=BaradWatchU è ancora in esecuzione da questa cartella (dashboard o tray). Usa «Chiudi BaradWatchU» nella dashboard o nel menu della tray (o esegui: baradwatchu-agent quit), poi riprova. Nessun file è stato modificato.
+en.StillRunning=BaradWatchU is still running from this folder (dashboard or tray). Use "Quit BaradWatchU" in the dashboard or the tray menu (or run: baradwatchu-agent quit), then retry. No file was changed.
 
 [Tasks]
 #if WithTray == "1"
@@ -266,8 +268,92 @@ begin
   end;
 end;
 
-{ Upgrade: stop this installation's service, then refuse while other programs of the target
-  folder run (no file has been touched yet; the service is started again on refusal). }
+{ Ends the BaradWatchU programs still running from Dir (taskkill /F /T on each PID, matched by
+  executable path only: other installations and other programs are never touched). }
+procedure KillRunningFrom(const Dir: String);
+var
+  Locator, Service, Items, Item: Variant;
+  I, Code, ProcessId: Integer;
+  Path, Prefix: String;
+begin
+  Prefix := Lowercase(AddBackslash(Dir));
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Items := Service.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = ''baradwatchu-agent.exe'' OR Name = ''baradwatchu-tray.exe''');
+    for I := 0 to Items.Count - 1 do
+    begin
+      Item := Items.ItemIndex(I);
+      if not VarIsNull(Item.ExecutablePath) then
+      begin
+        Path := Item.ExecutablePath;
+        Path := Lowercase(Path);
+        if Pos(Prefix, Path) = 1 then
+        begin
+          ProcessId := Item.ProcessId;
+          Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /PID ' + IntToStr(ProcessId), '',
+            SW_HIDE, ewWaitUntilTerminated, Code);
+          Log('taskkill ' + IntToStr(ProcessId) + ' (' + Path + '): ' + IntToStr(Code));
+        end;
+      end;
+    end;
+  except
+    Log('Cannot enumerate BaradWatchU processes');
+  end;
+end;
+
+{ Waits up to Seconds for the programs of Dir to end. }
+function WaitNotRunning(const Dir: String; Seconds: Integer): Boolean;
+var
+  I: Integer;
+begin
+  for I := 1 to Seconds * 2 do
+  begin
+    if RunningFrom(Dir) = 0 then
+    begin
+      Result := True;
+      exit;
+    end;
+    Sleep(500);
+  end;
+  Result := RunningFrom(Dir) = 0;
+end;
+
+{ Dashboard or tray of this folder still running: ask once (silent default: yes), then ask
+  them to close the normal way ("baradwatchu-agent quit", as the user who started setup), and
+  after 10 seconds end whatever is still running. False only when the user says no or a
+  program survives even that; no file has been touched in either case. }
+function CloseRunningPrograms(): Boolean;
+var
+  Dir, Agent: String;
+  Code: Integer;
+begin
+  Dir := ExpandConstant('{app}');
+  Result := RunningFrom(Dir) = 0;
+  if Result then
+    exit;
+  if SuppressibleMsgBox(CustomMessage('AskClose'), mbConfirmation, MB_YESNO, IDYES) <> IDYES then
+    exit;
+  Agent := AgentPath();
+  if FileExists(Agent) then
+  begin
+    if IsUninstaller() then
+      Exec(Agent, 'quit', '', SW_HIDE, ewWaitUntilTerminated, Code)
+    else
+      ExecAsOriginalUser(Agent, 'quit', '', SW_HIDE, ewWaitUntilTerminated, Code);
+    Log('agent quit: ' + IntToStr(Code));
+  end;
+  { The tray reads the close request at its next poll (every 5 s). }
+  Result := WaitNotRunning(Dir, 10);
+  if not Result then
+  begin
+    KillRunningFrom(Dir);
+    Result := WaitNotRunning(Dir, 5);
+  end;
+end;
+
+{ Upgrade: stop this installation's service, then close the other programs of the target
+  folder (no file has been touched yet; the service is started again on refusal). }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
@@ -282,7 +368,7 @@ begin
     Result := CustomMessage('ServiceStopFailed');
     exit;
   end;
-  if RunningFrom(ExpandConstant('{app}')) > 0 then
+  if not CloseRunningPrograms() then
   begin
     Result := CustomMessage('StillRunning');
     RestoreService();
@@ -297,7 +383,7 @@ begin
     SuppressibleMsgBox(CustomMessage('ServiceStopFailed'), mbError, MB_OK, IDOK);
     exit;
   end;
-  Result := RunningFrom(ExpandConstant('{app}')) = 0;
+  Result := CloseRunningPrograms();
   if not Result then
   begin
     SuppressibleMsgBox(CustomMessage('StillRunning'), mbError, MB_OK, IDOK);
