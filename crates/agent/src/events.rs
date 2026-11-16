@@ -65,6 +65,9 @@ pub struct Event {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    /// Audit started by the Barad Policy schedule (`audit --scheduled`), not by a person.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scheduled: bool,
 }
 
 pub(crate) struct NewEvent {
@@ -75,6 +78,7 @@ pub(crate) struct NewEvent {
     pub audit_completed_at_unix_ms: Option<u64>,
     pub request_id: Option<String>,
     pub fingerprint: Option<String>,
+    pub scheduled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -242,6 +246,7 @@ pub(crate) fn append_event(new: NewEvent) -> Result<Event, CliError> {
         audit_completed_at_unix_ms: new.audit_completed_at_unix_ms,
         request_id: new.request_id,
         fingerprint: new.fingerprint,
+        scheduled: new.scheduled,
     };
     let mut event = event;
     if let Some(fingerprint) = &event.fingerprint {
@@ -405,6 +410,12 @@ pub(crate) fn audit_event(report: &AuditReport) -> NewEvent {
                 .replace("{counts}", &counts),
         )
     };
+    let scheduled = matches!(report.initiator, Some(req::AuditInitiator::Scheduled));
+    let title = if scheduled {
+        baradwatchu_messages::message("events.scheduled.title", language).replace("{title}", &title)
+    } else {
+        title
+    };
     NewEvent {
         kind,
         severity,
@@ -413,6 +424,7 @@ pub(crate) fn audit_event(report: &AuditReport) -> NewEvent {
         audit_completed_at_unix_ms: Some(report.completed_at_unix_ms),
         request_id: None,
         fingerprint: (!fingerprint.is_empty()).then(|| fingerprint.join(",")),
+        scheduled,
     }
 }
 
@@ -756,6 +768,23 @@ mod tests {
         assert_eq!(integrity.kind, EventKind::IntegrityIssue);
         assert_eq!(integrity.severity, Severity::Critical);
         assert!(integrity.body.contains("CUSTOM-001"));
+    }
+
+    #[test]
+    fn scheduled_audits_are_recorded_and_marked() {
+        let _env = TestEnv::new("events-scheduled");
+        let mut periodic = report(20, vec![result("REQ-001", ResultStatus::Pass, "ok")]);
+        periodic.initiator = Some(crate::requirements::AuditInitiator::Scheduled);
+        let event = record_audit(&periodic).unwrap();
+        assert!(event.scheduled);
+        assert_eq!(event.title, "Audit completato (automatico)");
+        assert_eq!(event.audit_completed_at_unix_ms, Some(20));
+        let local = record_audit(&report(21, vec![])).unwrap();
+        assert!(!local.scheduled);
+        let stored = read_events().unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored[0].scheduled && !stored[1].scheduled);
+        assert!(!serde_json::to_string(&local).unwrap().contains("scheduled"));
     }
 
     #[test]

@@ -19,6 +19,9 @@ pub struct Event {
     pub body: String,
     #[serde(default)]
     pub repeated: bool,
+    /// Periodic (Barad Policy) audit: recorded, but only a new problem is notified.
+    #[serde(default)]
+    pub scheduled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -299,6 +302,10 @@ pub fn wants(event: &Event, preferences: Preferences) -> bool {
         // Consent requests always surface (they also open the consent window).
         Severity::Action => true,
         _ if !preferences.enabled => false,
+        // A periodic audit every few minutes must not become a stream of notifications:
+        // routine outcomes and unchanged problems stay in the event list only.
+        Severity::Info if event.scheduled => false,
+        _ if event.scheduled && event.repeated => false,
         Severity::Info => preferences.informative,
         _ if event.repeated => preferences.informative,
         Severity::Warning | Severity::Critical => true,
@@ -417,7 +424,27 @@ mod tests {
             title: format!("e{id}"),
             body: String::new(),
             repeated,
+            scheduled: false,
         }
+    }
+
+    #[test]
+    fn scheduled_audits_notify_only_new_problems() {
+        let scheduled = |severity, repeated| Event {
+            scheduled: true,
+            ..event(1, severity, repeated)
+        };
+        let all = Preferences::default();
+        assert!(!wants(&scheduled(Severity::Info, false), all));
+        assert!(!wants(&scheduled(Severity::Warning, true), all));
+        assert!(!wants(&scheduled(Severity::Critical, true), all));
+        assert!(wants(&scheduled(Severity::Warning, false), all));
+        assert!(wants(&scheduled(Severity::Critical, false), all));
+        let off = Preferences {
+            enabled: false,
+            informative: true,
+        };
+        assert!(!wants(&scheduled(Severity::Critical, false), off));
     }
 
     fn snapshot(latest: u64, events: Vec<Event>, preferences: Preferences) -> Snapshot {

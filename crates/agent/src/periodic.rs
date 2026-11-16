@@ -441,7 +441,8 @@ mod windows_session {
     use std::{os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+            CloseHandle, LocalFree, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT,
+            WAIT_OBJECT_0,
         },
         Security::{
             Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser,

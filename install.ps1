@@ -61,8 +61,8 @@ Usage: powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 [OPTION
   -Package           Only build the setup.exe (with -OutputDir DIR, default
                      BUILDDIR\dist), e.g. to install it on other machines
 Install = build as the current user, build the setup.exe with Inno Setup 6, then
-run it elevated (UAC: administrator credentials are required). The setup
-installs into Program Files for all users and installs, updates and starts the
+run it elevated (UAC: administrator credentials are required; a refused or
+missed UAC prompt can be retried from the console). The setup installs into Program Files for all users and installs, updates and starts the
 BaradWatchU Windows service that keeps the Server connections (tunnels). There
 is no per-user installation. Settings, identities, trust stores, custom checks
 and history are never touched.
@@ -477,18 +477,39 @@ function Close-InstalledPrograms {
     }
 }
 
+function Test-CanAsk {
+    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) { return $false }
+    foreach ($arg in [Environment]::GetCommandLineArgs()) {
+        if ($arg -match '^-noni') { return $false }
+    }
+    return $true
+}
+
+# Starts $File elevated and waits. A refused or missed UAC prompt (e.g. it timed out unseen)
+# is offered again, like install.sh retries sudo; nothing was changed by the refused attempt.
+function Start-Elevated([string]$File, [string[]]$Arguments, [string]$What) {
+    while ($true) {
+        Write-Host "Starting the $What as administrator (UAC prompt)..."
+        try {
+            return Start-Process -FilePath $File -ArgumentList $Arguments -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        } catch {
+            Write-Host "The $What was not started (administrator rights refused?): $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+        $answer = ''
+        if (Test-CanAsk) { $answer = Read-Host 'Retry the UAC prompt? [y/N]' }
+        if ($answer -notmatch '^(?i)y(es)?$') {
+            Fail "the $What was not started; nothing was installed or removed. Run this script again to retry (-NoBuild reuses the build). The tray was asked to close: restart it from the Start menu if needed."
+        }
+    }
+}
+
 function Invoke-Setup([string]$Setup) {
     $arguments = @('/SILENT', '/NORESTART', "/LOG=`"$(Join-Path $BuildDir 'setup.log')`"")
     if (-not $WithoutTray) {
         if ($NoTrayAutostart) { $arguments += '/MERGETASKS="!trayautostart"' }
         elseif ($TrayAutostart) { $arguments += '/MERGETASKS="trayautostart"' }
     }
-    Write-Host 'Starting the setup as administrator (UAC prompt)...'
-    try {
-        $process = Start-Process -FilePath $Setup -ArgumentList $arguments -Verb RunAs -Wait -PassThru
-    } catch {
-        Fail "the setup was not started (administrator rights refused?): $($_.Exception.Message)"
-    }
+    $process = Start-Elevated $Setup $arguments 'setup'
     if ($process.ExitCode -ne 0) { Fail "the setup ended with exit code $($process.ExitCode); see $(Join-Path $BuildDir 'setup.log')" }
     $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if ($service -and $service.Status -eq 'Running') {
@@ -516,12 +537,7 @@ function Invoke-SystemUninstall {
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { Fail "uninstaller missing: $uninstaller" }
     if ($DryRun) { Write-Host "Would run $uninstaller /SILENT as administrator"; return }
     Close-InstalledPrograms
-    Write-Host 'Starting the uninstaller as administrator (UAC prompt)...'
-    try {
-        $process = Start-Process -FilePath $uninstaller -ArgumentList '/SILENT', '/NORESTART' -Verb RunAs -Wait -PassThru
-    } catch {
-        Fail "the uninstaller was not started (administrator rights refused?): $($_.Exception.Message)"
-    }
+    $process = Start-Elevated $uninstaller @('/SILENT', '/NORESTART') 'uninstaller'
     if ($process.ExitCode -ne 0) { Fail "the uninstaller ended with exit code $($process.ExitCode)" }
     Write-Host 'System installation removed; configuration and user data preserved.'
 }

@@ -277,6 +277,7 @@ fn close_event(request: &ConsentRequest) -> NewEvent {
         audit_completed_at_unix_ms: None,
         request_id: Some(request.request_id.clone()),
         fingerprint: None,
+        scheduled: false,
     }
 }
 
@@ -375,6 +376,7 @@ pub fn create_simulated(params: SimulationParams) -> Result<ConsentView, CliErro
         audit_completed_at_unix_ms: None,
         request_id: Some(request.request_id.clone()),
         fingerprint: None,
+        scheduled: false,
     });
     Ok(view(request, now))
 }
@@ -483,6 +485,7 @@ pub(crate) fn create_remote(
         audit_completed_at_unix_ms: None,
         request_id: Some(request.request_id.clone()),
         fingerprint: None,
+        scheduled: false,
     });
     Ok(view(request, now))
 }

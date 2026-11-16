@@ -504,6 +504,7 @@
     "events.anomaly.body": "{counts}. Da verificare: {ids}.",
     "events.completed.title": "Audit completato",
     "events.completed.body": "{counts}. Esito dei controlli locali, non una certificazione di sicurezza.",
+    "events.scheduled.title": "{title} (automatico)",
     "events.more_ids": "e altri {count}",
     "cli.notifications.usage": "Uso: notifications [--json] | notifications set enabled|informative on|off",
     "cli.events.usage": "Uso: events --json [--after ID]",

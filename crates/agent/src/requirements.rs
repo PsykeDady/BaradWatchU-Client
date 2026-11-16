@@ -4257,7 +4257,10 @@ fn run_audit_with_initiator(
     };
     if scheduled {
         // Periodic audits go to the service (and, when changed, to the Servers): they do not
-        // fill the local history with hourly copies, PDFs or notifications.
+        // fill the local history with hourly copies or PDFs. They are still recorded as
+        // events, whether or not a Server receives them; failing to record one must not
+        // discard the report the service is waiting for.
+        let _ = crate::events::record_audit(&report);
         return Ok(CliOutput {
             text: output_json(&report)?,
             code: 0,

@@ -81,7 +81,7 @@ thread_local! {
     static TEST_OWNER: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_test_policy(path: Option<PathBuf>, owner: Option<u32>) {
     TEST_PATH.with(|slot| *slot.borrow_mut() = path);
     TEST_OWNER.with(|slot| slot.set(owner));

@@ -504,6 +504,7 @@
     "events.anomaly.body": "{counts}. Needs review: {ids}.",
     "events.completed.title": "Audit completed",
     "events.completed.body": "{counts}. Local check results are not a security certification.",
+    "events.scheduled.title": "{title} (automatic)",
     "events.more_ids": "and {count} more",
     "cli.notifications.usage": "Usage: notifications [--json] | notifications set enabled|informative on|off",
     "cli.events.usage": "Usage: events --json [--after ID]",
