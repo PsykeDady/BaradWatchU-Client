@@ -25,7 +25,9 @@ const CHECK_SCHEMA: &str = "baradwatchu.custom-checks.v1";
 /// Package-owned builtin check folders for this OS, relative to the installation root.
 #[cfg(windows)]
 const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-windows";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks-macos";
+#[cfg(not(any(windows, target_os = "macos")))]
 const BUILTIN_CATALOG_DIR: &str = "share/baradwatchu-client/catalog/checks";
 /// Summary of a result blocked by the SHA-256 gate (also used to classify events).
 pub(crate) const INTEGRITY_GATE_SUMMARY: &str = "Integrità non verificata: lo SHA-256 del tool non corrisponde a quello atteso; il tool non è stato eseguito";
@@ -132,6 +134,10 @@ pub struct Requirement {
     /// CUSTOM override folder: shown as custom, but the official files still run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub configuration_override: bool,
+    /// Built-in single-tool control that may ask for elevation (Barad Policy
+    /// `privilegedAudit`); the text explains why to the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_reason: Option<String>,
 }
 
 impl Requirement {
@@ -159,6 +165,8 @@ pub struct ProviderSpec {
     pub timeout_seconds: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privilege_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -376,6 +384,8 @@ pub enum AuditInitiator {
         server_trusted_name: String,
         server_fingerprint: String,
     },
+    /// Periodic audit started by the Client service under the local Barad Policy.
+    Scheduled,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -398,6 +408,9 @@ pub struct AuditReport {
     /// agent, computed at audit time (for the Server's installation check). Older reports omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installation: Option<InstallationIntegrity>,
+    /// Barad Policy state and SHA-256 of the bytes read at audit time. Older reports omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::policy::PolicyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
 }
@@ -564,6 +577,7 @@ fn broken_requirement(broken: BrokenCustom) -> Requirement {
         integrity_status: IntegrityStatus::Unknown,
         providers: Vec::new(),
         configuration_override: false,
+        privilege_reason: None,
     }
 }
 
@@ -664,6 +678,7 @@ fn catalog_with_registry() -> Result<(Catalog, CustomRegistry), CliError> {
                 integrity_status: IntegrityStatus::Unknown,
                 providers: Vec::new(),
                 configuration_override: false,
+                privilege_reason: None,
             });
         }
     }
@@ -718,6 +733,9 @@ struct CheckConfiguration {
     override_builtin_id: Option<String>,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Built-in only: the tool may run elevated when the Barad Policy permits it.
+    #[serde(default)]
+    privilege_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -729,6 +747,15 @@ struct ProviderConfiguration {
     parameters: serde_json::Value,
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    #[serde(default)]
+    privilege_reason: Option<String>,
+}
+
+/// Privilege reasons are shown in the password prompt: short plain text only.
+fn valid_privilege_reason(reason: &str) -> bool {
+    !reason.trim().is_empty()
+        && reason.chars().count() <= 200
+        && !reason.chars().any(char::is_control)
 }
 
 fn valid_provider_id(id: &str) -> bool {
@@ -813,6 +840,24 @@ fn validate_configuration(folder: &str, config: &CheckConfiguration) -> Result<(
     }
     if config.arguments.len() > 64 || config.arguments.iter().any(|arg| arg.len() > 4096) {
         return Err("arguments ammette al massimo 64 stringhe di 4096 caratteri".into());
+    }
+    let privileged = config.privilege_reason.iter().chain(
+        config
+            .providers
+            .values()
+            .filter_map(|provider| provider.privilege_reason.as_ref()),
+    );
+    for reason in privileged {
+        if folder.starts_with("CUSTOM-") {
+            return Err(
+                "privilegeReason è riservato ai controlli integrati: un controllo personalizzato non può chiedere privilegi".into(),
+            );
+        }
+        if !valid_privilege_reason(reason) {
+            return Err(
+                "privilegeReason deve essere un testo semplice di massimo 200 caratteri".into(),
+            );
+        }
     }
     match (&config.tool_path, config.providers.is_empty()) {
         (Some(path), true) if safe_relative_path(path) => {}
@@ -1005,6 +1050,7 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
                     parameters: provider.parameters.clone(),
                     timeout_seconds: provider.timeout_seconds.unwrap_or(timeout_seconds),
                     expected_sha256: Some(expected),
+                    privilege_reason: provider.privilege_reason.clone(),
                 });
             }
             (relative, Some(trusted), providers)
@@ -1035,6 +1081,7 @@ fn discover_builtin_checks(install: &Path) -> Result<Vec<Requirement>, CliError>
             integrity_status: IntegrityStatus::Unknown,
             providers,
             configuration_override: false,
+            privilege_reason: config.privilege_reason.clone(),
         });
     }
     // A built-in listed in the trusted manifest must never silently disappear: a deleted
@@ -2083,6 +2130,10 @@ pub(crate) fn atomic_text(path: &Path, value: &str) -> Result<(), CliError> {
 }
 
 pub(crate) fn install_root() -> Result<PathBuf, CliError> {
+    // Unit tests use the installation staged by build.rs, wherever Cargo put the test binary.
+    #[cfg(test)]
+    return Ok(PathBuf::from(env!("BARADWATCHU_TEST_INSTALL_ROOT")));
+    #[allow(unreachable_code)]
     let executable = std::env::current_exe()
         .map_err(|_| CliError("Cannot locate Client installation".into()))?;
     executable
@@ -2130,6 +2181,24 @@ fn spawn_failure(error: &std::io::Error, tool: &Path) -> (&'static str, Vec<Stri
         "Could not start requirement tool",
         vec![format!("Avvio di {} non riuscito: {error}", shown(tool))],
     )
+}
+
+/// A file the kernel can execute directly: a `#!` script or a Mach-O (thin or universal) binary.
+#[cfg(target_os = "macos")]
+fn has_interpreter_or_binary_header(tool: &Path) -> bool {
+    let mut header = [0u8; 4];
+    let Ok(mut file) = fs::File::open(tool) else {
+        // Let the spawn report the real error (missing file, permissions).
+        return true;
+    };
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    header.starts_with(b"#!")
+        || matches!(
+            u32::from_be_bytes(header),
+            0xfeed_face | 0xfeed_facf | 0xcefa_edfe | 0xcffa_edfe | 0xcafe_babe | 0xbeba_feca
+        )
 }
 
 fn error_result(requirement: &Requirement, priority: Priority, summary: &str) -> ResultRecord {
@@ -2306,6 +2375,7 @@ fn execute_providers(
             arguments: Vec::new(),
             parameters: merged.clone(),
             providers: Vec::new(),
+            privilege_reason: spec.privilege_reason.clone(),
             ..requirement.clone()
         };
         let record = execute(&tool, priority, &merged);
@@ -2772,11 +2842,74 @@ fn integrity_hint(requirement: &Requirement) -> String {
     }
 }
 
+/// How the tool of a privileged control runs (see `elevation`).
+enum ToolElevation<'a> {
+    /// Ordinary control.
+    None,
+    /// Through sudo; a refused or impossible elevation is written to the slot.
+    Elevate(
+        &'a crate::elevation::Prompt,
+        &'a std::cell::RefCell<Option<crate::elevation::Outcome>>,
+    ),
+    /// Unprivileged run of a privileged control: the tool learns why.
+    Fallback(&'static str),
+}
+
 fn execute_with_timeout(
     requirement: &Requirement,
     priority: Priority,
     parameters: &serde_json::Value,
     timeout: Duration,
+) -> ResultRecord {
+    let Some(reason) = requirement.privilege_reason.as_deref() else {
+        return run_tool(
+            requirement,
+            priority,
+            parameters,
+            timeout,
+            ToolElevation::None,
+        );
+    };
+    let outcome = match crate::elevation::plan(requirement, reason) {
+        Ok(prompt) => {
+            let failure = std::cell::RefCell::new(None);
+            // The password prompt is part of the run: give the user time to answer.
+            let result = run_tool(
+                requirement,
+                priority,
+                parameters,
+                timeout + Duration::from_secs(120),
+                ToolElevation::Elevate(&prompt, &failure),
+            );
+            match failure.into_inner() {
+                None => {
+                    return crate::elevation::annotate(
+                        result,
+                        reason,
+                        &crate::elevation::Outcome::Granted,
+                    )
+                }
+                Some(outcome) => outcome,
+            }
+        }
+        Err(outcome) => outcome,
+    };
+    let result = run_tool(
+        requirement,
+        priority,
+        parameters,
+        timeout,
+        ToolElevation::Fallback(outcome.code()),
+    );
+    crate::elevation::annotate(result, reason, &outcome)
+}
+
+fn run_tool(
+    requirement: &Requirement,
+    priority: Priority,
+    parameters: &serde_json::Value,
+    timeout: Duration,
+    elevation: ToolElevation<'_>,
 ) -> ResultRecord {
     if let Some(reason) = &requirement.configuration_error {
         return error_with_details(
@@ -2983,7 +3116,20 @@ fn execute_with_timeout(
             };
             Some(encoded)
         };
-    let mut command = match tool_command(&execution_path) {
+    #[cfg(unix)]
+    let elevated_command = match &elevation {
+        ToolElevation::Elevate(prompt, failure) => {
+            if let Err(why) = crate::elevation::tool_is_root_protected(&canonical_tool) {
+                *failure.borrow_mut() = Some(crate::elevation::Outcome::Unavailable(why));
+                return error_result(requirement, priority, "Elevation unavailable");
+            }
+            Some(crate::elevation::command(&execution_path, prompt))
+        }
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let elevated_command: Option<Command> = None;
+    let mut command = match elevated_command.map_or_else(|| tool_command(&execution_path), Ok) {
         Ok(command) => command,
         Err((summary, details)) => {
             return error_with_details(requirement, priority, &summary, details)
@@ -2994,13 +3140,27 @@ fn execute_with_timeout(
     command
         .args(&requirement.arguments)
         .current_dir(&working_dir);
+    // A password asked on the terminal needs the foreground process group.
+    let terminal_prompt = matches!(&elevation, ToolElevation::Elevate(prompt, _) if !prompt.graphical && !prompt.already_root);
     #[cfg(unix)]
-    {
+    if !terminal_prompt {
         use std::os::unix::process::CommandExt;
         // Own process group: a timeout kills the tool and every helper it started.
         command.process_group(0);
     }
+    #[cfg(not(unix))]
+    let _ = terminal_prompt;
     tool_environment(&mut command, requirement.execution_origin());
+    match &elevation {
+        #[cfg(unix)]
+        ToolElevation::Elevate(prompt, _) => {
+            crate::elevation::prompt_environment(&mut command, prompt)
+        }
+        ToolElevation::Fallback(code) => {
+            command.env("BARADWATCHU_ELEVATION", code);
+        }
+        _ => {}
+    }
     command
         .stdin(if parameter_input.is_some() {
             Stdio::piped()
@@ -3009,6 +3169,16 @@ fn execute_with_timeout(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // macOS posix_spawn runs a script without a `#!` line through /bin/sh instead of failing
+    // with ENOEXEC as Linux does: refuse it the same way, so tools behave alike on both.
+    #[cfg(target_os = "macos")]
+    if !has_interpreter_or_binary_header(&execution_path) {
+        let (summary, details) = spawn_failure(
+            &io::Error::from_raw_os_error(libc::ENOEXEC),
+            &canonical_tool,
+        );
+        return error_with_details(requirement, priority, summary, details);
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -3094,6 +3264,13 @@ fn execute_with_timeout(
     };
     match status {
         Some(status) if status.success() => {}
+        // sudo refused (wrong password, cancelled prompt): the tool did not run.
+        Some(_) if output.is_empty() && matches!(elevation, ToolElevation::Elevate(..)) => {
+            if let ToolElevation::Elevate(_, failure) = &elevation {
+                *failure.borrow_mut() = Some(crate::elevation::Outcome::Denied);
+            }
+            return error_result(requirement, priority, "Elevation refused");
+        }
         Some(status) => {
             let code = status.code().map_or_else(
                 || "terminato da un segnale".to_owned(),
@@ -3802,9 +3979,26 @@ pub fn run(args: &[OsString]) -> Result<CliOutput, CliError> {
             run_check(&catalog, &settings, id_of(id), true)
         }
         [command, options @ ..] if command == "audit" => {
-            let (json, notify, include_log) = parse_audit_options(options)?;
+            let options = parse_audit_options(options)?;
             let _exclusive = crate::events::audit_lock()?;
-            run_audit(&catalog, &settings, json, notify, include_log)
+            if options.scheduled {
+                crate::elevation::set_non_interactive();
+                return run_audit_with_initiator(
+                    &catalog,
+                    &settings,
+                    true,
+                    false,
+                    false,
+                    AuditInitiator::Scheduled,
+                );
+            }
+            run_audit(
+                &catalog,
+                &settings,
+                options.json,
+                options.notify,
+                options.log,
+            )
         }
         [command] if command == "status" => match load_last_audit()? {
             Some(report) => {
@@ -3849,13 +4043,22 @@ fn result_code(status: &ResultStatus) -> u8 {
     }
 }
 
-fn parse_audit_options(options: &[OsString]) -> Result<(bool, bool, bool), CliError> {
-    let (mut json, mut notify, mut log) = (false, false, false);
+struct AuditOptions {
+    json: bool,
+    notify: bool,
+    log: bool,
+    /// Internal: started by the Client service for the Barad Policy schedule.
+    scheduled: bool,
+}
+
+fn parse_audit_options(options: &[OsString]) -> Result<AuditOptions, CliError> {
+    let (mut json, mut notify, mut log, mut scheduled) = (false, false, false, false);
     for option in options {
         let target = match option.to_str() {
             Some("--json") => &mut json,
             Some("--notify") => &mut notify,
             Some("--log") => &mut log,
+            Some("--scheduled") => &mut scheduled,
             _ => {
                 return Err(CliError(
                     baradwatchu_messages::message(
@@ -3877,7 +4080,21 @@ fn parse_audit_options(options: &[OsString]) -> Result<(bool, bool, bool), CliEr
         }
         *target = true;
     }
-    Ok((json, notify, log))
+    if scheduled && (!json || notify || log) {
+        return Err(CliError(
+            baradwatchu_messages::message(
+                "cli.audit.usage",
+                baradwatchu_messages::configured_language(),
+            )
+            .into(),
+        ));
+    }
+    Ok(AuditOptions {
+        json,
+        notify,
+        log,
+        scheduled,
+    })
 }
 
 fn run_check(
@@ -3931,6 +4148,7 @@ fn run_check(
             providers,
         },
         installation: Some(installation),
+        policy: Some(crate::policy::load().report),
         log_file: None,
     };
     let log_path = save_audit(&mut report, include_log)?;
@@ -3981,6 +4199,9 @@ fn run_audit_with_initiator(
     let mut providers = Vec::new();
     // Hashed once per audit, before any tool runs; disabled controls are covered too.
     let installation = installation_integrity();
+    // Read once per audit: its hash goes into every report, transmitted or not.
+    let policy = crate::policy::load().report;
+    let scheduled = matches!(initiator, AuditInitiator::Scheduled);
     for requirement in &catalog.requirements {
         let local = settings.requirements.get(&requirement.id);
         let enabled = local.map_or(requirement.enabled, |v| v.enabled);
@@ -4031,8 +4252,17 @@ fn run_audit_with_initiator(
             providers,
         },
         installation: Some(installation),
+        policy: Some(policy),
         log_file: None,
     };
+    if scheduled {
+        // Periodic audits go to the service (and, when changed, to the Servers): they do not
+        // fill the local history with hourly copies, PDFs or notifications.
+        return Ok(CliOutput {
+            text: output_json(&report)?,
+            code: 0,
+        });
+    }
     let log_path = save_audit(&mut report, include_log)?;
     let pdf = crate::pdf::generate_for_audit(&report);
     report.pdf = Some(match pdf {
@@ -4392,6 +4622,7 @@ pub(crate) fn dashboard_check_json(id: &str) -> Result<String, CliError> {
             providers,
         },
         installation: Some(installation),
+        policy: Some(crate::policy::load().report),
         log_file: None,
     };
     save_audit(&mut report, false)?;
@@ -4480,6 +4711,34 @@ pub fn help() -> String {
 
 /// Serialises tests that change process-wide environment variables and points every
 /// XDG location at a private temporary tree, so tests never touch the real user data.
+/// A minimal built-in requirement for unit tests of other modules.
+#[cfg(test)]
+pub(crate) fn test_requirement(id: &str) -> Requirement {
+    Requirement {
+        id: id.into(),
+        name: id.into(),
+        description: String::new(),
+        enabled: true,
+        priority: Priority::High,
+        parameters: empty_parameters(),
+        arguments: vec![],
+        timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+        tools: BTreeMap::new(),
+        configuration_error: None,
+        origin: ControlOrigin::Builtin,
+        expected_sha256: None,
+        replaces_builtin: None,
+        custom_tool_id: None,
+        custom_tool_version: None,
+        builtin_tool_path: None,
+        actual_sha256: None,
+        integrity_status: IntegrityStatus::Unknown,
+        providers: vec![],
+        configuration_override: false,
+        privilege_reason: None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct TestEnv {
     pub(crate) root: PathBuf,
@@ -4683,6 +4942,7 @@ mod tests {
                     parameters: serde_json::json!({"fromDefault": "d"}),
                     timeout_seconds: 20,
                     expected_sha256: sha256_bytes(bytes),
+                    privilege_reason: None,
                 }
             })
             .collect();
@@ -4707,6 +4967,7 @@ mod tests {
             integrity_status: IntegrityStatus::Unknown,
             providers,
             configuration_override: false,
+            privilege_reason: None,
         }
     }
 
@@ -4848,6 +5109,8 @@ mod tests {
                 ids,
                 ["bitdefender-gravityzone", "defender", "security-center"]
             );
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(ids, ["bitdefender-gravityzone", "xprotect"]);
         } else {
             assert_eq!(ids, ["bitdefender-gravityzone", "clamav"]);
         }
@@ -6164,12 +6427,188 @@ mod tests {
         }
     }
 
+    /// Built-in-like privileged control run through a fake sudo (Barad Policy privilegedAudit).
+    #[cfg(unix)]
+    #[test]
+    fn privileged_controls_elevate_only_when_permitted_and_never_pass_without_it() {
+        use crate::elevation::{TEST_POLICY_ALLOWS, TEST_PROMPT, TEST_SUDO, TEST_TRUST_TOOLS};
+        use std::os::unix::fs::PermissionsExt;
+        let env = TestEnv::new("elevation");
+        let install = PathBuf::from(env!("BARADWATCHU_TEST_INSTALL_ROOT"));
+        let folder = install.join(format!(
+            "test-elevation-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&folder).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(folder.clone());
+        let executable = |path: &Path, text: &str| {
+            fs::write(path, text).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let tool = folder.join("check.sh");
+        let tool_text = "#!/bin/sh\nprintf '{\"id\":\"REQ-T\",\"status\":\"PASS\",\"summary\":\"ok\",\"details\":[\"elevation=%s\"]}' \"${BARADWATCHU_ELEVATION:-none}\"\n";
+        executable(&tool, tool_text);
+        let log = env.root.join("sudo.log");
+        let sudo_ok = env.root.join("sudo-ok");
+        executable(
+            &sudo_ok,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+                log.display()
+            ),
+        );
+        let sudo_deny = env.root.join("sudo-deny");
+        executable(
+            &sudo_deny,
+            &format!(
+                "#!/bin/sh\necho denied >> '{}'\necho 'sudo: 1 incorrect password attempt' >&2\nexit 1\n",
+                log.display()
+            ),
+        );
+        let requirement = Requirement {
+            id: "REQ-T".into(),
+            name: "Privileged test".into(),
+            tools: BTreeMap::from([(
+                platform_key().into(),
+                tool.strip_prefix(&install)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            )]),
+            expected_sha256: sha256_bytes(tool_text.as_bytes()),
+            privilege_reason: Some("Reads protected antivirus data".into()),
+            ..test_requirement("REQ-T")
+        };
+        let run = || execute(&requirement, Priority::High, &serde_json::json!({}));
+        let sudo_calls = || fs::read_to_string(&log).unwrap_or_default();
+        TEST_PROMPT.with(|v| v.set(Some(true)));
+        TEST_TRUST_TOOLS.with(|v| v.set(true));
+        TEST_SUDO.with(|v| *v.borrow_mut() = Some(sudo_ok.clone()));
+
+        // Not permitted by the policy: unprivileged run, PASS cannot stand, sudo untouched.
+        TEST_POLICY_ALLOWS.with(|v| v.set(Some(false)));
+        let disabled = run();
+        assert_eq!(disabled.status, ResultStatus::Warn, "{disabled:?}");
+        assert!(disabled
+            .details
+            .iter()
+            .any(|d| d.contains("elevation=DISABLED")));
+        assert!(disabled.details[0].contains("Reads protected antivirus data"));
+        assert!(sudo_calls().is_empty());
+
+        // Permitted: sudo -k with the graphical prompt and the reason, PASS kept.
+        TEST_POLICY_ALLOWS.with(|v| v.set(Some(true)));
+        let granted = run();
+        assert_eq!(granted.status, ResultStatus::Pass, "{granted:?}");
+        let calls = sudo_calls();
+        let arguments: Vec<&str> = calls.lines().collect();
+        assert_eq!(&arguments[..2], ["-k", "-A"]);
+        assert_eq!(arguments[2], "-p");
+        assert!(
+            arguments[3].contains("REQ-T")
+                && arguments[3].contains("Reads protected antivirus data")
+        );
+        assert_eq!(arguments[4], "--");
+        assert!(arguments[5].ends_with("check.sh"));
+
+        // Refused or cancelled: the tool runs without privileges and the result says so.
+        fs::remove_file(&log).unwrap();
+        TEST_SUDO.with(|v| *v.borrow_mut() = Some(sudo_deny.clone()));
+        let denied = run();
+        assert_eq!(denied.status, ResultStatus::Warn, "{denied:?}");
+        assert!(denied
+            .details
+            .iter()
+            .any(|d| d.contains("elevation=DENIED")));
+        assert_eq!(sudo_calls().trim(), "denied");
+
+        // A tool the user could modify is never run as root.
+        fs::remove_file(&log).unwrap();
+        TEST_TRUST_TOOLS.with(|v| v.set(false));
+        let unprotected = run();
+        assert_eq!(unprotected.status, ResultStatus::Warn);
+        assert!(unprotected
+            .details
+            .iter()
+            .any(|d| d.contains("elevation=UNAVAILABLE")));
+        assert!(sudo_calls().is_empty());
+
+        // Scheduled audits are unattended: no prompt at all.
+        TEST_TRUST_TOOLS.with(|v| v.set(true));
+        crate::elevation::set_non_interactive();
+        let unattended = run();
+        assert_eq!(unattended.status, ResultStatus::Warn);
+        assert!(sudo_calls().is_empty());
+
+        // A configuration override of the official control never elevates either.
+        let overridden = Requirement {
+            configuration_override: true,
+            ..requirement.clone()
+        };
+        let overridden = execute(&overridden, Priority::High, &serde_json::json!({}));
+        assert_eq!(overridden.status, ResultStatus::Warn);
+        assert!(sudo_calls().is_empty());
+
+        // Ordinary controls are unaffected by the policy.
+        let ordinary = Requirement {
+            privilege_reason: None,
+            ..requirement.clone()
+        };
+        let ordinary = execute(&ordinary, Priority::High, &serde_json::json!({}));
+        assert_eq!(ordinary.status, ResultStatus::Pass);
+        assert!(ordinary
+            .details
+            .iter()
+            .any(|d| d.contains("elevation=none")));
+
+        TEST_POLICY_ALLOWS.with(|v| v.set(None));
+        TEST_PROMPT.with(|v| v.set(None));
+        TEST_TRUST_TOOLS.with(|v| v.set(false));
+        TEST_SUDO.with(|v| *v.borrow_mut() = None);
+    }
+
+    #[test]
+    fn custom_checks_cannot_declare_privileges() {
+        let config = |folder: &str| -> CheckConfiguration {
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": CHECK_SCHEMA, "id": folder, "name": "X", "description": "",
+                "priority": "HIGH", "enabled": true, "toolPath": "./check.sh",
+                "expectedSha256": "a".repeat(64), "privilegeReason": "needs root"
+            }))
+            .unwrap()
+        };
+        assert!(validate_configuration("CUSTOM-X", &config("CUSTOM-X"))
+            .unwrap_err()
+            .contains("privilegeReason"));
+        assert!(validate_configuration("REQ-077", &config("REQ-077")).is_ok());
+        let mut bad = config("REQ-077");
+        bad.privilege_reason = Some("line\nbreak".into());
+        assert!(validate_configuration("REQ-077", &bad).is_err());
+    }
+
     #[test]
     fn audit_options_allow_log_with_json_and_notification() {
         let options = ["--notify", "--log", "--json"].map(OsString::from);
-        assert_eq!(parse_audit_options(&options).unwrap(), (true, true, true));
+        let parsed = parse_audit_options(&options).unwrap();
+        assert!(parsed.json && parsed.notify && parsed.log && !parsed.scheduled);
         assert!(parse_audit_options(&[OsString::from("--log"), OsString::from("--log")]).is_err());
         assert!(parse_audit_options(&[OsString::from("--verbose")]).is_err());
+        // The service's internal option: JSON only, no notification or text log.
+        let scheduled =
+            parse_audit_options(&["--json", "--scheduled"].map(OsString::from)).unwrap();
+        assert!(scheduled.scheduled && scheduled.json);
+        assert!(parse_audit_options(&[OsString::from("--scheduled")]).is_err());
+        assert!(
+            parse_audit_options(&["--json", "--scheduled", "--notify"].map(OsString::from))
+                .is_err()
+        );
     }
 
     #[test]
@@ -6204,6 +6643,7 @@ mod tests {
         let directory = env.root.join("audits");
         let mut report = AuditReport {
             initiator: Some(AuditInitiator::Local),
+            policy: None,
             schema_version: "baradwatchu.audit.v1".into(),
             completed_at_unix_ms: now_ms(),
             results: vec![],
@@ -6292,6 +6732,7 @@ mod tests {
         for (stamp, status) in [(100, ResultStatus::Pass), (200, ResultStatus::Warn)] {
             let report = AuditReport {
                 initiator: Some(AuditInitiator::Local),
+                policy: None,
                 schema_version: "baradwatchu.audit.v1".into(),
                 completed_at_unix_ms: stamp,
                 results: vec![ResultRecord {

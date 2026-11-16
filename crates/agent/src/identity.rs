@@ -90,6 +90,9 @@ pub struct PublicIdentity {
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_unix_ms: Option<u64>,
+    /// SHA-256 of this running Client executable when the public identity is exported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -908,6 +911,10 @@ fn local_name() -> Option<String> {
 }
 
 fn public_identity_of(record: &KeyRecord) -> PublicIdentity {
+    let executable_sha256 = std::env::current_exe()
+        .ok()
+        .and_then(|path| fs::read(path).ok())
+        .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
     PublicIdentity {
         schema_version: PUBLIC_IDENTITY_SCHEMA.into(),
         role: Role::Client,
@@ -917,6 +924,7 @@ fn public_identity_of(record: &KeyRecord) -> PublicIdentity {
         public_key: record.public_key.clone(),
         fingerprint: Some(record.fingerprint.clone()),
         created_at_unix_ms: Some(record.created_at_unix_ms),
+        executable_sha256,
     }
 }
 
@@ -1853,6 +1861,11 @@ pub(crate) fn run_identity_with(
             let identity = public_identity()?.ok_or_else(|| {
                 CliError("No local identity: generate one with identity generate".into())
             })?;
+            if identity.executable_sha256.is_none() {
+                return Err(CliError(
+                    "Cannot read the current Client executable to compute its SHA-256".into(),
+                ));
+            }
             let text = req::output_json(&identity)?;
             match options {
                 [] => ok(text),
@@ -2103,6 +2116,7 @@ mod tests {
             public_key: encode_public_key(&public),
             fingerprint: Some(fingerprint(&public)),
             created_at_unix_ms: None,
+            executable_sha256: None,
         };
         (serde_json::to_string(&document).unwrap(), public, signing)
     }

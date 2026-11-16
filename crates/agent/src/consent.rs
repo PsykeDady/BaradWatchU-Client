@@ -204,10 +204,15 @@ pub fn prompt(request: &ConsentRequest) -> String {
     text
 }
 
+/// What the decision causes: a simulation sends nothing, a Server request is audited and
+/// answered (report on accept, rejection outcome on reject).
 fn effect(request: &ConsentRequest) -> String {
+    let remote = request.source == ConsentSource::RemoteServer;
     let key = match request.state {
         ConsentState::Pending => "consent.effect.pending",
+        ConsentState::Accepted if remote => "consent.effect.accepted_remote",
         ConsentState::Accepted => "consent.effect.accepted",
+        ConsentState::Rejected if remote => "consent.effect.rejected_remote",
         ConsentState::Rejected => "consent.effect.rejected",
         ConsentState::Expired => "consent.effect.expired",
     };
@@ -709,6 +714,12 @@ mod tests {
             view.prompt.contains("Server Test") && view.prompt.contains("SRV-AAAA-BBBB-CCCC-DDDD")
         );
         assert!(view.prompt.contains(&"a".repeat(64)) && !view.prompt.contains("SIMULAZIONE"));
+        // The decision text tells what really happens for a Server request (no "simulation").
+        let other =
+            create_remote(&remote_server("SRV-EEEE-FFFF-0000-1111"), "BWU-1", None).unwrap();
+        let accepted = decide(&other.request.request_id, true, DecisionChannel::Cli).unwrap();
+        assert!(accepted.effect.contains("Server") && !accepted.effect.contains("M7"));
+        assert_ne!(accepted.effect, simulate(60).effect);
         // Revoking another Server leaves it; revoking this one withdraws it.
         assert_eq!(expire_remote_pending(Some("SRV-OTHER")).unwrap(), 0);
         let simulated = simulate(60);

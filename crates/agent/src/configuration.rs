@@ -47,6 +47,8 @@ struct ConfigurationView {
     install_root: String,
     tray: TrayView,
     paths: DataPaths,
+    /// Barad Policy as read now (read-only; installed by an administrator).
+    policy: serde_json::Value,
 }
 
 fn tray_path() -> Option<PathBuf> {
@@ -179,6 +181,7 @@ fn view(error: Option<String>) -> Result<String, CliError> {
             history: shown(req::history_dir()),
             runtime: shown(req::runtime_dir()),
         },
+        policy: crate::policy::status_view(),
     })
 }
 

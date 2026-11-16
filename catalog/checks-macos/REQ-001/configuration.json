@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-001",
+  "name": "Aggiornamenti software",
+  "description": "Verifica con softwareupdate che Apple non segnali aggiornamenti di macOS o dati di sicurezza disponibili.",
+  "priority": "HIGH",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "bd4a80c08152d137a5a03424af0df61e70cffde5327a0f0975be634d10868b85",
+  "version": 1,
+  "timeoutSeconds": 180,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

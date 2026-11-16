@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-002",
+  "name": "Protezione antivirus",
+  "description": "Verifica che una protezione antimalware supportata (XProtect di Apple o Bitdefender GravityZone) sia attiva con firme aggiornate; acceptedProviders rende obbligatori i provider elencati.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "arguments": [],
+  "version": 1,
+  "timeoutSeconds": 60,
+  "parameters": {
+    "acceptedProviders": []
+  },
+  "providers": {
+    "xprotect": {
+      "name": "Apple XProtect",
+      "toolPath": "./providers/xprotect.sh",
+      "parameters": {
+        "maxSignatureAgeDays": 30
+      }
+    },
+    "bitdefender-gravityzone": {
+      "name": "Bitdefender GravityZone",
+      "toolPath": "./providers/bitdefender-gravityzone.sh",
+      "parameters": {
+        "maxSignatureAgeDays": 3,
+        "expectedCompanyId": ""
+      }
+    }
+  },
+  "overrideBuiltinId": null
+}

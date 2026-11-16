@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-004",
+  "name": "Filtro DNS",
+  "description": "Verifica che dnsmasq filtri il DNS oppure che /etc/hosts contenga una lista HaGeZi completa e aggiornata.",
+  "priority": "HIGHEST",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "a2e9897f0bf8a00275f443b3168107872269cc1b77a60e4d4716f19765b5821a",
+  "version": 1,
+  "parameters": {
+    "minimumHostsEntries": 10000,
+    "minimumDnsmasqRules": 1000,
+    "maxListAgeDays": 30,
+    "requireHagezi": true
+  },
+  "overrideBuiltinId": null
+}

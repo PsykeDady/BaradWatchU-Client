@@ -1,0 +1,15 @@
+{
+  "schemaVersion": "baradwatchu.custom-checks.v1",
+  "id": "REQ-009",
+  "name": "Sicurezza di avvio",
+  "description": "Verifica avvio sicuro con Sicurezza totale, System Integrity Protection e volume di sistema firmato.",
+  "priority": "OPTIONAL",
+  "enabled": true,
+  "toolPath": "./check.sh",
+  "arguments": [],
+  "expectedSha256": "6d164e13420e9f00bdbc5be29338c57254de23bcfb594659a5418a6a44f9b157",
+  "version": 1,
+  "timeoutSeconds": 60,
+  "parameters": {},
+  "overrideBuiltinId": null
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # BaradWatchU system service (Milestone 2) on Linux (systemd) and macOS (launchd).
-# Internal component: install.sh calls it during installation, update and uninstall (in
-# the step that already runs as root); it can also be run by hand. It installs nothing but
+# Internal component: install.sh (install-macos.sh on macOS) calls it during installation,
+# update and uninstall (in the step that already runs as root); it can also be run by hand. It installs nothing but
 # the service definition. It never generates keys, starts a Server connection,
 # never changes firewall rules and never removes registrations or user data.
 set -euo pipefail
@@ -18,11 +18,15 @@ Usage: sudo packaging/service/install-service.sh [--agent=PATH] [--dry-run]
        sudo packaging/service/install-service.sh --uninstall|--stop|--start [--agent=PATH] [--dry-run]
        packaging/service/install-service.sh --status
 
-Normally run by install.sh: every system installation, update and uninstall includes it.
+Normally run by install.sh (macOS: install-macos.sh): every system installation, update and
+uninstall includes it.
 
   (default)     Install or update the service (systemd unit baradwatchu-agent.service,
                 LaunchDaemon io.baradwatchu.agent), enable it at boot and (re)start it,
                 then check that the running process is exactly PATH (never an old copy).
+                A Barad Policy applied on this machine with "startOnBoot": false keeps the
+                service out of boot start (it is still started now); run this again after
+                the administrator changes the policy. Without a valid policy: boot start.
   --agent=PATH  Installed baradwatchu-agent (default: /usr/local/bin/baradwatchu-agent,
                 else the one in PATH). It runs as root, so it and every parent folder must
                 be owned by root and not writable by others: per-user copies are refused.
@@ -196,11 +200,22 @@ check_root_owned "$AGENT"
 "$AGENT" --version >/dev/null || fail "$AGENT does not run"
 { "$AGENT" service 2>&1 || true; } | grep -q 'service run' || fail "$AGENT predates the system service: reinstall the Client first"
 
+# Barad Policy (installed by an administrator, never by this script): only an APPLIED policy
+# changes the boot behavior; absent, invalid or untrusted policies keep the default.
+BOOT=on
+policy_view=$("$AGENT" policy status --json 2>/dev/null || true)
+if grep -q '"state": "APPLIED"' <<<"$policy_view"; then
+    grep -q '"startOnBoot": false' <<<"$policy_view" && BOOT=off
+fi
+
 echo "BaradWatchU system service"
 echo "  agent:    $AGENT"
+policy_state=$(sed -n 's/^  "state": "\([A-Z]*\)",*$/\1/p' <<<"$policy_view" | head -n 1)
+echo "  policy:   Barad Policy ${policy_state:-UNKNOWN} (details: $AGENT policy status)"
 [[ -z $current || $current == "$AGENT" ]] || echo "  replaces: service that ran $current"
 if [[ $OS == linux ]]; then
-    echo "  unit:     $UNIT (enabled at boot, restarted on failure)"
+    if [[ $BOOT == on ]]; then echo "  unit:     $UNIT (enabled at boot, restarted on failure)"
+    else echo "  unit:     $UNIT (not started at boot: Barad Policy startOnBoot=false; restarted on failure)"; fi
     echo "  data:     /var/lib/baradwatchu (user connections start only when enabled)"
     rendered=$(sed "s#@AGENT@#$AGENT#" "$HERE/baradwatchu-agent.service")
     if ((DRY_RUN)); then echo "  would write $UNIT"; else
@@ -210,13 +225,20 @@ if [[ $OS == linux ]]; then
         mv -f -- "$tmp" "$UNIT"
     fi
     run systemctl daemon-reload
-    run systemctl enable baradwatchu-agent.service
+    if [[ $BOOT == on ]]; then run systemctl enable baradwatchu-agent.service
+    else run systemctl disable baradwatchu-agent.service; fi
     # restart, not "enable --now": an already running service must load the new executable.
     run systemctl restart baradwatchu-agent.service
 else
-    echo "  daemon:   $PLIST (started at boot, kept alive)"
     echo "  data:     /Library/Application Support/BaradWatchU/service"
     rendered=$(sed "s#@AGENT@#$AGENT#" "$HERE/io.baradwatchu.agent.plist")
+    if [[ $BOOT == on ]]; then echo "  daemon:   $PLIST (started at boot, kept alive)"
+    else
+        # launchd starts a KeepAlive job at every load (boot included): both are turned off.
+        echo "  daemon:   $PLIST (not started at boot: Barad Policy startOnBoot=false; started now)"
+        rendered=$(sed -e 's#<key>RunAtLoad</key><true/>#<key>RunAtLoad</key><false/>#' \
+                       -e 's#<key>KeepAlive</key><true/>#<key>KeepAlive</key><false/>#' <<<"$rendered")
+    fi
     run launchctl bootout "system/$LABEL" 2>/dev/null || true
     if ((DRY_RUN)); then echo "  would write $PLIST"; else
         tmp=$(mktemp "$PLIST.XXXXXX")
@@ -225,6 +247,7 @@ else
         mv -f -- "$tmp" "$PLIST"
     fi
     run launchctl bootstrap system "$PLIST"
+    [[ $BOOT == on ]] || run launchctl kickstart "system/$LABEL"
 fi
 verify_running "$AGENT"
 echo "Service ready. Each user enables remote requests and starts trusted Server connections from the Client dashboard (after identity generate)."

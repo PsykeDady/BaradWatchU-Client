@@ -176,6 +176,8 @@ struct RequirementText {
     /// Windows wording when the built-in check works differently there (other tools and
     /// sources); empty = `description` applies to every platform.
     windows_description: String,
+    /// macOS wording, same rule as `windows_description`.
+    macos_description: String,
 }
 
 fn locale_catalog(language: Language) -> &'static LocaleCatalog {
@@ -708,6 +710,16 @@ pub fn dashboard_catalog(
         "ui.notifications.result",
         "ui.settings.tray_status_error",
         "ui.settings.tray_explanation",
+        "ui.settings.policy_title",
+        "ui.settings.policy_state",
+        "ui.settings.policy_schedule",
+        "ui.settings.policy_privileged",
+        "ui.settings.policy_boot",
+        "ui.settings.policy_hint",
+        "policy.state.applied",
+        "policy.state.absent",
+        "policy.state.invalid",
+        "policy.state.untrusted",
         "ui.settings.notifications_hint",
         "ui.remote.registered",
         "ui.remote.unregistered",
@@ -844,6 +856,8 @@ pub fn requirement_metadata(id: &str, language: Language) -> Option<(&'static st
         .map(|metadata| {
             let description = if cfg!(windows) && !metadata.windows_description.is_empty() {
                 &metadata.windows_description
+            } else if cfg!(target_os = "macos") && !metadata.macos_description.is_empty() {
+                &metadata.macos_description
             } else {
                 &metadata.description
             };

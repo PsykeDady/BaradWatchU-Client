@@ -7,15 +7,22 @@
 //! - requests are relayed to the user's linked agent (`remote link`, started by the tray);
 //!   with no linked agent the answer is `UNAVAILABLE`, while busy it is `BUSY`.
 //!
+//! Barad Policy (`policy.rs`, `periodic.rs`): with `onChangeDetecting` enabled the service
+//! also schedules periodic audits, started as each registered user, and sends a report to
+//! the user's trusted Servers over the same tunnel only when the security state changed.
+//!
 //! Data (`BARADWATCHU_SERVICE_DIR` or the platform default, system-only):
 //! `users/<principal>.json`
 //! (registrations), `requests/<job>.json` (request records without results, for duplicate
-//! and replay detection across restarts). Results stay in memory only.
+//! and replay detection across restarts), `periodic/<principal>.json` (schedule anchor, last
+//! state confirmed by each Server, latest unsent change report). Remote results stay in
+//! memory only.
 use crate::identity::{self, TrustedServer};
 use crate::ipc::{
     self, Intent, JobServer, JobState, Principal, ServerConnectionStatus, ServiceStatus, ToAgent,
     ToService,
 };
+use crate::periodic::{self, UserState};
 use crate::remote::{self, AuditRequest, AuditResult, RequestStatus};
 use crate::requirements::{self as req, CliError, CliOutput};
 use serde::{Deserialize, Serialize};
@@ -45,6 +52,12 @@ const RUN_LIMIT_MS: u64 = 35 * 60 * 1000;
 const PING_EVERY: Duration = Duration::from_secs(3);
 const MAX_RESULT: usize = 8 * 1024 * 1024;
 const TUNNEL_SCHEMA: &str = "baradwatchu.tunnel.v1";
+/// Unanswered change report: sent again (same report ID, the Server deduplicates).
+const PUSH_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+/// After a refusal by the Server.
+const PUSH_RETRY: Duration = Duration::from_secs(300);
+/// How often the Barad Policy schedule is evaluated.
+const SCHEDULE_TICK: Duration = Duration::from_secs(30);
 const MAX_TUNNEL_FRAME: usize = 9 * 1024 * 1024;
 #[cfg(windows)]
 pub(crate) const WINDOWS_SERVICE_NAME: &str = "BaradWatchU";
@@ -171,6 +184,7 @@ struct Shared {
     changed: Condvar,
     connections: Mutex<HashMap<String, ConnectionRuntime>>,
     serial: AtomicUsize,
+    periodic: Mutex<HashMap<Principal, UserState>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -194,6 +208,39 @@ impl Shared {
         self.dir.join("requests")
     }
 
+    fn periodic_dir(&self) -> PathBuf {
+        self.dir.join("periodic")
+    }
+
+    fn save_periodic(&self, principal: &Principal, state: &UserState) {
+        if let Some(stem) = principal.file_stem() {
+            let _ = req::atomic_json(&self.periodic_dir().join(format!("{stem}.json")), state);
+        }
+    }
+
+    /// The latest unsent change report for this user and Server.
+    fn pending_report(
+        &self,
+        principal: &Principal,
+        server_id: &str,
+    ) -> Option<periodic::PendingReport> {
+        lock(&self.periodic)
+            .get(principal)?
+            .servers
+            .get(server_id)?
+            .pending
+            .clone()
+    }
+
+    fn confirm_report(&self, principal: &Principal, server_id: &str, report_id: &str) {
+        let mut all = lock(&self.periodic);
+        if let Some(state) = all.get_mut(principal) {
+            if periodic::confirm(state, server_id, report_id) {
+                self.save_periodic(principal, state);
+            }
+        }
+    }
+
     fn persist(&self, record: &Record) {
         let _ = req::atomic_json(
             &self.requests_dir().join(format!("{}.json", record.job_id)),
@@ -211,9 +258,11 @@ impl Shared {
             changed: Condvar::new(),
             connections: Mutex::new(HashMap::new()),
             serial: AtomicUsize::new(1),
+            periodic: Mutex::new(HashMap::new()),
         };
         private_dir(&shared.users_dir())?;
         private_dir(&shared.requests_dir())?;
+        private_dir(&shared.periodic_dir())?;
         let mut registrations = vec![];
         for path in json_files(&shared.users_dir()) {
             let parsed = fs::read(&path)
@@ -224,6 +273,20 @@ impl Shared {
                 _ => {}
             }
         }
+        let mut periodic_states = HashMap::new();
+        for registration in &registrations {
+            let Some(stem) = registration.principal.file_stem() else {
+                continue;
+            };
+            let state = fs::read(shared.periodic_dir().join(format!("{stem}.json")))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<UserState>(&bytes).ok())
+                .filter(|state| state.schema_version == periodic::STATE_SCHEMA);
+            if let Some(state) = state {
+                periodic_states.insert(registration.principal.clone(), state);
+            }
+        }
+        *lock(&shared.periodic) = periodic_states;
         *lock(&shared.registrations) = registrations;
         let now = req::now_ms();
         let mut jobs = HashMap::new();
@@ -1147,16 +1210,67 @@ fn connect_tunnel(
     if ack["schemaVersion"] != TUNNEL_SCHEMA || ack["connected"] != true {
         return Err("Server refused tunnel".into());
     }
+    // Change reports travel only to Servers that announce them (older Servers would read
+    // the frame as a malformed reply and drop the tunnel).
+    let accepts_reports = ack["accepts"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item == periodic::CHANGE_REPORT_FEATURE)
+    });
     set_connection_runtime(shared, registration, config, true, None);
     let mut last_frame = Instant::now();
+    let mut next_sequence = 1u64;
+    let mut in_flight: Option<(u64, String, Instant)> = None;
+    let mut retry_at = Instant::now();
     while current_connection(shared, registration, config) {
-        let Some(frame): Option<TunnelRequest> = read_tunnel_frame(&mut stream)? else {
+        if accepts_reports
+            && Instant::now() >= retry_at
+            && !in_flight
+                .as_ref()
+                .is_some_and(|(_, _, sent)| sent.elapsed() <= PUSH_ACK_TIMEOUT)
+        {
+            if let Some(pending) = shared.pending_report(&registration.principal, &config.server_id)
+            {
+                write_tunnel_frame(
+                    &mut stream,
+                    &serde_json::json!({
+                        "schemaVersion": TUNNEL_SCHEMA,
+                        "sequence": next_sequence,
+                        "method": "POST",
+                        "path": periodic::CHANGE_REPORT_PATH,
+                        "body": periodic::change_report_body(&registration.device_id, &pending),
+                    }),
+                )?;
+                in_flight = Some((next_sequence, pending.report_id, Instant::now()));
+                next_sequence += 1;
+            }
+        }
+        let Some(frame): Option<serde_json::Value> = read_tunnel_frame(&mut stream)? else {
             if last_frame.elapsed() > Duration::from_secs(40) {
                 return Err("Server heartbeat timed out".into());
             }
             continue;
         };
         last_frame = Instant::now();
+        if frame.get("code").is_some() {
+            // Answer to our change report: only a 200 confirms it.
+            let reply = frame;
+            if reply["schemaVersion"] != TUNNEL_SCHEMA {
+                return Err("Unsupported tunnel protocol".into());
+            }
+            if let Some((sequence, report_id, _)) = in_flight.take() {
+                if reply["sequence"] == sequence && reply["code"] == 200 {
+                    shared.confirm_report(&registration.principal, &config.server_id, &report_id);
+                } else if reply["sequence"] == sequence {
+                    retry_at = Instant::now() + PUSH_RETRY;
+                } else {
+                    in_flight = Some((sequence, report_id, Instant::now()));
+                }
+            }
+            continue;
+        }
+        let frame: TunnelRequest =
+            serde_json::from_value(frame).map_err(|_| "Invalid Server tunnel frame")?;
         if frame.schema_version != TUNNEL_SCHEMA {
             return Err("Unsupported tunnel protocol".into());
         }
@@ -1262,6 +1376,67 @@ fn run_connections(shared: Arc<Shared>) {
     }
 }
 
+// Barad Policy schedule
+// ---------------------------------------------------------------------------------------
+
+/// Evaluates the local policy and, for each registered user whose audit is due, runs the
+/// standard audit as that user. One audit at a time; the user's own audit lock also keeps
+/// it apart from local and remote audits (busy = retried later).
+fn run_periodic(shared: Arc<Shared>) {
+    loop {
+        let loaded = crate::policy::load();
+        let cron = loaded
+            .policy
+            .as_ref()
+            .filter(|policy| policy.on_change_detecting.enabled)
+            .and_then(|policy| crate::cron::Cron::parse(&policy.on_change_detecting.cron_job).ok());
+        if let Some(cron) = cron {
+            let registrations = lock(&shared.registrations).clone();
+            for registration in registrations {
+                let started = req::now_ms();
+                let due = match lock(&shared.periodic).get(&registration.principal) {
+                    Some(state) => periodic::due(state, &cron, started),
+                    None => true,
+                };
+                if !due {
+                    continue;
+                }
+                let result = periodic::run_audit_as(&registration.principal);
+                // Servers configured now (a connection may have been added meanwhile).
+                let servers = lock(&shared.registrations)
+                    .iter()
+                    .find(|r| {
+                        r.principal == registration.principal
+                            && r.device_id == registration.device_id
+                    })
+                    .map(|r| {
+                        r.connections
+                            .iter()
+                            .map(|c| c.server_id.clone())
+                            .collect::<Vec<_>>()
+                    });
+                let mut all = lock(&shared.periodic);
+                let state = all.entry(registration.principal.clone()).or_default();
+                match (result, servers) {
+                    (Ok(report), Some(servers)) => periodic::record_audit(
+                        state,
+                        started,
+                        &servers,
+                        &report,
+                        periodic::new_report_id,
+                    ),
+                    (Ok(_), None) => {
+                        periodic::record_failure(state, started, "registration changed")
+                    }
+                    (Err(error), _) => periodic::record_failure(state, started, &error),
+                }
+                shared.save_periodic(&registration.principal, state);
+            }
+        }
+        thread::sleep(SCHEDULE_TICK);
+    }
+}
+
 // Supervision
 // ---------------------------------------------------------------------------------------
 
@@ -1321,6 +1496,10 @@ fn serve() -> Result<(), CliError> {
     {
         let shared = shared.clone();
         thread::spawn(move || run_connections(shared));
+    }
+    {
+        let shared = shared.clone();
+        thread::spawn(move || run_periodic(shared));
     }
     loop {
         match ipc_listener.accept() {

@@ -1,0 +1,8 @@
+{
+  "onChangeDetecting": {
+    "enabled": true,
+    "cronJob": "0 * * * *"
+  },
+  "privilegedAudit": true,
+  "startOnBoot": true
+}

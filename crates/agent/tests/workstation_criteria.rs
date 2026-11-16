@@ -1,4 +1,5 @@
-#![cfg(unix)]
+// Exercises the Linux built-in scripts (catalog/checks, /usr/bin/bash).
+#![cfg(target_os = "linux")]
 //! Fixture tests for the built-in Arch checks whose PASS criteria follow the workstation
 //! audit baseline (REQUIREMENTS §5 SEC-003/006/007/008-010, skill audit-postazione R1-R5).
 //! Absolute system paths in each script are rewritten to fixture files and stub commands.

@@ -1,8 +1,9 @@
 #!/usr/bin/bash
 # Regenerate catalog/builtin-tools.sha256: one line per file of every built-in check folder
-# ("<ID> <platform> catalog/<dir>/<ID>/<file> <sha256>"), for Linux (catalog/checks) and Windows
-# (catalog/checks-windows). The manifest is embedded in the agent at build time and every audit
-# re-hashes the installed files against it. Run after editing any built-in check file.
+# ("<ID> <platform> catalog/<dir>/<ID>/<file> <sha256>"), for Linux (catalog/checks), Windows
+# (catalog/checks-windows) and macOS (catalog/checks-macos). The manifest is embedded in the
+# agent at build time and every audit re-hashes the installed files against it. Run after
+# editing any built-in check file (on macOS: bash scripts/update-builtin-hashes.sh).
 # Entry-point checks also get their configuration.json "expectedSha256" refreshed first, so the
 # configuration hash in the manifest covers the final file. Custom checks are never listed.
 set -euo pipefail
@@ -13,7 +14,7 @@ import hashlib, json, pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 catalog = root / "catalog"
 lines = []
-for directory, platform in (("checks", "linux"), ("checks-windows", "windows")):
+for directory, platform in (("checks", "linux"), ("checks-windows", "windows"), ("checks-macos", "macos")):
     base = catalog / directory
     for folder in sorted(p for p in base.iterdir() if p.is_dir()):
         config_path = folder / "configuration.json"
