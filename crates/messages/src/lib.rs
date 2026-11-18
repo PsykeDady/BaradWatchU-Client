@@ -567,6 +567,12 @@ pub fn dashboard_catalog(
         "language.english",
         "ui.custom.eyebrow",
         "ui.custom.intro",
+        "ui.custom.import_package",
+        "ui.custom.package_invalid",
+        "ui.custom.package_loaded",
+        "ui.custom.package_too_large",
+        "ui.identity.executable_sha",
+        "ui.identity.sha_unavailable",
         "ui.custom.rescan",
         "ui.custom.new",
         "ui.custom.new_title",
@@ -886,6 +892,27 @@ mod tests {
         assert_eq!(Language::parse("fr"), None);
         assert_eq!(Language::Italian.code(), "it_IT");
         assert_eq!(Language::English.code(), "en_EN");
+    }
+
+    #[test]
+    fn dashboard_exports_every_literal_ui_translation() {
+        let source = include_str!("../../../web/src/main.ts");
+        for language in [Language::Italian, Language::English] {
+            let catalog = dashboard_catalog(language);
+            for tail in source.split("t('").skip(1) {
+                let Some((key, _)) = tail.split_once("')") else {
+                    continue;
+                };
+                if !key.starts_with("ui.") || key.contains('\n') || key.contains('\'') {
+                    continue;
+                }
+                assert!(
+                    catalog.contains_key(key),
+                    "dashboard key not exported: {key}"
+                );
+                assert_ne!(catalog[key], key, "dashboard key not translated: {key}");
+            }
+        }
     }
 
     #[test]

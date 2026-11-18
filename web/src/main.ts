@@ -59,15 +59,17 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
     <main class="shell">
       <header class="topbar">
         <a class="brand" href="#/" (click)="go('overview', $event)" [attr.aria-label]="t('ui.brand.aria')"><span class="brand-mark" aria-hidden="true">B</span><span><strong>BaradWatchU</strong><small>{{ t('ui.brand.subtitle') }}</small></span></a>
-        <nav class="tabs" role="tablist" [attr.aria-label]="t('ui.sections')">
-          <button type="button" role="tab" class="tab" [class.active]="view === 'overview'" [attr.aria-selected]="view === 'overview'" (click)="go('overview')">{{ t('ui.nav.status') }}</button>
-          <button type="button" role="tab" class="tab" [class.active]="view === 'custom'" [attr.aria-selected]="view === 'custom'" (click)="go('custom')">{{ t('ui.nav.custom') }}<span class="tab-count" *ngIf="customs.length">{{ customs.length }}</span><span class="tab-alert" *ngIf="customProblems > 0" [attr.aria-label]="customProblems + ' ' + t('ui.alert.custom_issues')">!</span></button>
-          <button type="button" role="tab" class="tab" [class.active]="view === 'notifications'" [attr.aria-selected]="view === 'notifications'" (click)="go('notifications')">{{ t('ui.nav.notifications') }}<span class="tab-alert" *ngIf="pendingConsents > 0" [attr.aria-label]="pendingConsents + ' ' + t('ui.alert.pending_requests')">{{ pendingConsents }}</span></button>
-          <button type="button" role="tab" class="tab" [class.active]="view === 'connections'" [attr.aria-selected]="view === 'connections'" (click)="go('connections')">{{ t('ui.nav.connections') }}</button>
-          <button type="button" role="tab" class="tab" [class.active]="view === 'settings'" [attr.aria-selected]="view === 'settings'" (click)="go('settings')">{{ t('ui.nav.settings') }}</button>
+        <nav class="tabs" [attr.aria-label]="t('ui.sections')">
+          <button type="button" class="tab" [class.active]="view === 'overview'" [attr.aria-current]="view === 'overview' ? 'page' : null" (click)="go('overview')">{{ t('ui.nav.status') }}</button>
+          <button type="button" class="tab" [class.active]="view === 'custom'" [attr.aria-current]="view === 'custom' ? 'page' : null" (click)="go('custom')">{{ t('ui.nav.custom') }}<span class="tab-count" *ngIf="customs.length">{{ customs.length }}</span><span class="tab-alert" *ngIf="customProblems > 0" [attr.aria-label]="customProblems + ' ' + t('ui.alert.custom_issues')">!</span></button>
+          <button type="button" class="tab" [class.active]="view === 'notifications'" [attr.aria-current]="view === 'notifications' ? 'page' : null" (click)="go('notifications')">{{ t('ui.nav.notifications') }}<span class="tab-alert" *ngIf="pendingConsents > 0" [attr.aria-label]="pendingConsents + ' ' + t('ui.alert.pending_requests')">{{ pendingConsents }}</span></button>
+          <button type="button" class="tab" [class.active]="view === 'connections'" [attr.aria-current]="view === 'connections' ? 'page' : null" (click)="go('connections')">{{ t('ui.nav.connections') }}</button>
+          <button type="button" class="tab" [class.active]="view === 'settings'" [attr.aria-current]="view === 'settings' ? 'page' : null" (click)="go('settings')">{{ t('ui.nav.settings') }}</button>
         </nav>
-        <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? t('ui.audit.running') : t('ui.audit.run') }}</button>
-        <button class="button secondary quit-button" type="button" (click)="quitApp()" [disabled]="busy || saving || closed">{{ t('ui.quit') }}</button>
+        <div class="audit-actions">
+          <button class="button primary" type="button" (click)="runAudit()" [disabled]="busy || loading || saving"><span class="play-icon" aria-hidden="true">▶</span>{{ busy ? t('ui.audit.running') : t('ui.audit.run') }}</button>
+          <button class="button secondary quit-button" type="button" (click)="quitApp()" [disabled]="busy || saving || closed">{{ t('ui.quit') }}</button>
+        </div>
       </header>
       <div class="modal-backdrop" *ngIf="closed">
         <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="quit-title"><h2 id="quit-title">{{ t('ui.quit_done_title') }}</h2><p>{{ t('ui.quit_done_text') }}</p></div>
@@ -93,10 +95,10 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
           </div>
           <div class="summary-bottom">
             <div class="metrics" *ngIf="visibleReport; else emptySummary">
-              <button type="button" class="metric pass" (click)="setFilter('PASS')" [class.selected]="filter === 'PASS'"><span class="metric-symbol">✓</span><span><strong>{{ counts.pass }}</strong><small>{{ t('ui.metric.pass') }}</small></span></button>
-              <button type="button" class="metric fail" (click)="setFilter('FAIL')" [class.selected]="filter === 'FAIL'"><span class="metric-symbol">×</span><span><strong>{{ counts.fail }}</strong><small>{{ t('ui.metric.fail') }}</small></span></button>
-              <button type="button" class="metric warn" (click)="setFilter('WARN')" [class.selected]="filter === 'WARN'"><span class="metric-symbol">!</span><span><strong>{{ counts.warn }}</strong><small>{{ t('ui.metric.warn') }}</small></span></button>
-              <button type="button" class="metric error" (click)="setFilter('ERROR')" [class.selected]="filter === 'ERROR'"><span class="metric-symbol">⚠</span><span><strong>{{ counts.error }}</strong><small>{{ t('ui.metric.error') }}</small></span></button>
+              <button type="button" class="metric pass" (click)="setFilter('PASS')" [class.selected]="filter === 'PASS'" [attr.aria-pressed]="filter === 'PASS'"><span class="metric-symbol">✓</span><span><strong>{{ counts.pass }}</strong><small>{{ t('ui.metric.pass') }}</small></span></button>
+              <button type="button" class="metric fail" (click)="setFilter('FAIL')" [class.selected]="filter === 'FAIL'" [attr.aria-pressed]="filter === 'FAIL'"><span class="metric-symbol">×</span><span><strong>{{ counts.fail }}</strong><small>{{ t('ui.metric.fail') }}</small></span></button>
+              <button type="button" class="metric warn" (click)="setFilter('WARN')" [class.selected]="filter === 'WARN'" [attr.aria-pressed]="filter === 'WARN'"><span class="metric-symbol">!</span><span><strong>{{ counts.warn }}</strong><small>{{ t('ui.metric.warn') }}</small></span></button>
+              <button type="button" class="metric error" (click)="setFilter('ERROR')" [class.selected]="filter === 'ERROR'" [attr.aria-pressed]="filter === 'ERROR'"><span class="metric-symbol">⚠</span><span><strong>{{ counts.error }}</strong><small>{{ t('ui.metric.error') }}</small></span></button>
               <div class="metric other"><span class="metric-symbol">·</span><span><strong>{{ counts.other }}</strong><small>{{ t('ui.metric.other') }}</small></span></div>
             </div>
             <ng-template #emptySummary><p class="empty-copy">{{ viewingHistory && historyLoading ? t('ui.history.loading') : t('ui.summary.empty') }}</p></ng-template>
@@ -122,7 +124,7 @@ const SEVERITY: Record<string, number> = { ERROR: 0, FAIL: 1, WARN: 2, PENDING: 
             </div>
             <div class="toolbar">
               <div class="chips" role="group" [attr.aria-label]="t('ui.filter')">
-                <button type="button" class="chip" *ngFor="let option of filterOptions" [class.active]="filter === option.value" (click)="setFilter(option.value)">{{ option.label }}</button>
+                <button type="button" class="chip" *ngFor="let option of filterOptions" [class.active]="filter === option.value" [attr.aria-pressed]="filter === option.value" (click)="setFilter(option.value)">{{ option.label }}</button>
               </div>
               <input class="search" type="search" [placeholder]="t('ui.search')" [value]="search" (input)="search = inputValue($event)" [attr.aria-label]="t('ui.search')">
             </div>
